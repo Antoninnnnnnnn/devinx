@@ -230,6 +230,28 @@ def warn_shadowed(path):
         say(WARN, f"`{name}` on PATH resolves to {other}, not {path}")
 
 
+def report_agents():
+    """Agents ride on the launcher's --agents flag, so nothing is installed.
+
+    Writing them into ~/.claude/agents made them visible in every session,
+    including plain ones where invoking them fails because nothing routes swe-2
+    models. It also wrote into a directory the user may have relocated with
+    CLAUDE_CONFIG_DIR.
+    """
+    names = sorted(os.path.splitext(n)[0] for n in AGENTS)
+    say(OK, f"agents injected per session: {', '.join(names)}")
+    stale = [n for n in AGENTS
+             if os.path.exists(os.path.expanduser(f"~/.claude/agents/{n}"))]
+    if stale:
+        say(WARN, f"{len(stale)} agent file(s) from an older install are still "
+                  f"in ~/.claude/agents:")
+        print("        " + ", ".join(stale))
+        print("        They shadow the session-scoped ones and stay visible "
+              "outside devin mode.\n"
+              "        Remove them by hand once you are happy with this "
+              "install.")
+
+
 def install_agents(force):
     dest = os.path.expanduser("~/.claude/agents")
     os.makedirs(dest, exist_ok=True)
@@ -337,6 +359,9 @@ def main():
     ap.add_argument("--port", type=int, default=8316, help="service port")
     ap.add_argument("--bin", default=default_bin(), help="where to put the launcher")
     ap.add_argument("--no-smoke", action="store_true", help="skip the smoke test")
+    ap.add_argument("--global-agents", action="store_true",
+                    help="also install the agents into ~/.claude/agents, making "
+                         "them visible outside devin mode (not recommended)")
     args = ap.parse_args()
 
     print(f"devinx installer - {sys.platform}\n")
@@ -346,7 +371,10 @@ def main():
     py = make_venv(args.force)
     os.makedirs(data_dir(), exist_ok=True)
     say(OK, f"data directory: {data_dir()}")
-    install_agents(args.force)
+    if args.global_agents:
+        install_agents(args.force)
+    else:
+        report_agents()
     path = install_launcher(args.bin, args.port, args.force)
     have_credential = check_credential()
     if not args.no_smoke:

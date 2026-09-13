@@ -46,8 +46,13 @@ python3 install.py
 ```
 
 It creates a virtualenv, installs two dependencies, drops a `devinx` launcher in
-`~/.local/bin`, installs the three subagent definitions in `~/.claude/agents`,
-and runs a smoke test that ends with a real SWE-2 call.
+`~/.local/bin`, and runs a smoke test that ends with a real SWE-2 call.
+
+The subagent definitions are **not** installed into `~/.claude/agents`: the
+launcher injects them per session with `--agents`, so a plain session shows no
+`swe2-*` agent at all. Installing them globally would list agents that fail when
+invoked outside devin mode, since nothing routes swe-2 models there. Pass
+`--global-agents` for the old behaviour.
 
 If you have not logged into Devin on this machine yet, the installer prints the
 exact command — the login is interactive and cannot be automated:
@@ -56,8 +61,8 @@ exact command — the login is interactive and cannot be automated:
 XDG_DATA_HOME="<data dir printed by the installer>" devin auth login
 ```
 
-Useful flags: `--force` (overwrite an existing launcher, agents and virtualenv),
-`--port N`, `--bin DIR`, `--no-smoke`.
+Useful flags: `--force` (overwrite an existing launcher and virtualenv),
+`--port N`, `--bin DIR`, `--no-smoke`, `--global-agents`.
 
 ## Use
 

@@ -9,6 +9,7 @@ Keeping this in Python rather than in a .sh and a .cmd means one implementation
 instead of two that drift apart; the shell wrappers installed on PATH do nothing
 but call this file.
 """
+import glob
 import json
 import os
 import shutil
@@ -72,6 +73,66 @@ def split_args(argv):
             continue
         out.append(a)
     return use_devin, out
+
+
+def packaged_agents():
+    """Parse agents/*.md into the JSON shape `claude --agents` expects.
+
+    Injecting them per session rather than installing them into ~/.claude/agents
+    is what makes --devin genuinely opt-in: without the flag a plain session
+    shows no swe2-* agent at all, instead of listing agents that would fail if
+    invoked, since nothing routes swe-2 models outside devin mode. It also stops
+    the installer writing into a config directory the user may have moved with
+    CLAUDE_CONFIG_DIR.
+    """
+    out = {}
+    for path in sorted(glob.glob(os.path.join(HERE, "agents", "*.md"))):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if not text.startswith("---"):
+            continue
+        _, _, rest = text.partition("---")
+        front, sep, prompt = rest.partition("\n---")
+        if not sep:
+            continue
+        meta = {}
+        for line in front.splitlines():
+            key, colon, value = line.partition(":")
+            if colon:
+                meta[key.strip()] = value.strip()
+        name = meta.get("name")
+        if not name:
+            continue
+        agent = {"description": meta.get("description", ""),
+                 "prompt": prompt.lstrip("-\n").strip()}
+        if meta.get("model"):
+            agent["model"] = meta["model"]
+        out[name] = agent
+    return out
+
+
+def merge_agents(passthrough, agents):
+    """Add --agents, merging with one the user already passed rather than
+    fighting over the flag. Their definitions win on a name clash."""
+    if not agents:
+        return passthrough
+    existing = {}
+    for i, a in enumerate(passthrough):
+        if a == "--agents" and i + 1 < len(passthrough):
+            try:
+                existing = json.loads(passthrough[i + 1])
+            except ValueError:
+                sys.stderr.write("devinx: --agents is not valid JSON, "
+                                 "leaving it alone\n")
+                return passthrough
+            merged = dict(agents)
+            merged.update(existing if isinstance(existing, dict) else {})
+            return (passthrough[:i + 1] + [json.dumps(merged)]
+                    + passthrough[i + 2:])
+    return passthrough + ["--agents", json.dumps(agents)]
 
 
 def listening():
@@ -168,7 +229,7 @@ def main():
     # choosing to run tools unattended are separate decisions, and this tool has
     # no business making the second one on the user's behalf: pass the flag
     # yourself if you want it.
-    args = [claude] + passthrough
+    args = [claude] + merge_agents(passthrough, packaged_agents())
     if sys.platform == "win32":
         # No exec() on Windows that preserves the console properly; run as a child
         # and hand back its exit code.
