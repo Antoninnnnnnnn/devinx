@@ -235,6 +235,50 @@ Naming the roles is optional; the skill picks them on its own. Saying it is
 worth doing when you already know the shape of the work, or when you want the
 expensive reviewer on something that looks routine and is not.
 
+## Codex
+
+The same service, the same port, the same routing rule — only the wire differs.
+
+```sh
+devinx --codex        # Codex through devinx  (--cx is a shorthand)
+devinx --cx --or      # ... with the SWE-2 roles and the orchestrator brief
+```
+
+Codex speaks the Responses API, so `/v1/responses` is translated the same way
+`/v1/messages` is, and anything that is not a `swe-2-*` model is relayed to the
+upstream Codex would have used anyway, with Codex's own credential. Nothing is
+written into `~/.codex`: the whole configuration is passed as `-c` overrides for
+that one session, so your own config, plugins and agents are untouched.
+
+Two things make GPT-orchestrating-SWE-2 possible, and both were only findable by
+watching the wire:
+
+Codex lets a model provider be chosen per session but **not per agent** — a
+role's config layer honours `model` and silently ignores `model_provider`. That
+would sink the whole idea if devinx routed by provider. It routes on the model
+name, so one global provider is all it needs.
+
+Codex also has **two multi-agent surfaces**, and picks between them from the
+model catalog. On V2 a spawned agent's task is handed over as ciphertext only
+OpenAI can open — an executor on any other model receives the envelope and none
+of the letter. On V1 the same task arrives in the clear. `/v1/models` therefore
+serves a catalog pinned to V1, and the launcher disables the V2 feature flag,
+which resolves ahead of the catalog. Codex's catalog parser is strict and
+rejects the entire catalog over one missing key — taking plugins, apps and MCP
+down with it rather than just the offending row — so every entry spells out
+every default it wants.
+
+`agents.default_subagent_model` is set to `swe-2-max`, so every agent spawned
+without an explicit override runs there. The five roles are the same ones the
+Claude Code side uses, as config layers pinned to the same tier.
+
+One difference worth knowing: Codex has no per-agent prompt the way Claude Code
+does. Everything under `[agents]` is parsed as a role except a short list of
+recognised scalars, and an unrecognised one fails config loading outright, so
+the executor and orchestrator briefs in `codex/` are not injected the way the
+skill is on the Claude side. The roles carry the tier; the doctrine is yours to
+point at.
+
 ## How it works
 
 `devinx.py` speaks the Anthropic Messages API and routes on the model name.

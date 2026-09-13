@@ -63,21 +63,48 @@ DEVIN_FLAGS = {"--devin", "--d"}
 # first without the second, so --devin alone leaves the skill out entirely.
 ORCH_FLAGS = {"--or"}
 
+# Which client to launch. Codex reaches the same service on the same port; only
+# the wire differs, and devinx routes on the model name either way.
+CODEX_FLAGS = {"--codex", "--cx"}
+
+# Roles, in the order Codex should see them, with the guidance it uses to pick
+# one. Each is a config layer that pins swe-2-max and nothing else: Codex honours
+# `model` in a role layer but ignores `model_provider`, which is exactly why the
+# split has to happen on the model name instead.
+CODEX_ROLES = (
+    ("swe2-explorer", "Read-only mapping: locate files, symbols, tests and the "
+                      "execution path before anyone writes code."),
+    ("swe2-worker", "Bounded implementation: targeted fixes and mechanical "
+                    "edits in files you name explicitly."),
+    ("swe2-tester", "Verification: run targeted tests, reproduce failures, "
+                    "report exact commands and real output."),
+    ("swe2-researcher", "Read-only research: version-specific API behaviour and "
+                        "external documentation."),
+    ("swe2-reviewer", "Independent read of a finished change: correctness, "
+                      "regressions, scope creep, weakened tests."),
+)
+
 
 def split_args(argv):
-    """Return (use_devin, use_orchestrator, args_for_claude).
+    """Return (use_devin, use_orchestrator, use_codex, args_for_client).
 
     Everything after a bare `--` is passed through untouched, so a prompt that
     happens to contain a flag is never swallowed.
     """
     use_devin = os.environ.get("DEVINX_ALWAYS") == "1"
     use_orch = os.environ.get("DEVINX_ORCHESTRATOR") == "1"
+    use_codex = False
     out = []
     for i, a in enumerate(argv):
         if a == "--":
             out.extend(argv[i:])
             break
         if a in DEVIN_FLAGS:
+            use_devin = True
+            continue
+        if a in CODEX_FLAGS:
+            # Codex needs the service for the same reason Claude Code does.
+            use_codex = True
             use_devin = True
             continue
         if a in ORCH_FLAGS:
@@ -87,7 +114,7 @@ def split_args(argv):
             use_devin = True
             continue
         out.append(a)
-    return use_devin, use_orch, out
+    return use_devin, use_orch, use_codex, out
 
 
 def packaged_agents():
@@ -166,6 +193,57 @@ def merge_agents(passthrough, agents):
     return passthrough + ["--agents", json.dumps(agents)]
 
 
+def _toml_string(text):
+    """A TOML basic string for a -c override. JSON's escaping rules for quotes,
+    backslashes and newlines are TOML's, so this is exact rather than close."""
+    return json.dumps(text)
+
+
+def _read(name):
+    try:
+        with open(os.path.join(HERE, "codex", name), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def codex_args(orchestrate):
+    """Everything Codex needs, as -c overrides.
+
+    Nothing is written into ~/.codex. The user's own config, plugins and agents
+    are untouched, and a session without the flag is unaffected — the same
+    bargain the Claude side makes by injecting agents per session.
+    """
+    args = [
+        "-c", 'model_providers.devinx.name="devinx"',
+        "-c", f'model_providers.devinx.base_url="http://{HOST}:{PORT}/v1"',
+        "-c", 'model_providers.devinx.wire_api="responses"',
+        # Codex then sends its own credential, which devinx relays untouched to
+        # the upstream a gpt-* model would have gone to anyway.
+        "-c", "model_providers.devinx.requires_openai_auth=true",
+        "-c", 'model_provider="devinx"',
+        # The V1 multi-agent surface. On V2 a spawned agent's task is ciphertext
+        # only OpenAI can open, so a SWE-2 executor would receive the envelope
+        # and none of the letter; on V1 the same task arrives in the clear.
+        "-c", "features.multi_agent_v2.enabled=false",
+    ]
+    if not orchestrate:
+        return args
+    for name, description in CODEX_ROLES:
+        layer = os.path.join(HERE, "codex", "roles", f"{name}.toml")
+        if not os.path.exists(layer):
+            continue
+        args += ["-c", f"agents.{name}.config_file={_toml_string(layer)}",
+                 "-c", f"agents.{name}.description={_toml_string(description)}"]
+    # Everything under [agents] is parsed as a role except a short list of
+    # recognised scalars, so the doctrine cannot be injected there — an
+    # unrecognised scalar is read as a role name and fails config loading
+    # outright. This one is recognised, and it is the important one: every agent
+    # spawned without an explicit override lands on SWE-2 Max.
+    args += ["-c", 'agents.default_subagent_model="swe-2-max"']
+    return args
+
+
 def plugin_args(enabled):
     """Inject the bundled orchestrator skill, only when --or asked for it.
 
@@ -238,12 +316,14 @@ def start_service():
 
 
 def main():
-    use_devin, use_orch, passthrough = split_args(sys.argv[1:])
+    use_devin, use_orch, use_codex, passthrough = split_args(sys.argv[1:])
 
-    claude = shutil.which("claude")
-    if not claude:
-        sys.stderr.write("claude not found on PATH - install Claude Code first\n")
+    client = "codex" if use_codex else "claude"
+    binary = shutil.which(client)
+    if not binary:
+        sys.stderr.write(f"{client} not found on PATH - install it first\n")
         return 1
+    claude = binary
 
     env = dict(os.environ)
 
@@ -272,6 +352,15 @@ def main():
                 f"devinx failed to start on {HOST}:{PORT}\n"
                 f"check {os.path.join(data_dir(), 'devinx.log')}\n")
             return 1
+
+    if use_codex:
+        # Codex is configured entirely through -c overrides, so none of the
+        # Anthropic environment applies and nothing of the user's own config is
+        # touched. It authenticates as itself; devinx relays that credential.
+        args = [binary] + codex_args(use_orch) + passthrough
+        if sys.platform == "win32":
+            return subprocess.call(args, env=env)
+        os.execvpe(binary, args, env)
 
     for name in SCRUB:
         env.pop(name, None)
