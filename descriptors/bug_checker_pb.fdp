@@ -1,0 +1,22 @@
+
+$exa/bug_checker_pb/bug_checker.protoexa.bug_checker_pb"'
+Fix
+old_str (	
+new_str (	"Ó
+Bug
+
+id (	
+file (	
+start (
+end (
+title (	
+description (	
+severity (	
+
+resolution (	
+
+confidence	 (
+
+categories
+ (	$
+fix (2.exa.bug_checker_pb.Fixbproto3

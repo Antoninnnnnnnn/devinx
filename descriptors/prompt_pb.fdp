@@ -1,0 +1,65 @@
+
+exa/prompt_pb/prompt.protoexa.prompt_pb"9
+PendingCommand
+instruction (	
+
+completion (	"Î
+CommandIntentInfo
+	selection (	
+instruction (	7
+input_document (2.exa.codeium_common_pb.Document
+selection_start_line (
+selection_end_line (I
+terminal_command_data (2*.exa.codeium_common_pb.TerminalCommandDataF
+previous_commands (2+.exa.codeium_common_pb.TerminalShellCommand7
+pending_commands (2.exa.prompt_pb.PendingCommandC
+request_source	 (2+.exa.codeium_common_pb.CommandRequestSourceJ
+intellisense_prompt
+ (2-.exa.codeium_common_pb.IntellisenseSuggestionA
+diagnostics_prompt (2%.exa.codeium_common_pb.CodeDiagnostic" 
+SupercompleteFeedback
+accepted (
+intentional_reject (
+completion_id (	
+timestamp_ms (R
+diff_suggestion (29.exa.language_server_pb.HandleStreamingTabV2Response.DiffX
+tabjump_suggestion (2<.exa.language_server_pb.HandleStreamingTabV2Response.TabJump"V
+SupercompleteFeedbackContext6
+feedback (2$.exa.prompt_pb.SupercompleteFeedback"µ
+UnifiedPromptComponentsI
+context_module_result (2*.exa.context_module_pb.ContextModuleResult:
+cortex_trajectory (2.exa.cortex_pb.CortexTrajectory=
+command_intent_info (2 .exa.prompt_pb.CommandIntentInfo/
+chat_messages (2.exa.chat_pb.ChatMessage?
+code_diagnostics (2%.exa.codeium_common_pb.CodeDiagnostic8
+other_documents	 (2.exa.codeium_common_pb.DocumentA
+deep_wiki_context
+ (2".exa.chat_pb.DeepWikiSymbolContextB:
+deep_wiki_context_v2 (2.exa.chat_pb.DeepWikiContextS
+supercomplete_feedback_context (2+.exa.prompt_pb.SupercompleteFeedbackContextJJJ	Rknowledge_base_resultRknowledge_base_itemsRknowledge_base_groups";
+SystemPromptConstructionConfig
+element_separator (	"T
+CommandPromptCacheConfig
+max_tracked_files (
+max_cache_age_seconds ("Ö
+CumulativePromptConfig%
+persistent_context_multiplier (-
+%persistent_active_document_multiplier
+ ('
+persistent_open_docs_multiplier (*
+"persistent_max_tokens_per_open_doc (&
+persistent_max_ccis_considered ('
+persistent_document_suffix_frac (%
+trajectory_context_multiplier (/
+'trajectory_refresh_threshold_multiplier ((
+ trajectory_truncation_multiplier ($
+ephemeral_context_multiplier	 (!
+intent_reservation_tokens (,
+$ephemeral_active_document_multiplier (%
+ephemeral_max_ccis_considered (&
+ephemeral_document_suffix_frac (A
+allowed_cascade_step_types (2.exa.cortex_pb.CortexStepTypeh
+allowed_implicit_step_types (2C.exa.prompt_pb.CumulativePromptConfig.AllowedImplicitStepTypesEntry?
+AllowedImplicitStepTypesEntry
+key (	
+value (:8JJJJR"active_document_context_multiplierRcontext_item_context_multiplierRcache_context_multiplierRmax_ccis_consideredbproto3

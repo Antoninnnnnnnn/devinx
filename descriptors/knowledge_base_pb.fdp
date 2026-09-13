@@ -1,0 +1,87 @@
+
+*exa/knowledge_base_pb/knowledge_base.protoexa.knowledge_base_pb"Û
+KnowledgeBaseItem
+
+identifier (	@
+connector_type (2(.exa.opensearch_clients_pb.ConnectorType
+url (	
+title (	
+description (	
+content (	3
+last_crawled_at (2.google.protobuf.Timestamp
+	user_name (	"Œ
+CreateKnowledgeBaseItemRequest1
+metadata (2.exa.codeium_common_pb.Metadata@
+connector_type (2(.exa.opensearch_clients_pb.ConnectorType
+urls (	JJJRtitleRurlRdescription"Q
+CreateKnowledgeBaseItemResponse
+
+identifier (	
+title (	
+url (	"z
+EditKnowledgeBaseItemRequest1
+metadata (2.exa.codeium_common_pb.Metadata
+
+identifier (	
+description (	"
+EditKnowledgeBaseItemResponse"g
+DeleteKnowledgeBaseItemRequest1
+metadata (2.exa.codeium_common_pb.Metadata
+
+identifier (	"!
+DeleteKnowledgeBaseItemResponse"e
+ReadKnowledgeBaseItemRequest1
+metadata (2.exa.codeium_common_pb.Metadata
+
+identifier (	"W
+ReadKnowledgeBaseItemResponse6
+item (2(.exa.knowledge_base_pb.KnowledgeBaseItem"Q
+GetKnowledgeBaseItemsRequest1
+metadata (2.exa.codeium_common_pb.Metadata"X
+GetKnowledgeBaseItemsResponse7
+items (2(.exa.knowledge_base_pb.KnowledgeBaseItem"^
+#GetKnowledgeBaseItemsForTeamRequest1
+metadata (2.exa.codeium_common_pb.MetadataJ"_
+$GetKnowledgeBaseItemsForTeamResponse7
+items (2(.exa.knowledge_base_pb.KnowledgeBaseItem"∂
+CreateConnectionRequest1
+metadata (2.exa.codeium_common_pb.Metadata@
+connector_type (2(.exa.opensearch_clients_pb.ConnectorType
+access_token (	;
+access_token_expires_at (2.google.protobuf.Timestamp
+refresh_token (	<
+refresh_token_expires_at (2.google.protobuf.Timestamp"
+CreateConnectionResponse"é
+RemoveConnectionRequest1
+metadata (2.exa.codeium_common_pb.Metadata@
+connector_type (2(.exa.opensearch_clients_pb.ConnectorType"
+RemoveConnectionResponse"ã
+GetConnectionRequest1
+metadata (2.exa.codeium_common_pb.Metadata@
+connector_type (2(.exa.opensearch_clients_pb.ConnectorType">
+GetConnectionResponse
+enabled (
+access_token (	"x
+%GetGithubPullRequestSearchInfoRequest1
+metadata (2.exa.codeium_common_pb.Metadata
+query (	
+limit ("w
+&GetGithubPullRequestSearchInfoResponseM
+pull_request_infos (21.exa.auto_cascade_common_pb.GithubPullRequestInfo"V
+!GetGithubIntegrationStatusRequest1
+metadata (2.exa.codeium_common_pb.Metadata"Å
+"GetGithubIntegrationStatusResponse
+username (	I
+installations (22.exa.auto_cascade_common_pb.GithubInstallationInfo2ﬂ
+KnowledgeBaseServiceà
+CreateKnowledgeBaseItem5.exa.knowledge_base_pb.CreateKnowledgeBaseItemRequest6.exa.knowledge_base_pb.CreateKnowledgeBaseItemResponseÇ
+EditKnowledgeBaseItem3.exa.knowledge_base_pb.EditKnowledgeBaseItemRequest4.exa.knowledge_base_pb.EditKnowledgeBaseItemResponseà
+DeleteKnowledgeBaseItem5.exa.knowledge_base_pb.DeleteKnowledgeBaseItemRequest6.exa.knowledge_base_pb.DeleteKnowledgeBaseItemResponseÇ
+ReadKnowledgeBaseItem3.exa.knowledge_base_pb.ReadKnowledgeBaseItemRequest4.exa.knowledge_base_pb.ReadKnowledgeBaseItemResponseÇ
+GetKnowledgeBaseItems3.exa.knowledge_base_pb.GetKnowledgeBaseItemsRequest4.exa.knowledge_base_pb.GetKnowledgeBaseItemsResponseó
+GetKnowledgeBaseItemsForTeam:.exa.knowledge_base_pb.GetKnowledgeBaseItemsForTeamRequest;.exa.knowledge_base_pb.GetKnowledgeBaseItemsForTeamResponseù
+GetGithubPullRequestSearchInfo<.exa.knowledge_base_pb.GetGithubPullRequestSearchInfoRequest=.exa.knowledge_base_pb.GetGithubPullRequestSearchInfoResponses
+CreateConnection..exa.knowledge_base_pb.CreateConnectionRequest/.exa.knowledge_base_pb.CreateConnectionResponses
+RemoveConnection..exa.knowledge_base_pb.RemoveConnectionRequest/.exa.knowledge_base_pb.RemoveConnectionResponsej
+GetConnection+.exa.knowledge_base_pb.GetConnectionRequest,.exa.knowledge_base_pb.GetConnectionResponseë
+GetGithubIntegrationStatus8.exa.knowledge_base_pb.GetGithubIntegrationStatusRequest9.exa.knowledge_base_pb.GetGithubIntegrationStatusResponsebproto3

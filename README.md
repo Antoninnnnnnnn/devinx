@@ -1,0 +1,156 @@
+# devinx
+
+Claude Code stays logged in with your own claude.ai subscription, while its
+subagents run natively on SWE-2 Medium, High or Max.
+
+One local service, one port, no external binary.
+
+```
+cc
+ └─ Claude Code (claude.ai login, no ANTHROPIC_API_KEY)
+      └─ devinx.py on 127.0.0.1:8316
+           ├─ model=claude-*  ->  api.anthropic.com      transparent relay
+           └─ model=swe-2-*   ->  server.codeium.com     SWE-2
+```
+
+The subagents are real Claude Code subagents: same tools, same harness, same
+transcripts. Nothing spawns a second `claude` process.
+
+## Read this first
+
+This talks to Cognition's private API, not a public one, and it gets there by
+looking like something it is not:
+
+- it identifies itself as the Windsurf IDE (`IDE_NAME`, `IDE_VERSION`,
+  `EXT_VERSION` and a matching user-agent in `devinx.py`);
+- `_SYS_REWRITES` in `devinx.py` rewrites parts of Claude Code's system prompt
+  for the specific purpose of getting past Cognition's input classifier, which
+  otherwise rejects them. That is circumvention of a check the provider put
+  there, not a compatibility shim;
+- `descriptors/*.fdp` are protobuf definitions of that private API, extracted
+  from a published npm package.
+
+It runs on **your own** Devin/Windsurf subscription and spends your own quota.
+Using it plausibly breaches Cognition's terms of service. That is your call and
+your risk, not the authors'.
+
+Not affiliated with, endorsed by, or supported by Anthropic or Cognition.
+
+## Install
+
+Requires Python 3.10+, the [Claude Code CLI](https://claude.com/claude-code) on
+PATH, and a Devin CLI login for the SWE-2 side.
+
+```sh
+python3 install.py
+```
+
+It creates a virtualenv, installs two dependencies, drops a `cc` launcher in
+`~/.local/bin`, installs the three subagent definitions in `~/.claude/agents`,
+and runs a smoke test that ends with a real SWE-2 call.
+
+If you have not logged into Devin on this machine yet, the installer prints the
+exact command — the login is interactive and cannot be automated:
+
+```sh
+XDG_DATA_HOME="<data dir printed by the installer>" devin auth login
+```
+
+Useful flags: `--force` (overwrite an existing launcher, agents and virtualenv),
+`--port N`, `--bin DIR`, `--no-smoke`.
+
+## Use
+
+The SWE-2 layer is opt-in. Without the flag, `cc` is a plain passthrough to
+Claude Code: nothing is started, nothing is injected, no proxy.
+
+```sh
+cc                      # plain Claude Code, exactly as `claude`
+cc --devin              # with the SWE-2 layer  (--d is a shorthand)
+cc --d --resume         # composes with any claude flag
+cc --resume x -p "..."  # flags and prompts pass through untouched
+```
+
+Everything after a bare `--` is passed through verbatim, so a prompt containing
+`--devin` is never mistaken for the flag. `-d` is left alone — it is Claude
+Code's own `--debug`. Set `DEVINX_ALWAYS=1` to make the layer the default.
+
+In devin mode the service starts on demand the first time and stays up
+afterwards.
+
+### Choosing a tier for the main session
+
+`/model` offers a single `swe-2` entry. It has no tier of its own: the effort
+slider beside it picks one, which is what makes that slider meaningful.
+
+| effort | tier |
+|---|---|
+| low, medium | `swe-2-medium` |
+| high *(default)* | `swe-2-high` |
+| xhigh, max | `swe-2-max` |
+
+The three tiers are also selectable by name (`--model swe-2-high`). Asked for
+explicitly they are never retiered by effort — otherwise a subagent pinned to a
+tier would follow whatever its parent session was set to. The response reports
+the tier that actually ran, not the alias.
+
+### Choosing a tier for a subagent
+
+Delegate as usual and pick the agent:
+
+| agent | for |
+|---|---|
+| `swe2-medium` | quick searches, small mechanical edits, routine work |
+| `swe2-high` | normal implementation, debugging, testing, review |
+| `swe2-max` | hardest architecture and debugging, quality over latency |
+
+## How it works
+
+`devinx.py` speaks the Anthropic Messages API and routes on the model name.
+
+`claude-*` is relayed to `api.anthropic.com` untouched. The service holds no
+Anthropic credential of its own and forwards yours; with no credential in the
+request it answers 401 rather than inventing one.
+
+`swe-2-*` is translated to Cognition's Connect-RPC `GetChatMessage`. On this
+branch the Authorization and x-api-key headers are dropped and the OAuth
+capability is stripped from `anthropic-beta`, so the claude.ai token is never
+sent to Cognition.
+
+Speaking Anthropic on both sides rather than translating through OpenAI in the
+middle is what keeps usage accounting exact (input, cache read and cache write
+map 1:1) and lets reasoning survive across turns: Claude Code keeps the thinking
+blocks it receives and replays them, and nothing has to be stored server-side.
+
+Each subagent gets its own conversation key, derived from the session id plus its
+system prompt and first task. Sharing the parent's key collapses them into a
+single upstream cascade and costs the prefix cache on every continuation turn.
+
+## Troubleshooting
+
+Logs are in `devinx.log`, in the data directory printed by the installer
+(`%LOCALAPPDATA%\devinx`, `~/Library/Application Support/devinx`, or
+`$XDG_DATA_HOME/devinx`). Each request logs a line: `route=swe model=…` or
+`route=claude model=… status=…`.
+
+**SWE-2 calls fail, Claude still works.** Expected when the Devin credential is
+missing or expired — the service starts anyway so the main session is unaffected.
+Log in again with the command above.
+
+**`cc` reports the service failed to start.** Read `devinx.log`. A port conflict
+on 8316 is the usual cause; `--port` at install time changes it.
+
+**Everything is broken.** `claude` on its own does not go through devinx at all
+and is always available as a fallback.
+
+## Refreshing the protobuf descriptors
+
+`descriptors/*.fdp` are Cognition's message definitions, shipped with the
+package. They only need refreshing if the upstream wire format changes:
+
+```sh
+python3 extract_fdps.py descriptors
+```
+
+It resolves the `latest` published catalog, so it can pull a version newer than
+the one this release was tested against.
