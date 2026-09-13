@@ -9,12 +9,14 @@ Keeping this in Python rather than in a .sh and a .cmd means one implementation
 instead of two that drift apart; the shell wrappers installed on PATH do nothing
 but call this file.
 """
+import json
 import os
 import shutil
 import socket
 import subprocess
 import sys
 import time
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("DEVINX_PORT", "8316"))
@@ -73,9 +75,25 @@ def split_args(argv):
 
 
 def listening():
+    """True only if *devinx* answers on the port.
+
+    A bare TCP connect would also succeed for an unrelated process holding the
+    port, and Claude Code would then be pointed at it and fail in confusing ways.
+    Checking that the model list contains a swe-2 entry makes a port conflict
+    deterministic instead of silent. This guards against accidents, not against a
+    hostile local process.
+    """
     with socket.socket() as s:
         s.settimeout(0.5)
-        return s.connect_ex((HOST, PORT)) == 0
+        if s.connect_ex((HOST, PORT)) != 0:
+            return False
+    try:
+        with urllib.request.urlopen(
+                f"http://{HOST}:{PORT}/v1/models", timeout=3) as r:
+            data = json.loads(r.read()).get("data") or []
+        return any(str(m.get("id", "")).startswith("swe-2") for m in data)
+    except Exception:
+        return False
 
 
 def data_dir():
@@ -122,10 +140,7 @@ def main():
         # inherited from a parent devin-mode session — leaving it would silently
         # route "plain" through the proxy, which is the opposite of the intent.
         if env.get("ANTHROPIC_BASE_URL", "").rstrip("/") == f"http://{HOST}:{PORT}":
-            env.pop("ANTHROPIC_BASE_URL", None)
-            for name in ("ANTHROPIC_CUSTOM_MODEL_OPTION",
-                         "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
-                         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"):
+            for name in ENV:
                 env.pop(name, None)
         args = [claude] + passthrough
         if sys.platform == "win32":
@@ -149,7 +164,11 @@ def main():
         env.pop(name, None)
     env.update(ENV)
 
-    args = [claude, "--dangerously-skip-permissions"] + passthrough
+    # Deliberately no --dangerously-skip-permissions. Choosing a model and
+    # choosing to run tools unattended are separate decisions, and this tool has
+    # no business making the second one on the user's behalf: pass the flag
+    # yourself if you want it.
+    args = [claude] + passthrough
     if sys.platform == "win32":
         # No exec() on Windows that preserves the console properly; run as a child
         # and hand back its exit code.

@@ -6,7 +6,7 @@ subagents run natively on SWE-2 Medium, High or Max.
 One local service, one port, no external binary.
 
 ```
-cc
+devinx --devin
  └─ Claude Code (claude.ai login, no ANTHROPIC_API_KEY)
       └─ devinx.py on 127.0.0.1:8316
            ├─ model=claude-*  ->  api.anthropic.com      transparent relay
@@ -45,7 +45,7 @@ PATH, and a Devin CLI login for the SWE-2 side.
 python3 install.py
 ```
 
-It creates a virtualenv, installs two dependencies, drops a `cc` launcher in
+It creates a virtualenv, installs two dependencies, drops a `devinx` launcher in
 `~/.local/bin`, installs the three subagent definitions in `~/.claude/agents`,
 and runs a smoke test that ends with a real SWE-2 call.
 
@@ -61,14 +61,26 @@ Useful flags: `--force` (overwrite an existing launcher, agents and virtualenv),
 
 ## Use
 
-The SWE-2 layer is opt-in. Without the flag, `cc` is a plain passthrough to
+The SWE-2 layer is opt-in. Without the flag, `devinx` is a plain passthrough to
 Claude Code: nothing is started, nothing is injected, no proxy.
 
 ```sh
-cc                      # plain Claude Code, exactly as `claude`
-cc --devin              # with the SWE-2 layer  (--d is a shorthand)
-cc --d --resume         # composes with any claude flag
-cc --resume x -p "..."  # flags and prompts pass through untouched
+devinx                      # plain Claude Code, exactly as `claude`
+devinx --devin              # with the SWE-2 layer  (--d is a shorthand)
+devinx --d --resume         # composes with any claude flag
+devinx --resume x -p "..."  # flags and prompts pass through untouched
+```
+
+**devinx never adds `--dangerously-skip-permissions`.** Choosing a model and
+choosing to run tools unattended are separate decisions; pass the flag yourself
+if you want it. The launcher is deliberately not called `cc`: on Unix that is
+the C compiler, which `make`, autoconf and cgo invoke by name.
+
+Already have your own `cc` wrapper? Add a branch to it rather than using
+`devinx`, and keep whatever flags you already pass:
+
+```sh
+--devin|--d) exec ~/devinx/.venv/bin/python ~/devinx/launcher.py --devin "$@" ;;
 ```
 
 Everything after a bare `--` is passed through verbatim, so a prompt containing
@@ -113,9 +125,8 @@ Anthropic credential of its own and forwards yours; with no credential in the
 request it answers 401 rather than inventing one.
 
 `swe-2-*` is translated to Cognition's Connect-RPC `GetChatMessage`. On this
-branch the Authorization and x-api-key headers are dropped and the OAuth
-capability is stripped from `anthropic-beta`, so the claude.ai token is never
-sent to Cognition.
+branch no client header is forwarded at all: the Cognition request is built
+from scratch with its own header set, so the claude.ai token cannot reach it.
 
 Speaking Anthropic on both sides rather than translating through OpenAI in the
 middle is what keeps usage accounting exact (input, cache read and cache write
@@ -135,9 +146,11 @@ Logs are in `devinx.log`, in the data directory printed by the installer
 
 **SWE-2 calls fail, Claude still works.** Expected when the Devin credential is
 missing or expired — the service starts anyway so the main session is unaffected.
-Log in again with the command above.
+Log in again with the command above; the running service drops its cached
+credential when the upstream rejects it, so it picks the new one up without a
+restart.
 
-**`cc` reports the service failed to start.** Read `devinx.log`. A port conflict
+**The launcher reports the service failed to start.** Read `devinx.log`. A port conflict
 on 8316 is the usual cause; `--port` at install time changes it.
 
 **Everything is broken.** `claude` on its own does not go through devinx at all

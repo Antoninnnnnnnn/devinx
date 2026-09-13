@@ -221,6 +221,17 @@ def api_key():
         return _key["value"]
 
 
+def reset_key():
+    """Forget the memoised credential so the next use re-reads the file.
+
+    Called when the upstream rejects our auth: the usual cause is that the user
+    just ran `devin auth login` again, which rewrites credentials.toml while this
+    process happily keeps using the string it read at startup.
+    """
+    with _key_lock:
+        _key["value"] = None
+
+
 _jwt_lock = threading.Lock()
 _jwt = {"token": None, "exp": 0.0, "base": None}
 
@@ -253,10 +264,10 @@ def get_jwt(force=False):
         if not force and _jwt["token"] and _jwt["exp"] - 60 > now:
             return _jwt["token"], _jwt["base"]
         req = GetUserJwtRequest(metadata=_metadata())
-        r = requests.post(COGNITION_UPSTREAM + AUTH_PATH,
-                          data=req.SerializeToString(),
-                          headers={"content-type": "application/proto",
-                                   "connect-protocol-version": "1"}, timeout=30)
+        r = SESSION.post(COGNITION_UPSTREAM + AUTH_PATH,
+                         data=req.SerializeToString(),
+                         headers={"content-type": "application/proto",
+                                  "connect-protocol-version": "1"}, timeout=30)
         r.raise_for_status()
         resp = GetUserJwtResponse()
         try:
@@ -378,6 +389,13 @@ def resolve_model(body):
     return EFFORT_TIERS.get(effort, DEFAULT_TIER)
 
 
+def _image_digests(images):
+    """Images identify a turn as much as its text, but base64 payloads are far
+    too large to hash on every request; their digests are enough."""
+    return [hashlib.sha1((i.get("base64_data") or "").encode()).hexdigest()
+            for i in images]
+
+
 def _msgid(kind, payload):
     """Content-derived message id.
 
@@ -401,7 +419,22 @@ def build_request(body):
     cascade_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "devinx\0" + conv_seed))
     prompts = []
 
-    for i, m in enumerate(body.get("messages", [])):
+    seen_ids = {}
+    dropped = []
+
+    def mid(kind, payload):
+        """Content-derived id, disambiguated if the same content repeats.
+
+        Position must not enter into this: an id derived from the index would
+        shift for every message after one Claude Code dropped during compaction,
+        invalidating the upstream prefix cache for the rest of the conversation.
+        """
+        base = _msgid(kind, payload)
+        n = seen_ids.get(base, 0)
+        seen_ids[base] = n + 1
+        return base if n == 0 else f"{base}-{n}"
+
+    for m in body.get("messages", []):
         role = m.get("role")
         blocks = _blocks(m.get("content"))
         if role == "user":
@@ -412,10 +445,13 @@ def build_request(body):
                 kind = b.get("type")
                 if kind == "tool_result":
                     prompts.append({
-                        "message_id": _msgid("tool", b),
+                        "message_id": mid("tool", b),
                         "source": SRC_TOOL,
                         "tool_call_id": b.get("tool_use_id", ""),
                         "prompt": _tool_result_text(b),
+                        # Without this a failed tool call replays as a successful
+                        # one and the model has to infer failure from the text.
+                        "tool_result_is_error": bool(b.get("is_error")),
                         "images": [img for img in
                                    (_image_of(x) for x in _blocks(b.get("content")))
                                    if img],
@@ -426,35 +462,58 @@ def build_request(body):
                     img = _image_of(b)
                     if img:
                         images.append(img)
+                    else:
+                        dropped.append("image/" + str(
+                            (b.get("source") or {}).get("type")))
+                else:
+                    dropped.append(str(kind))
             if text_parts or images:
-                prompts.append({"message_id": _msgid(str(i), "user"),
+                prompts.append({"message_id": mid("user", {
+                                    "text": "".join(text_parts),
+                                    "images": _image_digests(images)}),
                                 "source": SRC_USER,
                                 "prompt": "".join(text_parts),
                                 "images": images})
         elif role == "assistant":
-            entry = {"message_id": _msgid(str(i), "assistant"),
-                     "source": SRC_SYSTEM, "prompt": "", "tool_calls": []}
-            texts = []
+            texts, thinkings, signature, tool_calls = [], [], None, []
             for b in blocks:
                 kind = b.get("type")
                 if kind == "thinking":
-                    # Replayed verbatim from what was emitted last turn, signature
-                    # included: this is what lets the model keep its reasoning
-                    # across turns without anything being stored server-side.
-                    entry["thinking"] = b.get("thinking", "")
+                    # Replayed from what was emitted last turn. Cognition accepts
+                    # replayed thinking unsigned, so losing the signature costs
+                    # nothing; losing the text would cost the reasoning itself.
+                    thinkings.append(b.get("thinking", ""))
                     if b.get("signature"):
-                        entry["signature"] = b["signature"]
-                        entry["signature_type"] = SIGNATURE_TYPE
+                        signature = b["signature"]
                 elif kind == "text":
                     texts.append(b.get("text", ""))
                 elif kind == "tool_use":
-                    entry["tool_calls"].append({
+                    tool_calls.append({
                         "id": b.get("id", ""),
                         "name": b.get("name", ""),
                         "arguments_json": json.dumps(b.get("input") or {}),
                     })
-            entry["prompt"] = "".join(texts)
+                else:
+                    dropped.append(str(kind))
+            entry = {"source": SRC_SYSTEM, "prompt": "".join(texts),
+                     "tool_calls": tool_calls}
+            if thinkings:
+                entry["thinking"] = "\n\n".join(thinkings)
+                # A signature covers one specific thinking text. Concatenating
+                # several invalidates it, so send it only when it still matches.
+                if signature and len(thinkings) == 1:
+                    entry["signature"] = signature
+                    entry["signature_type"] = SIGNATURE_TYPE
+            entry["message_id"] = mid("assistant", {
+                "text": entry["prompt"], "thinking": entry.get("thinking", ""),
+                "tool_calls": tool_calls})
             prompts.append(entry)
+
+    if dropped:
+        # Silent loss is the failure mode that is hardest to diagnose from the
+        # client side, where the model simply appears not to have seen something.
+        print(f"warning: dropped unsupported content blocks: "
+              f"{', '.join(sorted(set(dropped)))}", flush=True)
 
     tools = [{"name": t.get("name", ""),
               "description": _TOOL_DESC_REWRITES.get(
@@ -511,58 +570,89 @@ def chat_stream(req):
     t_start = time.time()
     n_msgs = len(req.chat_message_prompts)
     r = None
-    for attempt in range(2):
-        gz = gzip.compress(body, compresslevel=1)
-        frame = bytes([1]) + struct.pack(">I", len(gz)) + gz
-        r = requests.post((base or COGNITION_UPSTREAM) + CHAT_PATH, data=frame,
-                          headers={"content-type": "application/connect+proto",
-                                   "connect-protocol-version": "1",
-                                   "connect-content-encoding": "gzip",
-                                   "connect-accept-encoding": "gzip",
-                                   "user-agent": "connect-go/1.18.1 (go1.26.3)"},
-                          timeout=600, stream=True)
-        if r.status_code == 200:
-            break
-        if r.status_code in (401, 403) and attempt == 0:
-            jwt, base = get_jwt(force=True)
-            req.metadata.user_jwt = jwt
-            body = req.SerializeToString()
-            continue
-        print(f"upstream HTTP {r.status_code}: {r.text[:400]}", flush=True)
-        yield None, f"upstream {r.status_code}: {r.text[:400]}"
-        return
-    print(f"upstream conn: {time.time() - t_start:.1f}s to headers "
-          f"({n_msgs} msgs, {len(body) // 1024}KB req)", flush=True)
-    buf = b""
-    first_frame = True
-    for chunk in r.iter_content(65536):
-        buf += chunk
-        while len(buf) >= 5:
-            flag = buf[0]
-            ln = struct.unpack(">I", buf[1:5])[0]
-            if len(buf) < 5 + ln:
+    try:
+        for attempt in range(2):
+            gz = gzip.compress(body, compresslevel=1)
+            frame = bytes([1]) + struct.pack(">I", len(gz)) + gz
+            # SESSION rather than a bare requests.post: the latter builds a
+            # throwaway Session, so every turn paid a fresh TLS handshake to
+            # Cognition and ignored SESSION's trust_env=False.
+            r = SESSION.post((base or COGNITION_UPSTREAM) + CHAT_PATH, data=frame,
+                             headers={"content-type": "application/connect+proto",
+                                      "connect-protocol-version": "1",
+                                      "connect-content-encoding": "gzip",
+                                      "connect-accept-encoding": "gzip",
+                                      "user-agent": "connect-go/1.18.1 (go1.26.3)"},
+                             timeout=600, stream=True)
+            if r.status_code == 200:
                 break
-            payload = buf[5:5 + ln]
-            buf = buf[5 + ln:]
-            if flag & 2:
-                trailer = gzip.decompress(payload) if flag & 1 else payload
-                try:
-                    err = json.loads(trailer).get("error") or {}
-                except Exception:
-                    err = {}
-                if err.get("message"):
-                    print(f"upstream trailer error: "
-                          f"{err.get('code', 'error')}: {err['message']}", flush=True)
-                    yield None, f"{err.get('code', 'error')}: {err['message']}"
+            status, detail = r.status_code, r.text[:400]
+            r.close()
+            r = None
+            if status in (401, 403) and attempt == 0:
+                # Re-read the credential file too: after `devin auth login` the
+                # process would otherwise keep retrying with the stale key it
+                # memoised at first use.
+                reset_key()
+                jwt, base = get_jwt(force=True)
+                req.metadata.user_jwt = jwt
+                body = req.SerializeToString()
                 continue
-            raw = gzip.decompress(payload) if flag & 1 else payload
-            msg = GetChatMessageResponse()
-            msg.ParseFromString(raw)
-            if first_frame:
-                first_frame = False
-                print(f"upstream first-frame: {time.time() - t_start:.1f}s "
-                      f"({n_msgs} msgs)", flush=True)
-            yield msg, None
+            print(f"upstream HTTP {status}: {detail}", flush=True)
+            yield None, f"upstream {status}: {detail}"
+            return
+        print(f"upstream conn: {time.time() - t_start:.1f}s to headers "
+              f"({n_msgs} msgs, {len(body) // 1024}KB req)", flush=True)
+        buf = b""
+        first_frame = True
+        end_of_stream = False
+        for chunk in r.iter_content(65536):
+            buf += chunk
+            while len(buf) >= 5:
+                flag = buf[0]
+                ln = struct.unpack(">I", buf[1:5])[0]
+                if len(buf) < 5 + ln:
+                    break
+                payload = buf[5:5 + ln]
+                buf = buf[5 + ln:]
+                if flag & 2:
+                    end_of_stream = True
+                    trailer = gzip.decompress(payload) if flag & 1 else payload
+                    try:
+                        err = json.loads(trailer).get("error") or {}
+                    except Exception:
+                        err = {}
+                    # The Connect protocol makes the error message optional; a
+                    # code on its own is still an error. Testing for `message`
+                    # let those through as if the turn had completed normally.
+                    if err:
+                        code = err.get("code", "error")
+                        message = err.get("message", "(no message)")
+                        print(f"upstream trailer error: {code}: {message}",
+                              flush=True)
+                        yield None, f"{code}: {message}"
+                    continue
+                raw = gzip.decompress(payload) if flag & 1 else payload
+                msg = GetChatMessageResponse()
+                msg.ParseFromString(raw)
+                if first_frame:
+                    first_frame = False
+                    print(f"upstream first-frame: {time.time() - t_start:.1f}s "
+                          f"({n_msgs} msgs)", flush=True)
+                yield msg, None
+        if not end_of_stream:
+            # Connect always terminates a stream with an end-of-stream frame.
+            # Without one the connection dropped mid-answer, and reporting the
+            # partial turn as complete is what lets truncated output be stored
+            # and replayed as if the model had finished.
+            print("upstream stream ended without an end-of-stream frame",
+                  flush=True)
+            yield None, "upstream stream truncated"
+    finally:
+        # Abandoning the generator early (client disconnect) would otherwise
+        # leave the socket open until garbage collection.
+        if r is not None:
+            r.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -581,10 +671,17 @@ def _usage(u):
 
 
 def _stop_reason(stop, has_tools):
-    if has_tools:
-        return "tool_use"
+    """max_tokens outranks tool_use on purpose.
+
+    A turn cut off mid-tool-call carries a tool block whose JSON never closed.
+    Reporting that as a clean `tool_use` invites the client to execute a
+    truncated call; `max_tokens` tells it the turn was cut short, which is what
+    actually happened.
+    """
     if stop == STOP_MAX_TOKENS:
         return "max_tokens"
+    if has_tools:
+        return "tool_use"
     return "end_turn"
 
 
@@ -613,6 +710,7 @@ class AnthropicStream:
         self.open_key = None
         self.pending_signature = None
         self.started = False
+        self.tools = {}
 
     def _send(self, event, data):
         self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
@@ -675,16 +773,30 @@ class AnthropicStream:
             "type": "content_block_delta", "index": self.index,
             "delta": {"type": "text_delta", "text": text}})
 
-    def tool_start(self, tid, name):
-        self.open_block("tool", tid,
-                        {"type": "tool_use", "id": tid, "name": name, "input": {}})
+    def tool(self, tid, name, args_json):
+        """Buffer a tool call; nothing is emitted until finish().
 
-    def tool_args(self, fragment):
-        self._send("content_block_delta", {
-            "type": "content_block_delta", "index": self.index,
-            "delta": {"type": "input_json_delta", "partial_json": fragment}})
+        Streaming tool blocks through a single open slot misattributed fragments
+        whenever the upstream interleaved two call ids, and forced
+        content_block_start to go out before the name was known — neither of
+        which Anthropic's wire format lets you amend afterwards. Buffering costs
+        nothing real: a tool call is not actionable until its JSON closes.
+        """
+        self.tools[tid] = {"name": name, "json": args_json}
+
+    def flush_tools(self):
+        for tid, b in self.tools.items():
+            self.open_block("tool", tid, {"type": "tool_use", "id": tid,
+                                          "name": b["name"], "input": {}})
+            if b["json"]:
+                self._send("content_block_delta", {
+                    "type": "content_block_delta", "index": self.index,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": b["json"]}})
+        self.tools = {}
 
     def finish(self, stop_reason, usage):
+        self.flush_tools()
         self.close_block()
         self._send("message_delta", {
             "type": "message_delta",
@@ -695,6 +807,13 @@ class AnthropicStream:
     def error(self, message):
         self._send("error", {"type": "error",
                              "error": {"type": "api_error", "message": message}})
+
+    def stop(self):
+        """End a failed stream. Deliberately no message_delta: there is no
+        stop_reason that honestly describes an aborted turn, and emitting
+        end_turn would tell the client the answer is complete."""
+        self.close_block()
+        self._send("message_stop", {"type": "message_stop"})
 
 
 def run_swe(body, wfile):
@@ -727,58 +846,59 @@ def run_swe(body, wfile):
         tool_order, tool_blocks = [], {}
         usage, stop, err, emitted = {}, 0, None, False
 
-        for msg, e in chat_stream(req):
-            if e:
-                err = e
-                break
-            if msg.delta_thinking:
-                thinking.append(msg.delta_thinking)
-                if out:
-                    out.start(); emitted = True
-                    out.thinking(msg.delta_thinking)
-            if msg.delta_signature:
-                signature = msg.delta_signature
-                if out:
-                    out.signature(msg.delta_signature)
-            if msg.delta_text:
-                texts.append(msg.delta_text)
-                if out:
-                    out.start(); emitted = True
-                    out.text(msg.delta_text)
-            for tc in msg.delta_tool_calls:
-                tid = tc.id or (tool_order[-1] if tool_order else "")
-                if not tid:
-                    continue
-                if tid not in tool_blocks:
-                    tool_blocks[tid] = {"name": tc.name, "json": ""}
-                    tool_order.append(tid)
+        try:
+            for msg, e in chat_stream(req):
+                if e:
+                    err = e
+                    break
+                if msg.delta_thinking:
+                    thinking.append(msg.delta_thinking)
                     if out:
                         out.start(); emitted = True
-                        out.tool_start(tid, tc.name)
-                if tc.name:
-                    tool_blocks[tid]["name"] = tc.name
-                if tc.arguments_json:
-                    prev = tool_blocks[tid]["json"]
-                    # Cognition sometimes resends the whole buffer instead of a
-                    # delta; detect that rather than concatenating twice.
-                    if tc.arguments_json.startswith(prev):
-                        fragment = tc.arguments_json[len(prev):]
-                        tool_blocks[tid]["json"] = tc.arguments_json
-                    else:
-                        fragment = tc.arguments_json
-                        tool_blocks[tid]["json"] = prev + tc.arguments_json
-                    if out and fragment:
-                        out.tool_args(fragment)
-            if msg.usage.input_tokens or msg.usage.output_tokens or \
-                    msg.usage.cache_read_tokens or msg.usage.cache_write_tokens:
-                usage = _usage(msg.usage)
-            if msg.stop_reason:
-                stop = msg.stop_reason
-                print(f"upstream done: latency={msg.latency:.1f}s "
-                      f"usage in={msg.usage.input_tokens} "
-                      f"out={msg.usage.output_tokens} "
-                      f"cr={msg.usage.cache_read_tokens} "
-                      f"cw={msg.usage.cache_write_tokens}", flush=True)
+                        out.thinking(msg.delta_thinking)
+                if msg.delta_signature:
+                    signature = msg.delta_signature
+                    if out:
+                        out.signature(msg.delta_signature)
+                if msg.delta_text:
+                    texts.append(msg.delta_text)
+                    if out:
+                        out.start(); emitted = True
+                        out.text(msg.delta_text)
+                for tc in msg.delta_tool_calls:
+                    tid = tc.id or (tool_order[-1] if tool_order else "")
+                    if not tid:
+                        continue
+                    if tid not in tool_blocks:
+                        tool_blocks[tid] = {"name": tc.name, "json": ""}
+                        tool_order.append(tid)
+                    if tc.name:
+                        tool_blocks[tid]["name"] = tc.name
+                    if tc.arguments_json:
+                        prev = tool_blocks[tid]["json"]
+                        # Cognition sometimes resends the whole buffer instead of
+                        # a delta; detect that rather than concatenating twice.
+                        if tc.arguments_json.startswith(prev):
+                            tool_blocks[tid]["json"] = tc.arguments_json
+                        else:
+                            tool_blocks[tid]["json"] = prev + tc.arguments_json
+                if msg.usage.input_tokens or msg.usage.output_tokens or \
+                        msg.usage.cache_read_tokens or msg.usage.cache_write_tokens:
+                    usage = _usage(msg.usage)
+                if msg.stop_reason:
+                    stop = msg.stop_reason
+                    print(f"upstream done: latency={msg.latency:.1f}s "
+                          f"usage in={msg.usage.input_tokens} "
+                          f"out={msg.usage.output_tokens} "
+                          f"cr={msg.usage.cache_read_tokens} "
+                          f"cw={msg.usage.cache_write_tokens}", flush=True)
+        except (requests.RequestException, OSError, ValueError) as e:
+            # Network failure, a malformed frame, or an auth call that raised.
+            # Left uncaught these reached the handler, which for a streaming
+            # request had no path to answer: the client got a closed socket with
+            # no status line and no SSE error at all.
+            err = f"upstream {type(e).__name__}: {e}"
+            print(err, flush=True)
 
         if err and not emitted and attempt < 2 and "permission_denied" in err:
             print(f"upstream permission_denied, retrying "
@@ -790,14 +910,26 @@ def run_swe(body, wfile):
     usage = usage or {"input_tokens": 0, "output_tokens": 0}
 
     if out:
-        if err and not emitted:
-            out.start()
-            out.error(err)
-            out.finish("end_turn", usage)
-            return None, None
         out.start()
         if err:
-            out.text(f"\n\n[upstream error: {err}]\n")
+            # Never finalise a failed turn as a normal completion. Writing the
+            # error into the assistant text and then closing with end_turn made
+            # a truncated answer indistinguishable from a finished one, so the
+            # client stored it as complete and had no reason to retry.
+            out.error(err)
+            out.stop()
+            return None, None
+        for tid in tool_order:
+            raw_args = tool_blocks[tid]["json"] or "{}"
+            try:
+                json.loads(raw_args)
+            except ValueError:
+                print(f"tool call {tool_blocks[tid]['name']} has unparseable "
+                      f"arguments ({len(raw_args)} chars); dropping it and "
+                      f"reporting max_tokens", flush=True)
+                stop_reason = "max_tokens"
+                continue
+            out.tool(tid, tool_blocks[tid]["name"], raw_args)
         out.finish(stop_reason, usage)
         return None, None
 
@@ -813,10 +945,18 @@ def run_swe(body, wfile):
     if texts:
         content.append({"type": "text", "text": "".join(texts)})
     for tid in tool_order:
+        raw_args = tool_blocks[tid]["json"] or "{}"
         try:
-            args = json.loads(tool_blocks[tid]["json"] or "{}")
-        except Exception:
-            args = {}
+            args = json.loads(raw_args)
+        except ValueError:
+            # Substituting {} would hand the client a well-formed call with its
+            # arguments quietly removed — a truncated `Bash` becomes a no-arg
+            # `Bash`. Report the turn as cut short instead.
+            print(f"tool call {tool_blocks[tid]['name']} has unparseable "
+                  f"arguments ({len(raw_args)} chars); reporting max_tokens",
+                  flush=True)
+            stop_reason = "max_tokens"
+            continue
         content.append({"type": "tool_use", "id": tid,
                         "name": tool_blocks[tid]["name"], "input": args})
     return {"id": "msg_devinx", "type": "message", "role": "assistant",
@@ -837,10 +977,15 @@ SESSION.trust_env = False
 SESSION.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
 # An upstream is free to close an idle keep-alive socket at any time, and requests
 # retries nothing by default (max_retries=0) — that dead socket would otherwise
-# surface to Claude Code as a connection error and a multi-minute backoff. Retry
-# only covers failures where no response had begun, so a request is never replayed
-# after the upstream started answering.
-_RETRY = Retry(total=3, connect=3, read=0, status=0, redirect=0,
+# surface to Claude Code as a connection error and a multi-minute backoff.
+#
+# `read` has to be non-zero for that to work: urllib3 raises ProtocolError on a
+# reset keep-alive socket and _is_read_error() routes it to the read budget,
+# while `connect` only covers DNS/TCP/TLS establishment. read=0 therefore left
+# the one case this exists for uncovered. Replaying after the upstream began
+# answering is still impossible: with stream=True the retry window closes once
+# the response headers are read, and body-phase failures surface to the caller.
+_RETRY = Retry(total=3, connect=3, read=3, status=0, redirect=0,
                allowed_methods=None, backoff_factor=0.2)
 for _scheme in ("http://", "https://"):
     SESSION.mount(_scheme, requests.adapters.HTTPAdapter(
