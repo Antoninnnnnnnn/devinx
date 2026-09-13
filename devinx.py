@@ -1502,8 +1502,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             headers = {name: value for name, value in self.headers.items()
                        if name.lower() not in REQUEST_EXCLUDED}
-            r = SESSION.get(CODEX_UPSTREAM + "/models", headers=headers,
-                            timeout=(10, 20))
+            # Forward the query verbatim: Codex asks for
+            # /v1/models?client_version=…, and the upstream answers differently
+            # — or not at all — without it.
+            query = urlsplit(self.path).query
+            r = SESSION.get(CODEX_UPSTREAM + "/models"
+                            + (f"?{query}" if query else ""),
+                            headers=headers, timeout=(10, 20))
             upstream = r.json().get("models") if r.status_code == 200 else None
         except (requests.RequestException, ValueError):
             upstream = None
