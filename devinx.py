@@ -365,12 +365,13 @@ def _conv_key(body):
     msgs = body.get("messages", [])
     first_user = _text_of(
         next((m for m in msgs if m.get("role") == "user"), {}).get("content"))
-    base = (body.get("metadata") or {}).get("user_id")
-    if not base:
-        return first_user
     digest = hashlib.sha1(
         (_system_text(body) + "\0" + first_user).encode()).hexdigest()
-    return base + "\0" + digest
+    base = (body.get("metadata") or {}).get("user_id")
+    # The digest carries the discrimination, so it belongs in the fallback too:
+    # keyed on the first user turn alone, two agents with different system
+    # prompts but the same opening task would share one cascade.
+    return f"{base}\0{digest}" if base else digest
 
 
 def resolve_model(body):
@@ -521,6 +522,18 @@ def build_request(body):
               "json_schema_string": json.dumps(t.get("input_schema") or {}),
               "strict": False}
              for t in body.get("tools") or [] if t.get("name")]
+
+    # The real client never sends a tool_choice field and adding one risks the
+    # input classifier, so the only choice expressible here is "none" — and that
+    # one matters, because it forbids tool use rather than merely leaving the
+    # model free. Withholding the definitions enforces it exactly. The forcing
+    # variants cannot be expressed at all, so say so instead of ignoring them.
+    choice = (body.get("tool_choice") or {}).get("type")
+    if choice == "none":
+        tools = []
+    elif choice in ("any", "tool"):
+        print(f"warning: tool_choice={choice} is not expressible upstream; "
+              f"the model may decline to call a tool", flush=True)
 
     # Sampling config mirrors the real Devin client wire exactly:
     # num_completions/max_tokens/max_newlines/temperature/top_k/top_p only.
