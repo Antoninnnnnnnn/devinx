@@ -190,6 +190,51 @@ It is written as defaults with stated escape hatches, not as the hard
 `MUST`-gates of the original: review is chosen per change, and delegating
 nothing is a legitimate answer for a two-line fix you have already located.
 
+### Topology
+
+```text
+                      Opus / Fable
+                 root — decides and briefs
+                            |
+        +-------------------+-------------------+
+        |                   |                   |
+    explorer              worker            researcher
+    swe-2-max            swe-2-max           swe-2-max
+        |                   |
+        +---------+---------+
+                  |
+               tester
+              swe-2-max
+                  |
+               reviewer
+         swe-2-max, or claude-reviewer
+          when it is expensive to
+              get this wrong
+                  |
+                  v
+                      Opus / Fable
+          reads the real diff, verifies, reports
+```
+
+The root appears twice on purpose. It is the first thing in the chain and the
+last, and the bottom half is the half people skip.
+
+### Invoking it
+
+```text
+/devinx:swe-orchestrator
+
+Add rate limiting to the public API.
+Map the current middleware chain before touching anything.
+One worker per endpoint group, a tester for the limit boundaries
+themselves, and review this one with claude-reviewer — a limiter that
+is wrong in the permissive direction is not going to announce itself.
+```
+
+Naming the roles is optional; the skill picks them on its own. Saying it is
+worth doing when you already know the shape of the work, or when you want the
+expensive reviewer on something that looks routine and is not.
+
 ## How it works
 
 `devinx.py` speaks the Anthropic Messages API and routes on the model name.
