@@ -49,6 +49,12 @@ HOST = "127.0.0.1"
 PORT = int(os.environ.get("DEVINX_PORT", "8316"))
 
 CLAUDE_UPSTREAM = "https://api.anthropic.com"
+# Where Codex CLI sends its own traffic when authenticated with a ChatGPT
+# account. Relaying there with the caller's token is what lets the root session
+# stay on GPT while its subagents run on SWE-2: Codex only lets a provider be
+# chosen per session, never per agent, so the split has to happen here, on the
+# model name, exactly as it already does for claude-* / swe-2-*.
+CODEX_UPSTREAM = "https://chatgpt.com/backend-api/codex"
 COGNITION_UPSTREAM = "https://server.codeium.com"
 AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt"
 CHAT_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage"
@@ -421,7 +427,15 @@ def _msgid(kind, payload):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "devinx-msg\0" + kind + "\0" + blob))
 
 
-def build_request(body):
+# Cognition's input classifier rejects some long tool descriptions outright —
+# Codex's code-mode `exec` tool ships 16KB of API documentation and is refused
+# whole, while its first ~6KB passes. Rather than pattern-matching a text that
+# changes with every client release, the permission_denied retry shrinks the
+# descriptions and tries again. Measured against Codex 0.154: 6000 passes.
+TOOL_DESC_CAPS = (None, 6000, 2500)
+
+
+def build_request(body, tool_desc_cap=None):
     """Translate one Anthropic Messages body into a GetChatMessageRequest.
 
     Anthropic preserves real turn structure — one assistant message per turn, tool
@@ -528,9 +542,18 @@ def build_request(body):
         print(f"warning: dropped unsupported content blocks: "
               f"{', '.join(sorted(set(dropped)))}", flush=True)
 
+    def describe(t):
+        text = _TOOL_DESC_REWRITES.get(t.get("name"), t.get("description", ""))
+        if tool_desc_cap and len(text) > tool_desc_cap:
+            # Cut on a line boundary: stopping mid-declaration leaves the model
+            # reading a truncated type signature as if it were complete.
+            head = text[:tool_desc_cap]
+            head = head[:head.rfind("\n") + 1] or head
+            text = head + "\n(description truncated)"
+        return text
+
     tools = [{"name": t.get("name", ""),
-              "description": _TOOL_DESC_REWRITES.get(
-                  t.get("name"), t.get("description", "")),
+              "description": describe(t),
               "json_schema_string": json.dumps(t.get("input_schema") or {}),
               "strict": False}
              for t in body.get("tools") or [] if t.get("name")]
@@ -841,20 +864,26 @@ class AnthropicStream:
         self._send("message_stop", {"type": "message_stop"})
 
 
-def run_swe(body, wfile):
+def run_swe(body, wfile, make_stream=None):
     """Run one SWE-2 turn. Returns (response_dict, error) for the non-stream path;
-    streams and returns (None, None) when the client asked for SSE."""
+    streams and returns (None, None) when the client asked for SSE.
+
+    make_stream picks the wire the answer goes back on: Anthropic by default,
+    the Codex flavour of Responses when the request came in on that route. Only
+    the emitter differs — everything upstream of it is shared.
+    """
     stream = bool(body.get("stream"))
+    make_stream = make_stream or AnthropicStream
     # Report the resolved tier, not the alias, so the tier that actually ran is
     # visible in the client.
-    out = AnthropicStream(wfile, resolve_model(body)) if stream else None
+    out = make_stream(wfile, resolve_model(body)) if stream else None
 
     # Cognition's input classifier denies borderline payloads nondeterministically
     # (the same body has been observed to pass and to fail). Retry while nothing
     # has reached the client yet.
     for attempt in range(3):
         try:
-            req, model = build_request(body)
+            req, model = build_request(body, TOOL_DESC_CAPS[attempt])
         except Exception as e:
             # Typically a missing or expired Devin credential, surfaced here
             # rather than at import. The streaming client has had nothing yet, so
@@ -934,8 +963,10 @@ def run_swe(body, wfile):
             print(err, flush=True)
 
         if err and not emitted and attempt < 2 and "permission_denied" in err:
-            print(f"upstream permission_denied, retrying "
-                  f"(attempt {attempt + 2}/3)", flush=True)
+            nxt = TOOL_DESC_CAPS[attempt + 1]
+            print(f"upstream permission_denied, retrying (attempt "
+                  f"{attempt + 2}/3, tool descriptions capped at {nxt})",
+                  flush=True)
             continue
         break
 
@@ -996,6 +1027,308 @@ def run_swe(body, wfile):
             "model": resolve_model(body), "content": content,
             "stop_reason": stop_reason, "stop_sequence": None,
             "usage": usage}, None
+
+
+# --------------------------------------------------------------------------- #
+# OpenAI Responses (Codex) <-> the Anthropic shape
+# --------------------------------------------------------------------------- #
+
+# Codex's own tools are mostly "custom" ones: freeform bodies (JavaScript, for
+# the code-mode `exec` tool) rather than JSON arguments. Cognition only accepts
+# tools with a JSON schema, so a custom tool is declared as a single string
+# property and unwrapped again on the way back out. The alternative — turning
+# code mode off — hangs the client before it ever reaches us.
+CUSTOM_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {"input": {"type": "string",
+                             "description": "The freeform body of the call, "
+                                            "verbatim and unescaped."}},
+    "required": ["input"],
+}
+
+
+def _responses_text(content):
+    """Responses content is a string or a list of input_text / output_text."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(c.get("text", "") for c in content
+                   if isinstance(c, dict) and c.get("text"))
+
+
+def _responses_tools(items):
+    """Flatten Codex's namespaced additional_tools into Anthropic tool dicts.
+
+    Returns (tools, custom_names): the names in the second set take a freeform
+    body, so a call to one has to be re-emitted as custom_tool_call rather than
+    function_call.
+    """
+    tools, custom = [], set()
+
+    def add(t):
+        name = t.get("name")
+        if not name:
+            return
+        if t.get("type") == "custom":
+            custom.add(name)
+            schema = CUSTOM_TOOL_SCHEMA
+        else:
+            schema = t.get("parameters") or {}
+        tools.append({"name": name, "description": t.get("description", ""),
+                      "input_schema": schema})
+
+    for item in items:
+        if item.get("type") != "additional_tools":
+            continue
+        for entry in item.get("tools") or []:
+            if entry.get("type") == "namespace":
+                for t in entry.get("tools") or []:
+                    add(t)
+            else:
+                add(entry)
+    return tools, custom
+
+
+def responses_to_messages(body):
+    """Translate a Codex Responses request into the Anthropic-shaped body.
+
+    Going through the shape build_request() already eats, rather than writing a
+    second Cognition translator, is what stops the two front ends drifting
+    apart: cascade keys, content-derived message ids and thinking replay stay
+    defined in exactly one place.
+    """
+    items = body.get("input") or []
+    tools, custom = _responses_tools(items)
+    system = [body["instructions"]] if body.get("instructions") else []
+    messages = []
+
+    for item in items:
+        kind = item.get("type")
+        if kind in ("additional_tools", None):
+            continue
+        if kind == "message":
+            role = item.get("role")
+            text = _responses_text(item.get("content"))
+            if not text:
+                continue
+            if role in ("developer", "system"):
+                # Codex ships its system prompt as developer turns rather than
+                # an instructions field; they are the system prompt.
+                system.append(text)
+            elif role == "assistant":
+                messages.append({"role": "assistant",
+                                 "content": [{"type": "text", "text": text}]})
+            else:
+                messages.append({"role": "user",
+                                 "content": [{"type": "text", "text": text}]})
+        elif kind in ("function_call", "custom_tool_call"):
+            if kind == "custom_tool_call":
+                args = {"input": item.get("input", "")}
+            else:
+                try:
+                    args = json.loads(item.get("arguments") or "{}")
+                except ValueError:
+                    args = {}
+            messages.append({"role": "assistant", "content": [{
+                "type": "tool_use", "id": item.get("call_id", ""),
+                "name": item.get("name", ""), "input": args}]})
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": item.get("call_id", ""),
+                "content": _responses_text(item.get("output"))}]})
+        # `reasoning` items carry OpenAI's encrypted_content, which is opaque to
+        # anyone but OpenAI. Dropped rather than forwarded as garbage.
+
+    out = {
+        "model": body.get("model"),
+        "system": "\n\n".join(system),
+        "messages": messages,
+        "stream": bool(body.get("stream")),
+        "max_tokens": int(body.get("max_output_tokens") or 128000),
+    }
+    if tools:
+        out["tools"] = tools
+    # The effort slider rides in reasoning.effort here, not output_config.
+    effort = (body.get("reasoning") or {}).get("effort")
+    if effort:
+        out["output_config"] = {"effort": effort}
+    # Codex sends a stable per-thread cache key; it is a far better conversation
+    # identity than anything derivable from the prompt.
+    if body.get("prompt_cache_key"):
+        out["metadata"] = {"user_id": body["prompt_cache_key"]}
+    return out, custom
+
+
+class ResponsesStream:
+    """Emits the Codex flavour of the Responses SSE stream onto a raw socket.
+
+    Event order and field names are taken from a recorded upstream stream rather
+    than from the public API docs: this dialect carries output_index,
+    sequence_number and item_id on every event, and Codex reads them.
+    """
+
+    def __init__(self, wfile, model, custom_names=()):
+        self.w = wfile
+        self.model = model
+        self.custom = set(custom_names)
+        self.seq = 0
+        self.index = -1
+        self.item_id = None
+        self.open_text = False
+        self.text_buf = []
+        self.started = False
+        self.tools = {}
+
+    def _send(self, event, data):
+        data["sequence_number"] = self.seq
+        self.seq += 1
+        self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+        self.w.flush()
+
+    def _response(self, status, usage=None):
+        out = {"id": "resp_devinx", "object": "response",
+               "created_at": int(time.time()), "status": status,
+               "model": self.model, "output": [], "error": None,
+               "instructions": None, "incomplete_details": None,
+               "parallel_tool_calls": False, "tool_choice": "auto",
+               "tools": [], "metadata": {}}
+        if usage is not None:
+            out["usage"] = {
+                "input_tokens": usage.get("input_tokens", 0),
+                "input_tokens_details": {"cached_tokens": usage.get(
+                    "cache_read_input_tokens", 0)},
+                "output_tokens": usage.get("output_tokens", 0),
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": usage.get("input_tokens", 0)
+                + usage.get("output_tokens", 0)}
+        return out
+
+    def start(self, usage=None):
+        if self.started:
+            return
+        self.started = True
+        self.w.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                     b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
+        self.w.flush()
+        self._send("response.created", {"type": "response.created",
+                                        "response": self._response("in_progress")})
+        self._send("response.in_progress",
+                   {"type": "response.in_progress",
+                    "response": self._response("in_progress")})
+
+    def thinking(self, text):
+        """Dropped on purpose: Codex only replays reasoning it can hand back as
+        encrypted_content, which we cannot produce, and an unsigned reasoning
+        item is refused on the next turn."""
+
+    def signature(self, sig):
+        pass
+
+    def _open_text(self):
+        if self.open_text:
+            return
+        self.index += 1
+        self.item_id = f"msg_devinx_{self.index}"
+        self.open_text = True
+        self._send("response.output_item.added", {
+            "type": "response.output_item.added", "output_index": self.index,
+            "item": {"id": self.item_id, "type": "message", "status": "in_progress",
+                     "role": "assistant", "content": []}})
+        self._send("response.content_part.added", {
+            "type": "response.content_part.added", "content_index": 0,
+            "item_id": self.item_id, "output_index": self.index,
+            "part": {"type": "output_text", "annotations": [], "text": ""}})
+
+    def text(self, text):
+        self._open_text()
+        self.text_buf.append(text)
+        self._send("response.output_text.delta", {
+            "type": "response.output_text.delta", "content_index": 0,
+            "delta": text, "item_id": self.item_id, "output_index": self.index})
+
+    def _close_text(self):
+        if not self.open_text:
+            return
+        full = "".join(self.text_buf)
+        self._send("response.output_text.done", {
+            "type": "response.output_text.done", "content_index": 0,
+            "item_id": self.item_id, "output_index": self.index, "text": full})
+        self._send("response.content_part.done", {
+            "type": "response.content_part.done", "content_index": 0,
+            "item_id": self.item_id, "output_index": self.index,
+            "part": {"type": "output_text", "annotations": [], "text": full}})
+        self._send("response.output_item.done", {
+            "type": "response.output_item.done", "output_index": self.index,
+            "item": {"id": self.item_id, "type": "message", "status": "completed",
+                     "role": "assistant",
+                     "content": [{"type": "output_text", "annotations": [],
+                                  "text": full}]}})
+        self.open_text = False
+        self.text_buf = []
+
+    def tool(self, tid, name, args_json):
+        self.tools[tid] = {"name": name, "json": args_json}
+
+    def flush_tools(self):
+        for tid, b in self.tools.items():
+            self._close_text()
+            self.index += 1
+            item_id = f"call_devinx_{self.index}"
+            is_custom = b["name"] in self.custom
+            try:
+                args = json.loads(b["json"] or "{}")
+            except ValueError:
+                args = {}
+            if is_custom:
+                # Unwrap the single string property back into a freeform body.
+                payload = args.get("input", "")
+                item = {"id": item_id, "type": "custom_tool_call",
+                        "status": "in_progress", "call_id": tid,
+                        "name": b["name"], "input": ""}
+                delta_event = "response.custom_tool_call_input.delta"
+                done_event = "response.custom_tool_call_input.done"
+                done_key = "input"
+            else:
+                payload = b["json"] or "{}"
+                item = {"id": item_id, "type": "function_call",
+                        "status": "in_progress", "call_id": tid,
+                        "name": b["name"], "arguments": ""}
+                delta_event = "response.function_call_arguments.delta"
+                done_event = "response.function_call_arguments.done"
+                done_key = "arguments"
+            self._send("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": self.index, "item": item})
+            self._send(delta_event, {"type": delta_event, "delta": payload,
+                                     "item_id": item_id,
+                                     "output_index": self.index})
+            self._send(done_event, {"type": done_event, done_key: payload,
+                                    "item_id": item_id,
+                                    "output_index": self.index})
+            done_item = dict(item, status="completed", **{done_key: payload})
+            self._send("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": self.index, "item": done_item})
+        self.tools = {}
+
+    def finish(self, stop_reason, usage):
+        self.flush_tools()
+        self._close_text()
+        self._send("response.completed", {
+            "type": "response.completed",
+            "response": self._response("completed", usage)})
+
+    def error(self, message):
+        self._send("error", {"type": "error", "code": "api_error",
+                             "message": message})
+
+    def stop(self):
+        """No response.completed: a turn that failed must not be handed back as
+        a finished one, or Codex stores the truncated answer and moves on."""
+        self._send("response.incomplete", {
+            "type": "response.incomplete",
+            "response": self._response("incomplete")})
 
 
 # --------------------------------------------------------------------------- #
@@ -1083,16 +1416,26 @@ class Handler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path != "/v1/models":
             self.send_error_json(404, "not_found_error", "Not found")
             return
+        # Anthropic and OpenAI shapes in one object: Claude Code reads type /
+        # display_name / created_at, Codex reads object / created / owned_by, and
+        # the launcher's readiness probe reads id. Serving the union keeps a
+        # single endpoint honest for all three.
         models = [{"type": "model", "id": mid, "display_name": name,
-                   "created_at": "2026-01-01T00:00:00Z"}
+                   "created_at": "2026-01-01T00:00:00Z",
+                   "object": "model", "created": 1767225600,
+                   "owned_by": "devinx"}
                   for mid, name in SWE_MODELS]
-        self.send_json(200, {"data": models, "has_more": False,
+        # `data` is what Claude Code reads, `models` what Codex reads; serving
+        # both means one endpoint rather than one per client dialect.
+        self.send_json(200, {"data": models, "models": models,
+                             "has_more": False,
                              "first_id": models[0]["id"],
                              "last_id": models[-1]["id"]})
 
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path not in ("/v1/messages", "/v1/messages/count_tokens"):
+        if path not in ("/v1/messages", "/v1/messages/count_tokens",
+                        "/v1/responses"):
             self.send_error_json(404, "not_found_error", "Not found")
             return
         try:
@@ -1139,7 +1482,21 @@ class Handler(BaseHTTPRequestHandler):
             if path.endswith("count_tokens"):
                 self.send_json(200, {"input_tokens": estimate_tokens(body)})
                 return
+            if path == "/v1/responses":
+                self.serve_swe_responses(body)
+                return
             self.serve_swe(body)
+            return
+
+        # Anything else is relayed to the upstream the client would have used on
+        # its own, with the client's own credential. The path decides which one:
+        # Codex speaks Responses, Claude Code speaks Messages.
+        if path == "/v1/responses":
+            if not self.headers.get("authorization"):
+                self.send_error_json(401, "authentication_error",
+                                     "Codex login missing")
+                return
+            self.relay(raw, model, CODEX_UPSTREAM + "/responses", "codex")
             return
 
         if not model.startswith("claude-"):
@@ -1149,7 +1506,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(401, "authentication_error",
                                  "Claude Code login missing")
             return
-        self.relay_claude(raw, model)
+        self.relay(raw, model, CLAUDE_UPSTREAM + self.path, "claude")
 
     def serve_swe(self, body):
         stream = bool(body.get("stream"))
@@ -1173,7 +1530,32 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
 
-    def relay_claude(self, raw, model):
+    def serve_swe_responses(self, body):
+        """SWE-2 over the Responses wire, for Codex."""
+        try:
+            translated, custom = responses_to_messages(body)
+        except Exception as e:
+            self.send_error_json(400, "invalid_request_error",
+                                 f"could not read the Responses body: {e}")
+            return
+        if not translated.get("stream"):
+            # Codex always streams; a non-streaming caller would need a second
+            # response assembler for no one.
+            self.send_error_json(400, "invalid_request_error",
+                                 "the SWE-2 Responses route is streaming only")
+            return
+        try:
+            run_swe(translated, self.wfile,
+                    lambda w, m: ResponsesStream(w, m, custom))
+        except (BrokenPipeError, ConnectionResetError):
+            print("client disconnected mid-stream", flush=True)
+        except Exception as e:
+            print(f"route=swe-responses model={body.get('model')} "
+                  f"status={type(e).__name__}: {e}", flush=True)
+        finally:
+            self.close_connection = True
+
+    def relay(self, raw, model, url, label):
         """Transparent relay. Headers pass through untouched, including the
         caller's credential; this process adds nothing of its own."""
         response = None
@@ -1181,8 +1563,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             headers = {name: value for name, value in self.headers.items()
                        if name.lower() not in REQUEST_EXCLUDED}
-            response = SESSION.request(self.command, CLAUDE_UPSTREAM + self.path,
-                                       data=raw, headers=headers, stream=True,
+            response = SESSION.request(self.command, url, data=raw,
+                                       headers=headers, stream=True,
                                        allow_redirects=False, timeout=(15, None))
             response_started = True
             self.send_response(response.status_code)
@@ -1191,17 +1573,32 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header(name, value)
             self.send_header("connection", "close")
             self.end_headers()
+            # Diagnostic only, behind the same gate as the request dump: the
+            # upstream stream is the only authoritative description of the event
+            # vocabulary a given client version actually consumes.
+            tap = None
+            if os.environ.get("DEVINX_DUMP") and self.command != "HEAD":
+                try:
+                    tap = open(f"{os.environ['DEVINX_DUMP']}.{label}-resp."
+                               f"{time.time_ns()}.sse", "wb")
+                except OSError:
+                    tap = None
             if self.command != "HEAD":
                 for chunk in response.raw.stream(65536, decode_content=False):
                     if chunk:
+                        if tap is not None:
+                            tap.write(chunk)
                         self.wfile.write(chunk)
                         self.wfile.flush()
-            print(f"route=claude model={model} status={response.status_code}",
+            if tap is not None:
+                tap.close()
+            print(f"route={label} model={model} status={response.status_code}",
                   flush=True)
         except (BrokenPipeError, ConnectionResetError):
-            print(f"route=claude model={model} status=client_disconnected", flush=True)
+            print(f"route={label} model={model} status=client_disconnected",
+                  flush=True)
         except requests.RequestException as error:
-            print(f"route=claude model={model} status={type(error).__name__}",
+            print(f"route={label} model={model} status={type(error).__name__}",
                   flush=True)
             if not response_started:
                 self.send_error_json(502, "api_error", "Upstream unavailable")
