@@ -4,11 +4,13 @@
     python3 install.py [--force] [--port 8316] [--no-smoke] [--bin DIR]
 
 Creates a virtualenv next to this file, installs the two pinned dependencies,
-drops a `cc` launcher on PATH, installs the SWE-2 subagent definitions, and runs a
-smoke test end to end. Uses the standard library only, so it runs before any
-dependency exists.
+drops a `devinx` launcher on PATH and runs a smoke test end to end. The subagents
+and the orchestrator skill are injected per session by the launcher, so nothing is
+written into ~/.claude unless you ask for it with --global-agents. Uses the
+standard library only, so it runs before any dependency exists.
 """
 import argparse
+import glob
 import json
 import os
 import re
@@ -22,7 +24,6 @@ import venv
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MIN_PYTHON = (3, 10)
-AGENTS = ("swe2-medium.md", "swe2-high.md", "swe2-max.md")
 
 OK, WARN, BAD = "[ ok ]", "[warn]", "[fail]"
 
@@ -46,6 +47,16 @@ def data_dir():
     else:
         base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return os.path.normpath(os.path.join(base, "devinx"))
+
+
+def agent_files():
+    """Every agents/*.md the launcher injects.
+
+    Globbed rather than listed: a role added to the package is picked up here
+    without editing a constant that nothing else would notice was stale.
+    """
+    return sorted(os.path.basename(p)
+                  for p in glob.glob(os.path.join(HERE, "agents", "*.md")))
 
 
 def venv_python(root):
@@ -188,15 +199,17 @@ def install_launcher(bindir, port, force):
                   os.path.normcase(os.path.abspath(bindir))
                   for p in os.environ.get("PATH", "").split(os.pathsep) if p)
     if not on_path:
-        say(WARN, f"{bindir} is not on PATH - add it to use `cc` directly")
+        say(WARN, f"{bindir} is not on PATH - add it to use "
+                  f"`{os.path.basename(path)}` directly")
     warn_shadowed(path)
     return path
 
 
 def warn_shadowed(path):
-    """A shell function or alias named `cc` wins over anything on PATH, so the
-    launcher can be installed successfully and still never run. Python cannot see
-    the live shell's functions, but the rc files that define them are readable."""
+    """A shell function or alias with the launcher's name wins over anything on
+    PATH, so the launcher can be installed successfully and still never run.
+    Python cannot see the live shell's functions, but the rc files that define
+    them are readable."""
     name = os.path.basename(path).split(".")[0]
     pattern = re.compile(rf"^\s*(?:function\s+)?{name}\s*\(\s*\)|^\s*alias\s+{name}=",
                          re.M)
@@ -238,9 +251,9 @@ def report_agents():
     models. It also wrote into a directory the user may have relocated with
     CLAUDE_CONFIG_DIR.
     """
-    names = sorted(os.path.splitext(n)[0] for n in AGENTS)
+    names = sorted(os.path.splitext(n)[0] for n in agent_files())
     say(OK, f"agents injected per session: {', '.join(names)}")
-    stale = [n for n in AGENTS
+    stale = [n for n in agent_files()
              if os.path.exists(os.path.expanduser(f"~/.claude/agents/{n}"))]
     if stale:
         say(WARN, f"{len(stale)} agent file(s) from an older install are still "
@@ -256,7 +269,7 @@ def install_agents(force):
     dest = os.path.expanduser("~/.claude/agents")
     os.makedirs(dest, exist_ok=True)
     installed, kept = [], []
-    for name in AGENTS:
+    for name in agent_files():
         src = os.path.join(HERE, "agents", name)
         if not os.path.exists(src):
             say(WARN, f"missing agent definition {name}")
