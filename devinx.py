@@ -1038,6 +1038,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(status, {"type": "error",
                                 "error": {"type": kind, "message": message}})
 
+    def browser_origin(self):
+        """True when the request looks like it came from a web page.
+
+        The SWE-2 route spends the user's Cognition quota using a credential the
+        service holds, so unlike the Claude relay it cannot rely on the caller
+        proving anything. A page the user merely visits can POST here: a JSON
+        body sent as text/plain is a CORS simple request, so no preflight is
+        needed, and the attacker never has to read the reply for the turn to run
+        and be billed.
+
+        Browsers attach Origin to such a request and ordinary API clients do not,
+        so refusing it costs nothing. Host is checked too: under DNS rebinding
+        the address resolves to loopback while Host still carries the attacker's
+        domain. Set DEVINX_ALLOW_BROWSER=1 if you are deliberately calling this
+        from a local web UI.
+        """
+        if os.environ.get("DEVINX_ALLOW_BROWSER") == "1":
+            return False
+        if self.headers.get("origin"):
+            return True
+        host = (self.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
+        return host not in ("", "127.0.0.1", "localhost", "::1")
+
     def do_HEAD(self):
         if urlsplit(self.path).path == "/api/hello":
             self.send_response(200)
@@ -1096,6 +1119,12 @@ class Handler(BaseHTTPRequestHandler):
         model = body.get("model")
         if not isinstance(model, str) or not model:
             self.send_error_json(400, "invalid_request_error", "Missing model")
+            return
+
+        if model in SWE_MODEL_IDS and self.browser_origin():
+            self.send_error_json(
+                403, "permission_error",
+                "Refusing a browser-originated request on the SWE-2 route")
             return
 
         if model in SWE_MODEL_IDS:

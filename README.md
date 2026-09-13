@@ -142,6 +142,15 @@ Each subagent gets its own conversation key, derived from the session id plus it
 system prompt and first task. Sharing the parent's key collapses them into a
 single upstream cascade and costs the prefix cache on every continuation turn.
 
+The SWE-2 route refuses requests that carry an `Origin` header, or a `Host` that
+is not loopback. It spends your quota with a credential the service holds, so it
+cannot make the caller prove anything — and a page you merely visit could
+otherwise POST to it, since a JSON body sent as `text/plain` needs no CORS
+preflight and the attacker never has to read the reply. Browsers send `Origin`
+on such a request and API clients do not. Set `DEVINX_ALLOW_BROWSER=1` if you
+are deliberately driving it from a local web UI. This is not isolation between
+users of the machine: anything running as you can still reach the port.
+
 ## Troubleshooting
 
 Logs are in `devinx.log`, in the data directory printed by the installer
