@@ -121,6 +121,17 @@ Delegate as usual and pick the agent:
 | `swe2-high` | normal implementation, debugging, testing, review |
 | `swe2-max` | hardest architecture and debugging, quality over latency |
 
+Subagents are given `disallowedTools: ["mcp__*"]`. MCP tool schemas are re-sent
+in full on every request and there are usually many of them: measured here, a
+subagent turn drops from ~240KB to ~49KB and a cold first turn from ~58s to a
+few seconds. It is a glob rather than an allow-list on purpose — every built-in
+tool stays available, including ones a future Claude Code release adds, so the
+agents keep inheriting the native tool set.
+
+Only the subagents are affected; your main session keeps its connectors. Set
+`DEVINX_SUBAGENT_MCP=1` to give them back, or pass `--strict-mcp-config` to drop
+MCP for the whole session instead.
+
 ## How it works
 
 `devinx.py` speaks the Anthropic Messages API and routes on the model name.

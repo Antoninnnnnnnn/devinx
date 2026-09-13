@@ -113,6 +113,15 @@ def packaged_agents():
                  "prompt": prompt.lstrip("-\n").strip()}
         if meta.get("model"):
             agent["model"] = meta["model"]
+        if os.environ.get("DEVINX_SUBAGENT_MCP") != "1":
+            # MCP tool schemas are re-sent in full on every request, and there
+            # are usually a lot of them: measured here, a subagent turn goes from
+            # ~240KB to ~49KB by excluding them, and a cold first turn from ~58s
+            # to a few seconds. A glob rather than an allow-list on purpose —
+            # every built-in tool stays available, including ones added by a
+            # future Claude Code release, so the agents keep inheriting the
+            # native tool set. Only the main session keeps its connectors.
+            agent["disallowedTools"] = ["mcp__*"]
         out[name] = agent
     return out
 
