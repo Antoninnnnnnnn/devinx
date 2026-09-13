@@ -95,6 +95,23 @@ def has_ensurepip():
         return False
 
 
+def check_claude():
+    """devinx drives Claude Code, it does not install it. Checked here rather
+    than left for the launcher to discover at first run."""
+    claude = shutil.which("claude")
+    if claude:
+        say(OK, f"Claude Code found: {claude}")
+    else:
+        say(WARN, "claude is not on PATH - devinx has nothing to launch.")
+        print("        Install Claude Code first: https://claude.com/claude-code")
+    return bool(claude)
+
+
+def deps_satisfied(py):
+    return subprocess.run([py, "-c", "import requests, google.protobuf"],
+                          capture_output=True).returncode == 0
+
+
 def make_venv(force):
     py = venv_python(HERE)
     root = os.path.join(HERE, ".venv")
@@ -103,6 +120,9 @@ def make_venv(force):
 
     if os.path.exists(py) and not force:
         say(OK, "virtualenv already present")
+        if deps_satisfied(py):
+            say(OK, "dependencies already satisfied")
+            return py
     elif has_ensurepip():
         say(OK, "creating virtualenv")
         venv.EnvBuilder(with_pip=True, clear=force).create(root)
@@ -315,6 +335,7 @@ def main():
 
     print(f"devinx installer - {sys.platform}\n")
     check_python()
+    check_claude()
     check_descriptors()
     py = make_venv(args.force)
     os.makedirs(data_dir(), exist_ok=True)
