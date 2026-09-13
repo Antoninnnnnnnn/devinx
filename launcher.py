@@ -23,6 +23,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("DEVINX_PORT", "8316"))
 HOST = "127.0.0.1"
 START_TIMEOUT = 40
+# Must match devinx.SWE_ALIAS: the id the service advertises and the launcher
+# selects, and the one the readiness probe identifies devinx by.
+SWE_ALIAS = "swe-2"
 
 # Cleared so Claude Code falls back to its own claude.ai login. A leftover API key
 # or OAuth token in the environment would make it authenticate as something else.
@@ -36,7 +39,7 @@ ENV = {
     "ANTHROPIC_BASE_URL": f"http://{HOST}:{PORT}",
     # The alias, not a tier: this is the entry shown in /model, and the effort
     # slider next to it is what selects medium / high / max.
-    "ANTHROPIC_CUSTOM_MODEL_OPTION": "swe-2",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": SWE_ALIAS,
     "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES":
         "effort,max_effort,xhigh_effort,per_turn_effort",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
@@ -152,7 +155,11 @@ def listening():
         with urllib.request.urlopen(
                 f"http://{HOST}:{PORT}/v1/models", timeout=3) as r:
             data = json.loads(r.read()).get("data") or []
-        return any(str(m.get("id", "")).startswith("swe-2") for m in data)
+        # The exact alias, not a swe-2* prefix: an older gateway sharing this
+        # port advertises swe-2-max and friends without knowing `swe-2`, so a
+        # prefix match accepted it as devinx and Claude Code was pointed at a
+        # service that would then refuse the model this launcher selects.
+        return any(m.get("id") == SWE_ALIAS for m in data)
     except Exception:
         return False
 
