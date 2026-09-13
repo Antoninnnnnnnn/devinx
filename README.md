@@ -1,20 +1,31 @@
 # devinx
 
-Claude Code stays logged in with your own claude.ai subscription, while its
-subagents run natively on SWE-2 Medium, High or Max.
+Your coding agent keeps your own login. Its subagents run on SWE-2.
 
-One local service, one port, no external binary.
+Claude Code and Codex both stay signed in as you. The work they delegate goes to
+Cognition's SWE-2 — Medium, High or Max — through one local service that routes
+on the model name and nothing else.
+
+One port, no external binary, nothing written into your agent's config.
 
 ```
-devinx --devin
- └─ Claude Code (claude.ai login, no ANTHROPIC_API_KEY)
-      └─ devinx.py on 127.0.0.1:8316
-           ├─ model=claude-*  ->  api.anthropic.com      transparent relay
-           └─ model=swe-2-*   ->  server.codeium.com     SWE-2
+   devinx --or                                  devinx --cx --or
+   └─ Claude Code                               └─ Codex
+      claude.ai login                              ChatGPT login
+            │                                            │
+            └──────────►  devinx.py on :8316  ◄──────────┘
+                                 │
+                    routed on the model name
+                                 │
+         ┌───────────────────────┼───────────────────────┐
+     claude-*                swe-2-*                  gpt-*
+  api.anthropic.com      server.codeium.com    chatgpt.com/backend-api
+      relayed                 SWE-2                  relayed
 ```
 
-The subagents are real Claude Code subagents: same tools, same harness, same
-transcripts. Nothing spawns a second `claude` process.
+The subagents are real subagents of the client you launched: same tools, same
+harness, same transcripts. Nothing spawns a second process, and the credential
+for each upstream is the one its own client sent — devinx holds none of them.
 
 ## Read this first
 
@@ -23,7 +34,7 @@ looking like something it is not:
 
 - it identifies itself as the Windsurf IDE (`IDE_NAME`, `IDE_VERSION`,
   `EXT_VERSION` and a matching user-agent in `devinx.py`);
-- `_SYS_REWRITES` in `devinx.py` rewrites parts of Claude Code's system prompt
+- `_SYS_REWRITES` in `devinx.py` rewrites parts of the client's system prompt
   for the specific purpose of getting past Cognition's input classifier, which
   otherwise rejects them. That is circumvention of a check the provider put
   there, not a compatibility shim;
@@ -34,12 +45,12 @@ It runs on **your own** Devin/Windsurf subscription and spends your own quota.
 Using it plausibly breaches Cognition's terms of service. That is your call and
 your risk, not the authors'.
 
-Not affiliated with, endorsed by, or supported by Anthropic or Cognition.
+Not affiliated with, endorsed by, or supported by Anthropic, OpenAI or Cognition.
 
 ## Install
 
-Requires Python 3.10+, the [Claude Code CLI](https://claude.com/claude-code) on
-PATH, and a Devin CLI login for the SWE-2 side.
+Requires Python 3.10+, a Devin CLI login for the SWE-2 side, and at least one of
+the [Claude Code CLI](https://claude.com/claude-code) or the Codex CLI on PATH.
 
 ```sh
 python3 install.py
@@ -47,13 +58,6 @@ python3 install.py
 
 It creates a virtualenv, installs two dependencies, drops a `devinx` launcher in
 `~/.local/bin`, and runs a smoke test that ends with a real SWE-2 call.
-
-The subagent definitions are **not** installed into `~/.claude/agents`: the
-launcher injects them per session with `--agents`, so a plain session shows no
-`swe2-*` agent at all. Installing them globally would list agents that fail when
-invoked outside devin mode, since nothing routes swe-2 models there. Pass
-`--global-agents` for the old behaviour. The orchestrator skill rides along the
-same way, as a session-scoped `--plugin-dir`, and only when `--or` asks for it.
 
 If you have not logged into Devin on this machine yet, the installer prints the
 exact command — the login is interactive and cannot be automated:
@@ -65,10 +69,28 @@ XDG_DATA_HOME="<data dir printed by the installer>" devin auth login
 Useful flags: `--force` (overwrite an existing launcher and virtualenv),
 `--port N`, `--bin DIR`, `--no-smoke`, `--global-agents`.
 
+### What it does and does not touch
+
+Almost nothing is installed into your agent's configuration, because a tool that
+only works when you ask for it should also be invisible when you don't.
+
+The Claude Code subagents are **not** written into `~/.claude/agents`: the
+launcher injects them per session with `--agents`, so a plain session shows no
+`swe2-*` agent at all. Installing them globally would list agents that fail when
+invoked outside devin mode, since nothing routes swe-2 models there. Pass
+`--global-agents` for the old behaviour. The orchestrator skill rides along the
+same way, as a session-scoped `--plugin-dir`.
+
+Codex is configured entirely through per-session `-c` overrides, so your
+`config.toml`, plugins and agents are untouched. The one exception is the
+orchestrator skill, which Codex can only load as an installed plugin: the
+installer writes a `devinx.config.toml` **profile** next to your config and
+materialises the plugin cache. A profile does nothing until it is named, and the
+launcher names it only for `--codex --or`.
+
 ## Use
 
-The SWE-2 layer is opt-in. Without the flag, `devinx` is a plain passthrough to
-Claude Code: nothing is started, nothing is injected, no proxy.
+### Claude Code
 
 ```sh
 devinx                      # plain Claude Code, exactly as `claude`
@@ -78,10 +100,45 @@ devinx --d --resume         # composes with any claude flag
 devinx --resume x -p "..."  # flags and prompts pass through untouched
 ```
 
-`--or` is separate from `--devin` on purpose: the SWE-2 layer changes which
-model does the work, the orchestrator changes who decides what the work is. A
-session that just wants cheap subagents does not want a skill telling it to
-delegate, so `--devin` alone leaves the skill out entirely.
+Without a flag, `devinx` is a plain passthrough: nothing is started, nothing is
+injected, no proxy.
+
+### Codex
+
+```sh
+devinx --codex              # Codex through devinx  (--cx is a shorthand)
+devinx --cx --or            # ... with the SWE-2 roles and the orchestrator skill
+devinx --cx exec "..."      # any codex subcommand and flag passes through
+```
+
+`--codex` implies the service, the same way `--devin` does. Your root model is
+whatever your Codex config already says; only what it delegates changes.
+
+### Flags at a glance
+
+| flag | effect |
+|---|---|
+| `--devin`, `--d` | route Claude Code through devinx; inject the `swe2-*` agents |
+| `--codex`, `--cx` | route Codex through devinx; pin the SWE-2 roles |
+| `--or` | add the orchestrator skill; implies the client flag it is used with |
+| `--` | everything after it passes through verbatim |
+
+| variable | effect |
+|---|---|
+| `DEVINX_ALWAYS=1` | make the SWE-2 layer the default |
+| `DEVINX_ORCHESTRATOR=1` | make the orchestrator the default |
+| `DEVINX_SUBAGENT_MCP=1` | give subagents their MCP tools back |
+| `DEVINX_PORT` | change the port for one run |
+| `DEVINX_ALLOW_BROWSER=1` | accept browser-originated requests (see below) |
+
+`--or` is separate from the client flags on purpose: the SWE-2 layer changes
+which model does the work, the orchestrator changes who decides what the work
+is. A session that just wants cheap subagents does not want a skill telling it
+to delegate, so `--devin` alone leaves the skill out entirely.
+
+`-d` is left alone — it is Claude Code's own `--debug`. Everything after a bare
+`--` is passed through verbatim, so a prompt containing `--devin` is never
+mistaken for the flag.
 
 **devinx never adds `--dangerously-skip-permissions`.** Choosing a model and
 choosing to run tools unattended are separate decisions; pass the flag yourself
@@ -93,68 +150,22 @@ Already have your own `cc` wrapper? Add a branch to it rather than using
 
 ```sh
 --devin|--d) exec ~/devinx/.venv/bin/python ~/devinx/launcher.py --devin "$@" ;;
+--or)        exec ~/devinx/.venv/bin/python ~/devinx/launcher.py --or "$@" ;;
 ```
 
-Everything after a bare `--` is passed through verbatim, so a prompt containing
-`--devin` is never mistaken for the flag. `-d` is left alone — it is Claude
-Code's own `--debug`. Set `DEVINX_ALWAYS=1` to make the layer the default.
-
-In devin mode the service starts on demand the first time and stays up
-afterwards.
-
-### Choosing a tier for the main session
-
-`/model` offers a single `swe-2` entry. It has no tier of its own: the effort
-slider beside it picks one, which is what makes that slider meaningful.
-
-| effort | tier |
-|---|---|
-| low, medium | `swe-2-medium` |
-| high *(default)* | `swe-2-high` |
-| xhigh, max | `swe-2-max` |
-
-The three tiers are also selectable by name (`--model swe-2-high`). Asked for
-explicitly they are never retiered by effort — otherwise a subagent pinned to a
-tier would follow whatever its parent session was set to. The response reports
-the tier that actually ran, not the alias.
-
-### Choosing a tier for a subagent
-
-Delegate as usual and pick the agent:
-
-| agent | for |
-|---|---|
-| `swe2-medium` | quick searches, small mechanical edits, routine work |
-| `swe2-high` | normal implementation, debugging, testing, review |
-| `swe2-max` | hardest architecture and debugging, quality over latency |
-
-Subagents are given `disallowedTools: ["mcp__*"]`. MCP tool schemas are re-sent
-in full on every request and there are usually many of them: measured here, a
-subagent turn drops from ~240KB to ~49KB and a cold first turn from ~58s to a
-few seconds. It is a glob rather than an allow-list on purpose — every built-in
-tool stays available, including ones a future Claude Code release adds, so the
-agents keep inheriting the native tool set.
-
-Only the subagents are affected; your main session keeps its connectors. Set
-`DEVINX_SUBAGENT_MCP=1` to give them back, or pass `--strict-mcp-config` to drop
-MCP for the whole session instead.
+The service starts on demand the first time and stays up afterwards.
 
 ## Orchestration
 
-Opt in with `--or`, which implies `--devin`. Without it the skill is not loaded
-and the session behaves exactly as before.
-
-`/devinx:swe-orchestrator` turns the session around: your claude.ai model stops
-writing the code and starts running the agents that do.
+`--or` turns the session around: your own model stops writing the code and
+starts running the agents that do.
 
 The trade it is built on is that the two sides are scarce in opposite ways. Your
-claude.ai context is the thing that runs out; SWE-2 Max, on a Devin
-subscription, is not metered. So execution belongs downstream and judgment stays
-up top — architecture, decomposition, what the diff actually says, what to tell
-you.
+own context is the thing that runs out; SWE-2 Max, on a Devin subscription, is
+not metered. So execution belongs downstream and judgment stays up top —
+architecture, decomposition, what the diff actually says, what to tell you.
 
-The roles are the Luna topology, adapted for executors that are weaker than the
-orchestrator rather than merely cheaper:
+### The roles
 
 | agent | for | writes files |
 |---|---|---|
@@ -167,33 +178,37 @@ orchestrator rather than merely cheaper:
 
 Every SWE role is pinned to `swe-2-max`. There is no tier ladder and no effort
 budget to spend: Max is not rationed, so sending a task to a weaker tier buys
-nothing. `swe2-medium` and `swe2-high` stay available for explicit use.
+nothing.
 
-The read-only roles are denied `Edit`, `Write` and `NotebookEdit` outright.
-`Bash` can still write, so their prompts say it too — this closes the accidental
-path, not a determined one.
+On Claude Code the read-only roles are denied `Edit`, `Write` and
+`NotebookEdit` outright. `Bash` can still write, so their prompts say it too —
+this closes the accidental path, not a determined one.
 
-`claude-reviewer` is the one agent that costs claude.ai quota: it has no pinned
+`claude-reviewer` is the one agent that costs your own quota: it has no pinned
 model and inherits the session's own. It is for changes that are expensive to
 get wrong — security, auth, migrations, data integrity, concurrency — and the
 skill says so rather than leaving the choice to habit.
 
+### How it briefs them
+
 What the skill actually spends its length on is the asymmetry. A strong peer can
 be handed an outcome; these agents need the approach, the file list, acceptance
 criteria a command can settle, and tests declared off-limits unless changing
-them is the job. And the root reads the real diff before believing any of it: a
-subagent reporting success is a hypothesis, and the summary is the part that
-lies. Retry policy is two strikes — narrow the brief once, then take the task
-back and say that you did.
+them is the job.
 
-It is written as defaults with stated escape hatches, not as the hard
-`MUST`-gates of the original: review is chosen per change, and delegating
-nothing is a legitimate answer for a two-line fix you have already located.
+And the root reads the real diff before believing any of it: a subagent
+reporting success is a hypothesis, and the summary is the part that lies. Retry
+policy is two strikes — narrow the brief once, then take the task back and say
+that you did.
+
+It is written as defaults with stated escape hatches, not as hard `MUST`-gates:
+review is chosen per change, and delegating nothing is a legitimate answer for a
+two-line fix you have already located.
 
 ### Topology
 
 ```text
-                      Opus / Fable
+                     your own model
                  root — decides and briefs
                             |
         +-------------------+-------------------+
@@ -212,7 +227,7 @@ nothing is a legitimate answer for a two-line fix you have already located.
               get this wrong
                   |
                   v
-                      Opus / Fable
+                     your own model
           reads the real diff, verifies, reports
 ```
 
@@ -220,6 +235,9 @@ The root appears twice on purpose. It is the first thing in the chain and the
 last, and the bottom half is the half people skip.
 
 ### Invoking it
+
+On Claude Code the skill is `/devinx:swe-orchestrator`; on Codex it is
+`swe-orchestrator`. Both are also picked up on their own when a task matches.
 
 ```text
 /devinx:swe-orchestrator
@@ -235,109 +253,140 @@ Naming the roles is optional; the skill picks them on its own. Saying it is
 worth doing when you already know the shape of the work, or when you want the
 expensive reviewer on something that looks routine and is not.
 
-## Codex
+## Choosing a tier by hand
 
-The same service, the same port, the same routing rule — only the wire differs.
+Useful without the orchestrator, on Claude Code.
 
-```sh
-devinx --codex        # Codex through devinx  (--cx is a shorthand)
-devinx --cx --or      # ... with the SWE-2 roles and the orchestrator brief
-```
+`/model` offers a single `swe-2` entry. It has no tier of its own: the effort
+slider beside it picks one, which is what makes that slider meaningful.
 
-Codex speaks the Responses API, so `/v1/responses` is translated the same way
-`/v1/messages` is, and anything that is not a `swe-2-*` model is relayed to the
-upstream Codex would have used anyway, with Codex's own credential. Nothing is
-written into `~/.codex`: the whole configuration is passed as `-c` overrides for
-that one session, so your own config, plugins and agents are untouched.
+| effort | tier |
+|---|---|
+| low, medium | `swe-2-medium` |
+| high *(default)* | `swe-2-high` |
+| xhigh, max | `swe-2-max` |
 
-Two things make GPT-orchestrating-SWE-2 possible, and both were only findable by
-watching the wire:
+The three tiers are also selectable by name (`--model swe-2-high`). Asked for
+explicitly they are never retiered by effort — otherwise a subagent pinned to a
+tier would follow whatever its parent session was set to. The response reports
+the tier that actually ran, not the alias.
 
-Codex lets a model provider be chosen per session but **not per agent** — a
-role's config layer honours `model` and silently ignores `model_provider`. That
-would sink the whole idea if devinx routed by provider. It routes on the model
-name, so one global provider is all it needs.
+For a subagent, delegate as usual and pick `swe2-medium`, `swe2-high` or
+`swe2-max` directly.
 
-Codex also has **two multi-agent surfaces**, and picks between them from the
-model catalog. On V2 a spawned agent's task is handed over as ciphertext only
-OpenAI can open — an executor on any other model receives the envelope and none
-of the letter. On V1 the same task arrives in the clear. `/v1/models` therefore
-serves a catalog pinned to V1, and the launcher disables the V2 feature flag,
-which resolves ahead of the catalog. Codex's catalog parser is strict and
-rejects the entire catalog over one missing key — taking plugins, apps and MCP
-down with it rather than just the offending row — so every entry spells out
-every default it wants.
+Subagents are given `disallowedTools: ["mcp__*"]`. MCP tool schemas are re-sent
+in full on every request and there are usually many of them: measured here, a
+subagent turn drops from ~240KB to ~49KB and a cold first turn from ~58s to a
+few seconds. It is a glob rather than an allow-list on purpose — every built-in
+tool stays available, including ones a future release adds, so the agents keep
+inheriting the native tool set.
 
-`agents.default_subagent_model` is set to `swe-2-max`, so every agent spawned
-without an explicit override runs there. The five roles are the same ones the
-Claude Code side uses, as config layers pinned to the same tier.
-
-The orchestrator skill travels as a Codex plugin. Codex has no `--plugin-dir`
-and a plugin is enabled in config, not on the command line — and a `-c` override
-cannot reach it either, since the key holds a quoted segment
-(`plugins."name@marketplace".enabled`) the dotted-path parser does not resolve.
-So `install.py` writes a `devinx.config.toml` profile next to your `config.toml`
-and materialises the plugin cache, and the launcher selects that profile only
-for `--codex --or`. The profile is inert until it is named: a plain `codex`
-session, and `--codex` without `--or`, never see the skill. Installing the
-plugin enables it globally as a side effect, so the installer removes that entry
-again — and leaves it alone if you have since put settings of your own there.
-
-One difference remains. Codex has no per-agent prompt the way Claude Code does:
-everything under `[agents]` is parsed as a role except a short list of
-recognised scalars, and an unrecognised one fails config loading outright. The
-executor brief in `codex/executor.md` therefore has nowhere to hang; the roles
-carry the tier, and the orchestrator doctrine reaches the root through the
-skill.
+Only the subagents are affected; your main session keeps its connectors. Set
+`DEVINX_SUBAGENT_MCP=1` to give them back, or pass `--strict-mcp-config` to drop
+MCP for the whole session instead.
 
 ## How it works
 
-`devinx.py` speaks the Anthropic Messages API and routes on the model name.
+`devinx.py` listens on 127.0.0.1:8316 and routes on the model name. That single
+decision is what makes the whole thing possible, and the Codex section below is
+the story of why.
 
-`claude-*` is relayed to `api.anthropic.com` untouched. The service holds no
-Anthropic credential of its own and forwards yours; with no credential in the
-request it answers 401 rather than inventing one.
+**`claude-*` and `gpt-*` are relayed** to `api.anthropic.com` and
+`chatgpt.com/backend-api/codex` respectively, untouched, with the credential the
+client sent. The service holds no credential of its own for either; with none in
+the request it answers 401 rather than inventing one.
 
-`swe-2-*` is translated to Cognition's Connect-RPC `GetChatMessage`. On this
-branch no client header is forwarded at all: the Cognition request is built
-from scratch with its own header set, so the claude.ai token cannot reach it.
+**`swe-2-*` is translated** to Cognition's Connect-RPC `GetChatMessage`. No
+client header is forwarded there at all: the request is built from scratch with
+its own header set, so your claude.ai or ChatGPT token cannot reach it.
 
-Speaking Anthropic on both sides rather than translating through OpenAI in the
-middle is what keeps usage accounting exact (input, cache read and cache write
-map 1:1) and lets reasoning survive across turns: Claude Code keeps the thinking
-blocks it receives and replays them, and nothing has to be stored server-side.
+Speaking the client's own protocol on both sides, rather than translating
+through a third one in the middle, is what keeps usage accounting exact — input,
+cache read and cache write map 1:1 — and lets reasoning survive across turns:
+the client keeps the thinking blocks it receives and replays them, and nothing
+has to be stored server-side.
 
 Each subagent gets its own conversation key, derived from the session id plus its
 system prompt and first task. Sharing the parent's key collapses them into a
 single upstream cascade and costs the prefix cache on every continuation turn.
 
-The SWE-2 route refuses requests that carry an `Origin` header, or a `Host` that
-is not loopback. It spends your quota with a credential the service holds, so it
-cannot make the caller prove anything — and a page you merely visit could
+### What it took to make Codex delegate to SWE-2
+
+Codex speaks the Responses API rather than Messages, which is the easy half. The
+rest was only findable by watching the wire, and three things had to be true at
+once.
+
+**A provider is chosen per session, never per agent.** A role's config layer
+honours `model` and silently ignores `model_provider`, so the obvious design —
+point the subagents at a different provider — cannot work. Routing on the model
+name instead means one global provider is all Codex needs.
+
+**Codex has two multi-agent surfaces.** On V2 a spawned agent's task is handed
+over as ciphertext only OpenAI can open: an executor on any other model receives
+the envelope and none of the letter. On V1 the same task arrives in the clear.
+The surface is chosen from the model catalog, so `/v1/models` serves one pinned
+to V1, and the launcher disables the V2 feature flag, which resolves ahead of
+the catalog. That catalog parser is strict and rejects the whole catalog over a
+single missing key — taking plugins, apps and MCP down with it rather than just
+the offending row — so every entry spells out every default it wants.
+
+**The classifier reads tool descriptions too.** Codex's code-mode `exec` tool
+ships 16KB of API documentation and is refused whole, while its first ~6KB
+passes. Since that text changes with every release, the `permission_denied`
+retry shrinks tool descriptions rather than replaying the same body. The one
+other block that had to go is `<model_switch>`, which Codex injects whenever a
+turn changes model and which contains the *other* model's entire system prompt.
+
+With those in place, `agents.default_subagent_model` puts every spawned agent on
+`swe-2-max`, and the roles are the same five the Claude Code side uses.
+
+One difference remains. Codex has no per-agent prompt: everything under
+`[agents]` is parsed as a role except a short list of recognised scalars, and an
+unrecognised one fails config loading outright. The executor brief in
+`codex/executor.md` therefore has nowhere to hang; the roles carry the tier, and
+the orchestrator doctrine reaches the root through the skill.
+
+### Why the SWE-2 route refuses browsers
+
+It rejects any request carrying an `Origin` header, or a `Host` that is not
+loopback. That route spends your quota with a credential the service holds, so
+it cannot make the caller prove anything — and a page you merely visit could
 otherwise POST to it, since a JSON body sent as `text/plain` needs no CORS
 preflight and the attacker never has to read the reply. Browsers send `Origin`
-on such a request and API clients do not. Set `DEVINX_ALLOW_BROWSER=1` if you
-are deliberately driving it from a local web UI. This is not isolation between
-users of the machine: anything running as you can still reach the port.
+on such a request and API clients do not.
+
+Set `DEVINX_ALLOW_BROWSER=1` if you are deliberately driving it from a local web
+UI. This is not isolation between users of the machine: anything running as you
+can still reach the port.
 
 ## Troubleshooting
 
 Logs are in `devinx.log`, in the data directory printed by the installer
 (`%LOCALAPPDATA%\devinx`, `~/Library/Application Support/devinx`, or
-`$XDG_DATA_HOME/devinx`). Each request logs a line: `route=swe model=…` or
-`route=claude model=… status=…`.
+`$XDG_DATA_HOME/devinx`). Each request logs a line: `route=swe`, `route=claude`
+or `route=codex`, with the model and the status.
 
-**SWE-2 calls fail, Claude still works.** Expected when the Devin credential is
-missing or expired — the service starts anyway so the main session is unaffected.
-Log in again with the command above; the running service drops its cached
-credential when the upstream rejects it, so it picks the new one up without a
-restart.
+**SWE-2 calls fail, the rest still works.** Expected when the Devin credential
+is missing or expired — the service starts anyway so the main session is
+unaffected. Log in again with the command above; the running service drops its
+cached credential when the upstream rejects it, so it picks the new one up
+without a restart.
 
-**The launcher reports the service failed to start.** Read `devinx.log`. A port conflict
-on 8316 is the usual cause; `--port` at install time changes it.
+**The launcher reports the service failed to start.** Read `devinx.log`. A port
+conflict on 8316 is the usual cause; `--port` at install time changes it.
 
-**Everything is broken.** `claude` on its own does not go through devinx at all
-and is always available as a fallback.
+**A SWE-2 turn ends with `permission_denied`.** Cognition's input classifier
+refused the payload. The log says which attempt failed and what was capped; the
+retry shrinks tool descriptions on its own.
+
+**Checking what a Codex session will actually see**, without spending a request:
+
+```sh
+devinx --cx --or debug prompt-input
+```
+
+**Everything is broken.** `claude` and `codex` on their own do not go through
+devinx at all and are always available as a fallback.
 
 ## Refreshing the protobuf descriptors
 
