@@ -92,6 +92,10 @@ STOP_MAX_TOKENS = 3
 # the opaque signature string back, so the type is restored from this constant.
 SIGNATURE_TYPE = "sealed"
 
+# Generous enough for a long history with images, bounded so a malformed or
+# hostile content-length cannot make the process allocate without limit.
+MAX_BODY_BYTES = int(os.environ.get("DEVINX_MAX_BODY", str(128 * 1024 * 1024)))
+
 REQUEST_EXCLUDED = {
     "connection", "content-length", "host", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
@@ -363,10 +367,18 @@ def _conv_key(body):
     turns of a given agent, which is what cascade anchoring requires.
     """
     msgs = body.get("messages", [])
-    first_user = _text_of(
-        next((m for m in msgs if m.get("role") == "user"), {}).get("content"))
+    first = _blocks(next((m for m in msgs if m.get("role") == "user"), {})
+                    .get("content"))
+    # Images count as identity too: a subagent whose opening task is a screenshot
+    # would otherwise be keyed on the empty string and collide with every other
+    # image-only task.
+    first_user = "".join(b.get("text", "") for b in first if b.get("type") == "text")
+    first_images = _image_digests(
+        [img for img in (_image_of(b) for b in first if b.get("type") == "image")
+         if img])
     digest = hashlib.sha1(
-        (_system_text(body) + "\0" + first_user).encode()).hexdigest()
+        ("\0".join([_system_text(body), first_user] + first_images)).encode()
+    ).hexdigest()
     base = (body.get("metadata") or {}).get("user_id")
     # The digest carries the discrimination, so it belongs in the fallback too:
     # keyed on the first user turn alone, two agents with different system
@@ -1054,10 +1066,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("content-length", "0"))
+            if length > MAX_BODY_BYTES:
+                self.send_error_json(413, "invalid_request_error",
+                                     f"Body exceeds {MAX_BODY_BYTES} bytes")
+                return
             raw = self.rfile.read(length)
             body = json.loads(raw)
         except Exception:
             self.send_error_json(400, "invalid_request_error", "Invalid body")
+            return
+        # `[]`, `42` and `"x"` are all valid JSON. Reading .get() off them raised
+        # an uncaught AttributeError, which reached the client as a dropped
+        # connection rather than a 400.
+        if not isinstance(body, dict):
+            self.send_error_json(400, "invalid_request_error",
+                                 "Body must be a JSON object")
             return
 
         if os.environ.get("DEVINX_DUMP"):
@@ -1174,4 +1197,9 @@ class Server(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     print(f"devinx listening on http://{HOST}:{PORT}  (data: {DATA_DIR})", flush=True)
+    if os.environ.get("DEVINX_DUMP"):
+        print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
+              f"conversation and any credentials the client sends, is being "
+              f"written verbatim to {os.environ['DEVINX_DUMP']}.*.json",
+              flush=True)
     Server((HOST, PORT), Handler).serve_forever()
