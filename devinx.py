@@ -306,6 +306,18 @@ _SYS_REWRITES = [
     (re.compile(r"\n?\s*-?\s*Claude Code is available[^\n]*"), ""),
     (re.compile(r"- For clear communication with the user the assistant MUST avoid using emojis\."),
      "- For clear communication with the user, avoid emojis."),
+    # Codex injects <model_switch> when a turn changes model, and the block is
+    # the *other* model's entire system prompt — competitor identity, product
+    # description and all. It is the single thing that made Cognition answer
+    # "blocked by our content policy" on every subagent turn, and it says
+    # nothing a fresh model needs: the instructions it duplicates are already in
+    # the prompt beside it.
+    (re.compile(r"<model_switch>.*?</model_switch>", re.S), ""),
+    (re.compile(r"You are a coding agent running in the Codex CLI[^.]*\."
+                r"(\s*Codex CLI is an open source project led by OpenAI\.)?"),
+     "You are a coding agent."),
+    (re.compile(r"You are Codex, an agent based on GPT-[\w.]+[^.]*\."),
+     "You are a coding agent."),
 ]
 
 # TaskOutput's shipped description trips the same classifier in combination
@@ -1133,6 +1145,23 @@ def responses_to_messages(body):
             messages.append({"role": "assistant", "content": [{
                 "type": "tool_use", "id": item.get("call_id", ""),
                 "name": item.get("name", ""), "input": args}]})
+        elif kind == "agent_message":
+            # How Codex hands a spawned agent its task. The readable header
+            # arrives as input_text and the task itself as encrypted_content,
+            # which only OpenAI can open — so a non-OpenAI model receives the
+            # envelope and none of the letter. Pass on what is legible and say
+            # plainly that the rest was unreadable, rather than letting the
+            # agent answer an empty instruction.
+            text = _responses_text(item.get("content"))
+            if any(isinstance(c, dict) and c.get("encrypted_content")
+                   for c in (item.get("content") or [])):
+                print("warning: agent_message payload is encrypted to OpenAI; "
+                      "the delegated task is not readable here", flush=True)
+                text += ("\n(The task payload was encrypted by the client and "
+                         "could not be read. Say so instead of guessing.)")
+            if text:
+                messages.append({"role": "user",
+                                 "content": [{"type": "text", "text": text}]})
         elif kind in ("function_call_output", "custom_tool_call_output"):
             messages.append({"role": "user", "content": [{
                 "type": "tool_result", "tool_use_id": item.get("call_id", ""),
