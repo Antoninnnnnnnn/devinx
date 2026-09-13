@@ -172,9 +172,26 @@ def packaged_agents():
     return out
 
 
+def split_at_separator(args):
+    """Split at the first bare `--`.
+
+    split_args() already refuses to read flags past it; so must everything that
+    builds the command line afterwards. Injecting an option after `--` puts it
+    where the client will hand it to the prompt, and reading an `--agents` that
+    sits there rewrites text the user asked to be passed through untouched.
+    """
+    if "--" in args:
+        cut = args.index("--")
+        return list(args[:cut]), list(args[cut:])
+    return list(args), []
+
+
 def merge_agents(passthrough, agents):
     """Add --agents, merging with one the user already passed rather than
-    fighting over the flag. Their definitions win on a name clash."""
+    fighting over the flag. Their definitions win on a name clash.
+
+    Only ever called with the part before `--`.
+    """
     if not agents:
         return passthrough
     existing = {}
@@ -193,10 +210,27 @@ def merge_agents(passthrough, agents):
     return passthrough + ["--agents", json.dumps(agents)]
 
 
+# TOML basic strings escape a handful of characters and take everything else
+# as literal UTF-8. json.dumps() looked close enough and is not: it encodes a
+# character outside the basic multilingual plane as a surrogate pair, which TOML
+# rejects outright ("escaped character is not a Unicode scalar value"), so a
+# single emoji anywhere in the install path broke the whole Codex config.
+_TOML_ESCAPES = {'"': '\\"', "\\": "\\\\", "\n": "\\n", "\r": "\\r",
+                 "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+
+
 def _toml_string(text):
-    """A TOML basic string for a -c override. JSON's escaping rules for quotes,
-    backslashes and newlines are TOML's, so this is exact rather than close."""
-    return json.dumps(text)
+    """A TOML basic string for a -c override."""
+    out = ['"']
+    for ch in text:
+        if ch in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[ch])
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\u%04X" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
 
 
 def _read(name):
@@ -387,8 +421,9 @@ def main():
     # choosing to run tools unattended are separate decisions, and this tool has
     # no business making the second one on the user's behalf: pass the flag
     # yourself if you want it.
-    args = ([claude] + merge_agents(passthrough, packaged_agents())
-            + plugin_args(use_orch))
+    head, tail = split_at_separator(passthrough)
+    args = ([claude] + merge_agents(head, packaged_agents())
+            + plugin_args(use_orch) + tail)
     if sys.platform == "win32":
         # No exec() on Windows that preserves the console properly; run as a child
         # and hand back its exit code.

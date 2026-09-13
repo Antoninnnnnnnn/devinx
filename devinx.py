@@ -159,44 +159,61 @@ def descriptor_files():
         % ", ".join(candidates))
 
 
-pool = descriptor_pool.DescriptorPool()
-for _m in (timestamp_pb2, duration_pb2, any_pb2, struct_pb2, descriptor_pb2,
-           wrappers_pb2, empty_pb2, field_mask_pb2, type_pb2, source_context_pb2,
-           api_pb2):
-    _fd = descriptor_pb2.FileDescriptorProto()
-    _fd.ParseFromString(_m.DESCRIPTOR.serialized_pb)
-    try:
-        pool.Add(_fd)
-    except Exception:
-        pass
-
-_fdps = {}
-for _p in descriptor_files():
-    _fd = descriptor_pb2.FileDescriptorProto()
-    with open(_p, "rb") as _fh:
-        _fd.ParseFromString(_fh.read())
-    _fdps[_fd.name] = _fd
-# Descriptors reference each other; repeat until the dependency order resolves.
-_added = set()
-for _ in range(40):
-    for _name, _fd in _fdps.items():
-        if _name in _added:
-            continue
-        try:
-            pool.Add(_fd)
-            _added.add(_name)
-        except Exception:
-            pass
+_proto_lock = threading.Lock()
+_proto = {}
 
 
-def _msg(name):
-    return message_factory.GetMessageClass(pool.FindMessageTypeByName(name))
+def protos():
+    """Build the Cognition message classes on first SWE-2 use, never at import.
 
+    The same reasoning as the credential: the relay routes need no descriptors
+    at all, so a missing or malformed one has to degrade to "SWE-2 requests
+    fail" rather than "the service refuses to start" and take the main session
+    down with it. Loading at import meant one bad .fdp stopped Claude Code and
+    Codex from reaching their own upstreams.
+    """
+    with _proto_lock:
+        if _proto:
+            return _proto
+        pool = descriptor_pool.DescriptorPool()
+        for _m in (timestamp_pb2, duration_pb2, any_pb2, struct_pb2, descriptor_pb2,
+                   wrappers_pb2, empty_pb2, field_mask_pb2, type_pb2,
+                   source_context_pb2, api_pb2):
+            fd = descriptor_pb2.FileDescriptorProto()
+            fd.ParseFromString(_m.DESCRIPTOR.serialized_pb)
+            try:
+                pool.Add(fd)
+            except Exception:
+                pass
 
-GetUserJwtRequest = _msg("exa.auth_pb.GetUserJwtRequest")
-GetUserJwtResponse = _msg("exa.auth_pb.GetUserJwtResponse")
-GetChatMessageRequest = _msg("exa.api_server_pb.GetChatMessageRequest")
-GetChatMessageResponse = _msg("exa.api_server_pb.GetChatMessageResponse")
+        pending = {}
+        for path in descriptor_files():
+            fd = descriptor_pb2.FileDescriptorProto()
+            with open(path, "rb") as fh:
+                fd.ParseFromString(fh.read())
+            pending[fd.name] = fd
+        # Descriptors reference each other; repeat until the order resolves.
+        added = set()
+        for _ in range(40):
+            for name, fd in pending.items():
+                if name in added:
+                    continue
+                try:
+                    pool.Add(fd)
+                    added.add(name)
+                except Exception:
+                    pass
+
+        def msg(name):
+            return message_factory.GetMessageClass(pool.FindMessageTypeByName(name))
+
+        _proto.update({
+            "GetUserJwtRequest": msg("exa.auth_pb.GetUserJwtRequest"),
+            "GetUserJwtResponse": msg("exa.auth_pb.GetUserJwtResponse"),
+            "GetChatMessageRequest": msg("exa.api_server_pb.GetChatMessageRequest"),
+            "GetChatMessageResponse": msg("exa.api_server_pb.GetChatMessageResponse"),
+        })
+        return _proto
 
 
 # --------------------------------------------------------------------------- #
@@ -282,13 +299,13 @@ def get_jwt(force=False):
         now = time.time()
         if not force and _jwt["token"] and _jwt["exp"] - 60 > now:
             return _jwt["token"], _jwt["base"]
-        req = GetUserJwtRequest(metadata=_metadata())
+        req = protos()["GetUserJwtRequest"](metadata=_metadata())
         r = SESSION.post(COGNITION_UPSTREAM + AUTH_PATH,
                          data=req.SerializeToString(),
                          headers={"content-type": "application/proto",
                                   "connect-protocol-version": "1"}, timeout=30)
         r.raise_for_status()
-        resp = GetUserJwtResponse()
+        resp = protos()["GetUserJwtResponse"]()
         try:
             resp.ParseFromString(r.content)
         except Exception:
@@ -603,7 +620,7 @@ def build_request(body, tool_desc_cap=None):
 
     # Real-client request surface: no execution_id, no tool_choice, no
     # disable_parallel_tool_calls, no system_prompt_cache_options — ever.
-    req = GetChatMessageRequest(
+    req = protos()["GetChatMessageRequest"](
         metadata=_metadata(get_jwt()[0]),
         prompt=_scrub_system(_system_text(body)),
         chat_message_prompts=prompts,
@@ -702,7 +719,7 @@ def chat_stream(req):
                         yield None, f"{code}: {message}"
                     continue
                 raw = gzip.decompress(payload) if flag & 1 else payload
-                msg = GetChatMessageResponse()
+                msg = protos()["GetChatMessageResponse"]()
                 msg.ParseFromString(raw)
                 if first_frame:
                     first_frame = False

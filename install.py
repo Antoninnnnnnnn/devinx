@@ -118,9 +118,32 @@ def check_claude():
     return bool(claude)
 
 
+# Importable is not the same as the versions requirements.txt pins. A virtualenv
+# left over from an older install imports both modules perfectly well while
+# holding versions this code was never run against, and the installer would then
+# report "dependencies already satisfied" and change nothing.
+_VERSION_CHECK = """
+import sys
+from importlib.metadata import version, PackageNotFoundError
+ok = True
+for line in open(sys.argv[1], encoding='utf-8'):
+    line = line.split('#')[0].strip()
+    if '==' not in line:
+        continue
+    name, want = line.split('==', 1)
+    try:
+        if version(name.strip()) != want.strip():
+            ok = False
+    except PackageNotFoundError:
+        ok = False
+sys.exit(0 if ok else 1)
+"""
+
+
 def deps_satisfied(py):
-    return subprocess.run([py, "-c", "import requests, google.protobuf"],
-                          capture_output=True).returncode == 0
+    return subprocess.run(
+        [py, "-c", _VERSION_CHECK, os.path.join(HERE, "requirements.txt")],
+        capture_output=True).returncode == 0
 
 
 def make_venv(force):
@@ -317,8 +340,15 @@ def strip_plugin_entry(path, entry):
 
     `codex plugin add` enables the plugin for every session as a side effect of
     installing it, which is the opposite of the arrangement here: the profile
-    decides. Only a block whose body is nothing but `enabled` is removed, so an
-    entry the user has since put settings of their own into is never touched.
+    decides. Only the exact block that command writes is removed.
+
+    The section runs to the next header, but a run of comments at its end,
+    directly before that header, introduces the *next* section by convention and
+    is kept. Everything else in the body must be `enabled` and blank lines; a
+    comment or a setting of the user's own anywhere else means the block is left
+    untouched. Removing the header while leaving a setting behind would silently
+    re-parent it into the preceding section — the file stays valid and changes
+    meaning, which is the worst outcome available here.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -332,31 +362,31 @@ def strip_plugin_entry(path, entry):
             out.append(lines[i])
             i += 1
             continue
-        # Consume only the header's own `enabled` lines. Anything else — a
-        # comment introducing the next section, another setting — ends the
-        # block, so a comment that merely follows is never swallowed and a
-        # setting the user added is never silently dropped.
-        j, saw_enabled = i + 1, False
-        while j < len(lines):
-            stripped = lines[j].strip()
-            if not stripped:
-                j += 1
-                continue
-            if stripped.split("=")[0].strip() == "enabled":
-                saw_enabled = True
-                j += 1
-                continue
-            break
-        rest = lines[j].strip() if j < len(lines) else ""
-        own_settings = bool(rest) and not rest.startswith(("[", "#"))
-        if saw_enabled and not own_settings:
+        end = i + 1
+        while end < len(lines) and not lines[end].lstrip().startswith("["):
+            end += 1
+        body = lines[i + 1:end]
+        # Comments trailing the body belong to whatever comes next, not here.
+        keep_from = len(body)
+        while keep_from > 0:
+            stripped = body[keep_from - 1].strip()
+            if not stripped or stripped.startswith("#"):
+                keep_from -= 1
+            else:
+                break
+        trailing = body[keep_from:] if end < len(lines) else []
+        own = body[:keep_from] if end < len(lines) else body
+        settings = [b.strip() for b in own if b.strip()]
+        if settings and all(b.split("=")[0].strip() == "enabled" for b in settings):
             removed = True
-            i = j
             while out and not out[-1].strip():
                 out.pop()
             out.append("\n")
+            out.extend(trailing)
+            i = end
         else:
-            say(WARN, f"{path} has its own settings under {header}; leaving it")
+            say(WARN, f"{path} has settings of its own under {header}; "
+                      f"leaving the whole block alone")
             out.append(lines[i])
             i += 1
     if removed:
