@@ -870,6 +870,7 @@ def run_swe(body, wfile):
         thinking, signature, texts = [], None, []
         tool_order, tool_blocks = [], {}
         usage, stop, err, emitted = {}, 0, None, False
+        latency = 0.0
 
         try:
             for msg, e in chat_stream(req):
@@ -912,11 +913,18 @@ def run_swe(body, wfile):
                     usage = _usage(msg.usage)
                 if msg.stop_reason:
                     stop = msg.stop_reason
-                    print(f"upstream done: latency={msg.latency:.1f}s "
-                          f"usage in={msg.usage.input_tokens} "
-                          f"out={msg.usage.output_tokens} "
-                          f"cr={msg.usage.cache_read_tokens} "
-                          f"cw={msg.usage.cache_write_tokens}", flush=True)
+                    latency = msg.latency
+            # Logged after the stream rather than on the stop_reason frame:
+            # Cognition populates usage in a frame that arrives *after* that one,
+            # so reading it at stop time reported in=0 out=0 for every turn while
+            # the response returned to the client had the real figures all along.
+            if not err:
+                print(f"upstream done: latency={latency:.1f}s "
+                      f"usage in={usage.get('input_tokens', 0)} "
+                      f"out={usage.get('output_tokens', 0)} "
+                      f"cr={usage.get('cache_read_input_tokens', 0)} "
+                      f"cw={usage.get('cache_creation_input_tokens', 0)}",
+                      flush=True)
         except (requests.RequestException, OSError, ValueError) as e:
             # Network failure, a malformed frame, or an auth call that raised.
             # Left uncaught these reached the handler, which for a streaming
