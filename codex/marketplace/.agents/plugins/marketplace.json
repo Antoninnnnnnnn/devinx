@@ -1,0 +1,12 @@
+{
+  "name": "devinx",
+  "interface": { "displayName": "devinx" },
+  "plugins": [
+    {
+      "name": "swe-orchestrator",
+      "source": { "source": "local", "path": "./plugins/swe-orchestrator" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_USE" },
+      "category": "Productivity"
+    }
+  ]
+}

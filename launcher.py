@@ -207,6 +207,10 @@ def _read(name):
         return ""
 
 
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
 def codex_args(orchestrate):
     """Everything Codex needs, as -c overrides.
 
@@ -241,6 +245,19 @@ def codex_args(orchestrate):
     # outright. This one is recognised, and it is the important one: every agent
     # spawned without an explicit override lands on SWE-2 Max.
     args += ["-c", 'agents.default_subagent_model="swe-2-max"']
+    # The orchestrator skill travels as a Codex plugin, and a plugin has to be
+    # enabled in config rather than pointed at on the command line — Codex has
+    # no --plugin-dir. A -c override cannot do it either: the key holds a quoted
+    # segment (plugins."name@marketplace".enabled) that the dotted-path parser
+    # does not reach, so the entry stays at whatever config.toml says.
+    #
+    # A profile does exactly what is wanted instead. install.py writes
+    # devinx.config.toml next to config.toml, where it is inert, and selecting
+    # it here layers the marketplace and the enable on top for this session
+    # only. A plain codex session never names the profile and so never sees the
+    # skill.
+    if os.path.exists(os.path.join(codex_home(), "devinx.config.toml")):
+        args += ["-p", "devinx"]
     return args
 
 

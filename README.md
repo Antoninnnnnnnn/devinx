@@ -272,12 +272,23 @@ every default it wants.
 without an explicit override runs there. The five roles are the same ones the
 Claude Code side uses, as config layers pinned to the same tier.
 
-One difference worth knowing: Codex has no per-agent prompt the way Claude Code
-does. Everything under `[agents]` is parsed as a role except a short list of
-recognised scalars, and an unrecognised one fails config loading outright, so
-the executor and orchestrator briefs in `codex/` are not injected the way the
-skill is on the Claude side. The roles carry the tier; the doctrine is yours to
-point at.
+The orchestrator skill travels as a Codex plugin. Codex has no `--plugin-dir`
+and a plugin is enabled in config, not on the command line — and a `-c` override
+cannot reach it either, since the key holds a quoted segment
+(`plugins."name@marketplace".enabled`) the dotted-path parser does not resolve.
+So `install.py` writes a `devinx.config.toml` profile next to your `config.toml`
+and materialises the plugin cache, and the launcher selects that profile only
+for `--codex --or`. The profile is inert until it is named: a plain `codex`
+session, and `--codex` without `--or`, never see the skill. Installing the
+plugin enables it globally as a side effect, so the installer removes that entry
+again — and leaves it alone if you have since put settings of your own there.
+
+One difference remains. Codex has no per-agent prompt the way Claude Code does:
+everything under `[agents]` is parsed as a role except a short list of
+recognised scalars, and an unrecognised one fails config loading outright. The
+executor brief in `codex/executor.md` therefore has nowhere to hang; the roles
+carry the tier, and the orchestrator doctrine reaches the root through the
+skill.
 
 ## How it works
 

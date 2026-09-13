@@ -308,6 +308,112 @@ def install_agents(force):
         say(WARN, f"agents already present, left untouched: {', '.join(kept)}")
 
 
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def strip_plugin_entry(path, entry):
+    """Remove one [plugins."..."] block from config.toml, leaving the rest alone.
+
+    `codex plugin add` enables the plugin for every session as a side effect of
+    installing it, which is the opposite of the arrangement here: the profile
+    decides. Only a block whose body is nothing but `enabled` is removed, so an
+    entry the user has since put settings of their own into is never touched.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return False
+    header = f'[plugins."{entry}"]'
+    out, i, removed = [], 0, False
+    while i < len(lines):
+        if lines[i].strip() != header:
+            out.append(lines[i])
+            i += 1
+            continue
+        # Consume only the header's own `enabled` lines. Anything else — a
+        # comment introducing the next section, another setting — ends the
+        # block, so a comment that merely follows is never swallowed and a
+        # setting the user added is never silently dropped.
+        j, saw_enabled = i + 1, False
+        while j < len(lines):
+            stripped = lines[j].strip()
+            if not stripped:
+                j += 1
+                continue
+            if stripped.split("=")[0].strip() == "enabled":
+                saw_enabled = True
+                j += 1
+                continue
+            break
+        rest = lines[j].strip() if j < len(lines) else ""
+        own_settings = bool(rest) and not rest.startswith(("[", "#"))
+        if saw_enabled and not own_settings:
+            removed = True
+            i = j
+            while out and not out[-1].strip():
+                out.pop()
+            out.append("\n")
+        else:
+            say(WARN, f"{path} has its own settings under {header}; leaving it")
+            out.append(lines[i])
+            i += 1
+    if removed:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.writelines(out)
+    return removed
+
+
+def install_codex(force):
+    """Install the Codex side: a profile file, and the plugin cache it needs.
+
+    The profile sits next to config.toml and does nothing until `-p devinx`
+    selects it, which the launcher passes only for --codex --or. A plain codex
+    session never names it, so the skill is invisible there — the same promise
+    the Claude side keeps with a session-scoped --plugin-dir.
+    """
+    market = os.path.join(HERE, "codex", "marketplace")
+    if not os.path.isdir(market):
+        say(WARN, "no codex/marketplace in the package - skipping the Codex skill")
+        return
+    if not shutil.which("codex"):
+        say(WARN, "codex is not on PATH - skipping the Codex orchestrator skill")
+        return
+    home = codex_home()
+    os.makedirs(home, exist_ok=True)
+    profile = os.path.join(home, "devinx.config.toml")
+    if os.path.exists(profile) and not force:
+        say(WARN, f"{profile} exists - keeping it (use --force to overwrite)")
+    else:
+        with open(profile, "w", encoding="utf-8") as fh:
+            fh.write("# Written by devinx install.py. Inert unless selected with\n"
+                     "# `-p devinx`, which the devinx launcher passes only for\n"
+                     "# --codex --or sessions.\n"
+                     "[marketplaces.devinx]\n"
+                     'source_type = "local"\n'
+                     f'source = "{market}"\n\n'
+                     '[plugins."swe-orchestrator@devinx"]\n'
+                     "enabled = true\n")
+        say(OK, f"codex profile written: {profile}")
+
+    # The plugin has to be materialised into the cache; a profile alone leaves
+    # it "not installed" and the skill never loads.
+    r = subprocess.run(
+        ["codex", "-c", 'marketplaces.devinx.source_type="local"',
+         "-c", f'marketplaces.devinx.source="{market}"',
+         "plugin", "add", "swe-orchestrator@devinx"],
+        capture_output=True, text=True)
+    if r.returncode:
+        say(WARN, "could not install the Codex plugin:\n        "
+                  + (r.stderr or r.stdout).strip()[:300])
+        return
+    say(OK, "codex plugin installed: swe-orchestrator@devinx")
+    if strip_plugin_entry(os.path.join(home, "config.toml"),
+                          "swe-orchestrator@devinx"):
+        say(OK, "removed the global enable it wrote; the profile decides instead")
+
+
 def check_credential():
     """The Devin login is interactive and per-machine; it cannot be automated."""
     dd = data_dir()
@@ -411,6 +517,7 @@ def main():
     else:
         report_agents()
     report_skill()
+    install_codex(args.force)
     path = install_launcher(args.bin, args.port, args.force)
     have_credential = check_credential()
     if not args.no_smoke:
