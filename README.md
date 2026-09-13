@@ -52,7 +52,8 @@ The subagent definitions are **not** installed into `~/.claude/agents`: the
 launcher injects them per session with `--agents`, so a plain session shows no
 `swe2-*` agent at all. Installing them globally would list agents that fail when
 invoked outside devin mode, since nothing routes swe-2 models there. Pass
-`--global-agents` for the old behaviour.
+`--global-agents` for the old behaviour. The orchestrator skill rides along the
+same way, as a session-scoped `--plugin-dir`, and only when `--or` asks for it.
 
 If you have not logged into Devin on this machine yet, the installer prints the
 exact command — the login is interactive and cannot be automated:
@@ -72,9 +73,15 @@ Claude Code: nothing is started, nothing is injected, no proxy.
 ```sh
 devinx                      # plain Claude Code, exactly as `claude`
 devinx --devin              # with the SWE-2 layer  (--d is a shorthand)
+devinx --or                 # ... and the orchestrator skill; implies --devin
 devinx --d --resume         # composes with any claude flag
 devinx --resume x -p "..."  # flags and prompts pass through untouched
 ```
+
+`--or` is separate from `--devin` on purpose: the SWE-2 layer changes which
+model does the work, the orchestrator changes who decides what the work is. A
+session that just wants cheap subagents does not want a skill telling it to
+delegate, so `--devin` alone leaves the skill out entirely.
 
 **devinx never adds `--dangerously-skip-permissions`.** Choosing a model and
 choosing to run tools unattended are separate decisions; pass the flag yourself
@@ -131,6 +138,57 @@ agents keep inheriting the native tool set.
 Only the subagents are affected; your main session keeps its connectors. Set
 `DEVINX_SUBAGENT_MCP=1` to give them back, or pass `--strict-mcp-config` to drop
 MCP for the whole session instead.
+
+## Orchestration
+
+Opt in with `--or`, which implies `--devin`. Without it the skill is not loaded
+and the session behaves exactly as before.
+
+`/devinx:swe-orchestrator` turns the session around: your claude.ai model stops
+writing the code and starts running the agents that do.
+
+The trade it is built on is that the two sides are scarce in opposite ways. Your
+claude.ai context is the thing that runs out; SWE-2 Max, on a Devin
+subscription, is not metered. So execution belongs downstream and judgment stays
+up top — architecture, decomposition, what the diff actually says, what to tell
+you.
+
+The roles are the Luna topology, adapted for executors that are weaker than the
+orchestrator rather than merely cheaper:
+
+| agent | for | writes files |
+|---|---|---|
+| `swe2-explorer` | mapping code, tracing flow, locating symbols and tests | no |
+| `swe2-worker` | bounded implementation, targeted fixes, mechanical edits | yes |
+| `swe2-tester` | running tests, reproducing failures, adding tests | yes |
+| `swe2-researcher` | external docs, version-specific API behaviour | no |
+| `swe2-reviewer` | independent read of a finished change | no |
+| `claude-reviewer` | the same, on your own model, for high-stakes changes | no |
+
+Every SWE role is pinned to `swe-2-max`. There is no tier ladder and no effort
+budget to spend: Max is not rationed, so sending a task to a weaker tier buys
+nothing. `swe2-medium` and `swe2-high` stay available for explicit use.
+
+The read-only roles are denied `Edit`, `Write` and `NotebookEdit` outright.
+`Bash` can still write, so their prompts say it too — this closes the accidental
+path, not a determined one.
+
+`claude-reviewer` is the one agent that costs claude.ai quota: it has no pinned
+model and inherits the session's own. It is for changes that are expensive to
+get wrong — security, auth, migrations, data integrity, concurrency — and the
+skill says so rather than leaving the choice to habit.
+
+What the skill actually spends its length on is the asymmetry. A strong peer can
+be handed an outcome; these agents need the approach, the file list, acceptance
+criteria a command can settle, and tests declared off-limits unless changing
+them is the job. And the root reads the real diff before believing any of it: a
+subagent reporting success is a hypothesis, and the summary is the part that
+lies. Retry policy is two strikes — narrow the brief once, then take the task
+back and say that you did.
+
+It is written as defaults with stated escape hatches, not as the hard
+`MUST`-gates of the original: review is chosen per change, and delegating
+nothing is a legitimate answer for a two-line fix you have already located.
 
 ## How it works
 

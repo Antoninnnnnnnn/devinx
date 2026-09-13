@@ -1,0 +1,5 @@
+{
+  "name": "devinx",
+  "description": "Orchestration skill for devinx: a strong claude.ai root model driving SWE-2 Max execution subagents.",
+  "version": "1.0.0"
+}

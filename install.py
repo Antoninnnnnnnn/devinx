@@ -265,6 +265,28 @@ def report_agents():
               "install.")
 
 
+def report_skill():
+    """The orchestrator skill rides on the launcher's --plugin-dir, so like the
+    agents it exists in --devin sessions and nowhere else."""
+    skills = sorted(glob.glob(os.path.join(HERE, "plugin", "skills", "*",
+                                           "SKILL.md")))
+    if not skills:
+        say(WARN, "no orchestrator skill in plugin/skills - devin sessions will "
+                  "have the agents but no orchestration guidance")
+        return
+    # Plugin skills are invoked plugin-qualified, so report the name the user
+    # will actually type rather than the bare directory name.
+    try:
+        with open(os.path.join(HERE, "plugin", ".claude-plugin", "plugin.json"),
+                  encoding="utf-8") as fh:
+            prefix = json.load(fh).get("name", "devinx")
+    except (OSError, ValueError):
+        prefix = "devinx"
+    names = ", ".join(f"/{prefix}:{os.path.basename(os.path.dirname(p))}"
+                      for p in skills)
+    say(OK, f"skill available with --or: {names}")
+
+
 def install_agents(force):
     dest = os.path.expanduser("~/.claude/agents")
     os.makedirs(dest, exist_ok=True)
@@ -388,6 +410,7 @@ def main():
         install_agents(args.force)
     else:
         report_agents()
+    report_skill()
     path = install_launcher(args.bin, args.port, args.force)
     have_credential = check_credential()
     if not args.no_smoke:
@@ -400,6 +423,8 @@ def main():
     print(f"\n    {dx}                plain Claude Code, no proxy\n"
           f"    {dx} --devin        with the SWE-2 layer  (--d for short)\n"
           f"    {dx} --d --resume   composes with any claude flag\n\n"
+          f"    {dx} --or            adds /devinx:swe-orchestrator (implies "
+          f"--devin)\n\n"
           f"    launcher: {path}\n"
           f"    plain `claude` still works and bypasses devinx entirely.\n"
           f"    devinx never adds --dangerously-skip-permissions; pass it "

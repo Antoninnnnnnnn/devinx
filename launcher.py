@@ -58,14 +58,20 @@ ENV = {
 # accepted, it is Claude Code's own --debug short flag.
 DEVIN_FLAGS = {"--devin", "--d"}
 
+# Separately opt-in: the SWE-2 layer is about which model runs the work, the
+# orchestrator is about who decides what the work is. Most sessions want the
+# first without the second, so --devin alone leaves the skill out entirely.
+ORCH_FLAGS = {"--or"}
+
 
 def split_args(argv):
-    """Return (use_devin, args_for_claude).
+    """Return (use_devin, use_orchestrator, args_for_claude).
 
     Everything after a bare `--` is passed through untouched, so a prompt that
-    happens to contain the flag is never swallowed.
+    happens to contain a flag is never swallowed.
     """
     use_devin = os.environ.get("DEVINX_ALWAYS") == "1"
+    use_orch = os.environ.get("DEVINX_ORCHESTRATOR") == "1"
     out = []
     for i, a in enumerate(argv):
         if a == "--":
@@ -74,8 +80,14 @@ def split_args(argv):
         if a in DEVIN_FLAGS:
             use_devin = True
             continue
+        if a in ORCH_FLAGS:
+            # The orchestrator delegates to the swe2-* agents, which exist only
+            # in devin mode, so asking for it asks for that too.
+            use_orch = True
+            use_devin = True
+            continue
         out.append(a)
-    return use_devin, out
+    return use_devin, use_orch, out
 
 
 def packaged_agents():
@@ -113,6 +125,11 @@ def packaged_agents():
                  "prompt": prompt.lstrip("-\n").strip()}
         if meta.get("model"):
             agent["model"] = meta["model"]
+        # A read-only role (explorer, researcher, reviewer) denies the editing
+        # tools by name. Bash can still write, so the prompt says so too; this
+        # closes the accidental path, not a determined one.
+        blocked = [t.strip() for t in meta.get("disallowedTools", "").split(",")
+                   if t.strip()]
         if os.environ.get("DEVINX_SUBAGENT_MCP") != "1":
             # MCP tool schemas are re-sent in full on every request, and there
             # are usually a lot of them: measured here, a subagent turn goes from
@@ -121,7 +138,9 @@ def packaged_agents():
             # every built-in tool stays available, including ones added by a
             # future Claude Code release, so the agents keep inheriting the
             # native tool set. Only the main session keeps its connectors.
-            agent["disallowedTools"] = ["mcp__*"]
+            blocked.append("mcp__*")
+        if blocked:
+            agent["disallowedTools"] = blocked
         out[name] = agent
     return out
 
@@ -145,6 +164,23 @@ def merge_agents(passthrough, agents):
             return (passthrough[:i + 1] + [json.dumps(merged)]
                     + passthrough[i + 2:])
     return passthrough + ["--agents", json.dumps(agents)]
+
+
+def plugin_args(enabled):
+    """Inject the bundled orchestrator skill, only when --or asked for it.
+
+    --plugin-dir is per-session, which puts the skill on the same footing as the
+    agents: it exists where it was asked for and nowhere else. Copying it into
+    ~/.claude/skills would advertise an orchestrator in every plain session,
+    where the swe2-* agents it delegates to do not exist. The flag is
+    repeatable, so one the user passed themselves is unaffected.
+    """
+    if not enabled:
+        return []
+    plugin = os.path.join(HERE, "plugin")
+    if not os.path.isdir(plugin):
+        return []
+    return ["--plugin-dir", plugin]
 
 
 def listening():
@@ -202,7 +238,7 @@ def start_service():
 
 
 def main():
-    use_devin, passthrough = split_args(sys.argv[1:])
+    use_devin, use_orch, passthrough = split_args(sys.argv[1:])
 
     claude = shutil.which("claude")
     if not claude:
@@ -245,7 +281,8 @@ def main():
     # choosing to run tools unattended are separate decisions, and this tool has
     # no business making the second one on the user's behalf: pass the flag
     # yourself if you want it.
-    args = [claude] + merge_agents(passthrough, packaged_agents())
+    args = ([claude] + merge_agents(passthrough, packaged_agents())
+            + plugin_args(use_orch))
     if sys.platform == "win32":
         # No exec() on Windows that preserves the console properly; run as a child
         # and hand back its exit code.
