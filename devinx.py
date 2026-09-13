@@ -91,6 +91,15 @@ EFFORT_TIERS = {
 }
 DEFAULT_TIER = "swe-2-high"
 
+# Codex has two multi-agent surfaces and picks between them from the model
+# catalog. On V2 a child task is handed to the subagent as Fernet ciphertext only
+# OpenAI can open, so a non-OpenAI executor receives an envelope and no letter.
+# On V1 the same task arrives in the clear, and every catalog row is eligible as
+# a spawn target. Pinning the catalog to V1 is therefore the whole difference
+# between "GPT can delegate to SWE-2" and "it cannot".
+MULTI_AGENT_SURFACE = "v1"
+SWE_EFFORTS = ("low", "medium", "high", "xhigh")
+
 SRC_USER, SRC_SYSTEM, SRC_TOOL = 1, 2, 4
 REQ_CASCADE, PLANNER_DEFAULT = 5, 1
 STOP_MAX_TOKENS = 3
@@ -1441,6 +1450,72 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error_json(404, "not_found_error", "Not found")
 
+    @staticmethod
+    def catalog_row(slug, name, priority):
+        """One catalog entry, with every field Codex's strict parser demands.
+
+        The parser rejects the whole catalog over a single missing key — and a
+        rejected catalog takes plugins, apps and MCP down with it, not just the
+        row at fault — so the defaults are spelled out rather than left absent.
+        """
+        return {
+            "slug": slug, "display_name": name, "description": name,
+            "shell_type": "unified_exec", "visibility": "list",
+            "supported_in_api": True, "priority": priority,
+            "base_instructions": "You are a helpful coding assistant.",
+            "multi_agent_version": MULTI_AGENT_SURFACE,
+            "supported_reasoning_levels": [{"effort": e, "description": e}
+                                           for e in SWE_EFFORTS],
+            "default_reasoning_effort": "high",
+            "node_repl_disabled": False,
+            "node_repl_auto_review_required": False,
+            "include_plugin_usage_instructions": False,
+            "include_apps_usage_instructions": True,
+            "supports_reasoning_summaries": False,
+            "default_reasoning_summary": "none",
+            "support_verbosity": True, "default_verbosity": "low",
+            "apply_patch_tool_type": "freeform",
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "supports_parallel_tool_calls": True,
+            "supports_image_detail_original": False,
+            "experimental_supported_tools": [],
+            "input_modalities": ["text"],
+            "context_window": 305000, "max_context_window": 305000,
+            "supports_search_tool": False,
+        }
+
+    def codex_catalog(self):
+        """The model catalog Codex reads, with every row pinned to the V1
+        multi-agent surface.
+
+        The upstream catalog is fetched with the caller's own credential and
+        merged, so the GPT model the root runs on keeps its real metadata and
+        stays selectable; without that merge, pointing Codex at devinx would
+        hide every model the account actually has. A fetch that fails degrades
+        to the SWE-2 rows alone rather than failing the request.
+        """
+        rows = [self.catalog_row(mid, name, i)
+                for i, (mid, name) in enumerate(SWE_MODELS)]
+        auth = self.headers.get("authorization")
+        if not auth:
+            return rows
+        try:
+            headers = {name: value for name, value in self.headers.items()
+                       if name.lower() not in REQUEST_EXCLUDED}
+            r = SESSION.get(CODEX_UPSTREAM + "/models", headers=headers,
+                            timeout=(10, 20))
+            upstream = r.json().get("models") if r.status_code == 200 else None
+        except (requests.RequestException, ValueError):
+            upstream = None
+        if not isinstance(upstream, list):
+            print("codex catalog: upstream unavailable, serving swe-2 only",
+                  flush=True)
+            return rows
+        for entry in upstream:
+            if isinstance(entry, dict):
+                entry["multi_agent_version"] = MULTI_AGENT_SURFACE
+        return rows + upstream
+
     def do_GET(self):
         if urlsplit(self.path).path != "/v1/models":
             self.send_error_json(404, "not_found_error", "Not found")
@@ -1456,7 +1531,7 @@ class Handler(BaseHTTPRequestHandler):
                   for mid, name in SWE_MODELS]
         # `data` is what Claude Code reads, `models` what Codex reads; serving
         # both means one endpoint rather than one per client dialect.
-        self.send_json(200, {"data": models, "models": models,
+        self.send_json(200, {"data": models, "models": self.codex_catalog(),
                              "has_more": False,
                              "first_id": models[0]["id"],
                              "last_id": models[-1]["id"]})
