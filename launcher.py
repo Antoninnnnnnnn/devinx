@@ -10,9 +10,11 @@ instead of two that drift apart; the shell wrappers installed on PATH do nothing
 but call this file.
 """
 import glob
+import hashlib
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -322,6 +324,70 @@ def plugin_args(enabled):
     return ["--plugin-dir", plugin]
 
 
+def local_build():
+    """The fingerprint of the devinx.py sitting next to this launcher."""
+    try:
+        with open(os.path.join(HERE, "devinx.py"), "rb") as fh:
+            return hashlib.sha1(fh.read()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
+def service_state():
+    """Return (state, info) for whatever holds the port.
+
+    absent  - nothing is listening
+    foreign - something is, but it is not devinx
+    stale   - devinx, running code older than the file on disk
+    fresh   - devinx, running this code
+
+    The service deliberately outlives the sessions that use it, so closing a
+    session does not restart it and a pull leaves last week's code serving
+    today's launcher. Checking only that *something* answers is what let that
+    happen silently.
+    """
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        if sock.connect_ex((HOST, PORT)) != 0:
+            return "absent", {}
+    try:
+        with urllib.request.urlopen(
+                f"http://{HOST}:{PORT}/api/hello", timeout=3) as r:
+            info = json.loads(r.read())
+    except Exception:
+        # A devinx old enough to predate /api/hello still answers /v1/models.
+        return ("stale", {}) if listening() else ("foreign", {})
+    if info.get("service") != "devinx":
+        return "foreign", {}
+    want = local_build()
+    if want and info.get("build") != want:
+        return "stale", info
+    return "fresh", info
+
+
+def stop_service(info):
+    """Stop a devinx we identified ourselves. Never a pid we merely guessed."""
+    pid = info.get("pid")
+    if not isinstance(pid, int):
+        return False
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        return False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        with socket.socket() as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex((HOST, PORT)) != 0:
+                return True
+        time.sleep(0.2)
+    return False
+
+
 def listening():
     """True only if *devinx* answers on the port.
 
@@ -401,7 +467,29 @@ def main():
             return subprocess.call(args, env=env)
         os.execvpe(claude, args, env)
 
-    if not listening():
+    state, info = service_state()
+    if state == "stale":
+        # Restarting under a turn that is mid-flight would cut it in half, so a
+        # busy service is reported rather than replaced.
+        if info.get("inflight"):
+            sys.stderr.write(
+                f"devinx: the service on {PORT} is running older code and is "
+                f"busy ({info['inflight']} request(s) in flight).\n"
+                f"        Continuing with it. Restart when it is idle: "
+                f"kill {info.get('pid', '<pid>')}\n")
+            state = "fresh"
+        elif stop_service(info):
+            print("devinx: replacing a service running older code", flush=True)
+            state = "absent"
+        else:
+            sys.stderr.write(
+                "devinx: the service on this port is running older code and "
+                "could not be stopped automatically.\n"
+                "        Stop it by hand and run again"
+                + (f": kill {info['pid']}\n" if info.get("pid") else ".\n"))
+            state = "fresh"
+
+    if state != "fresh":
         start_service()
         deadline = time.time() + START_TIMEOUT
         while time.time() < deadline:

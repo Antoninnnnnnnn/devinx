@@ -376,6 +376,15 @@ without a restart.
 **The launcher reports the service failed to start.** Read `devinx.log`. A port
 conflict on 8316 is the usual cause; `--port` at install time changes it.
 
+**After a pull, is the running service the new code?** It is checked for you.
+The service outlives the sessions that use it on purpose — several share it, and
+closing one should not restart it for the others — so a pull otherwise leaves
+last week's code answering today's launcher, silently. Each start now stamps a
+fingerprint of its own source, and the launcher compares it against the file on
+disk: a stale service is replaced when idle, and reported rather than cut in
+half when a turn is in flight. `curl 127.0.0.1:8316/api/hello` shows the build,
+pid and how many requests are running right now.
+
 **A SWE-2 turn ends with `permission_denied`.** Cognition's input classifier
 refused the payload. The log says which attempt failed and what was capped; the
 retry shrinks tool descriptions on its own.

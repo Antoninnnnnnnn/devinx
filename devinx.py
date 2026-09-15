@@ -146,6 +146,40 @@ def data_dir():
 DATA_DIR = data_dir()
 
 
+def _build_id():
+    """A fingerprint of the code this process is running.
+
+    The service outlives the sessions that use it, on purpose: several of them
+    share it and none should pay the startup cost. The cost of that is a service
+    still running last week's code after a pull, with nothing to notice it. The
+    launcher compares this against the file on disk, so "is something listening"
+    becomes "is the right thing listening".
+    """
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.sha1(fh.read()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+BUILD = _build_id()
+
+# In-flight requests, so a restart can wait for an idle moment rather than
+# cutting a turn in half.
+_inflight_lock = threading.Lock()
+_inflight = {"n": 0}
+
+
+def _enter_request():
+    with _inflight_lock:
+        _inflight["n"] += 1
+
+
+def _leave_request():
+    with _inflight_lock:
+        _inflight["n"] -= 1
+
+
 # --------------------------------------------------------------------------- #
 # Protobuf descriptors
 # --------------------------------------------------------------------------- #
@@ -1547,6 +1581,13 @@ class Handler(BaseHTTPRequestHandler):
         return rows + upstream
 
     def do_GET(self):
+        if urlsplit(self.path).path == "/api/hello":
+            with _inflight_lock:
+                busy = _inflight["n"]
+            self.send_json(200, {"service": "devinx", "build": BUILD,
+                                 "pid": os.getpid(), "port": PORT,
+                                 "inflight": busy})
+            return
         if urlsplit(self.path).path != "/v1/models":
             self.send_error_json(404, "not_found_error", "Not found")
             return
@@ -1572,6 +1613,13 @@ class Handler(BaseHTTPRequestHandler):
                              "last_id": models[-1]["id"]})
 
     def do_POST(self):
+        _enter_request()
+        try:
+            self._do_POST()
+        finally:
+            _leave_request()
+
+    def _do_POST(self):
         path = urlsplit(self.path).path
         if path not in ("/v1/messages", "/v1/messages/count_tokens",
                         "/v1/responses"):
@@ -1769,7 +1817,8 @@ class Server(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
-    print(f"devinx listening on http://{HOST}:{PORT}  (data: {DATA_DIR})", flush=True)
+    print(f"devinx listening on http://{HOST}:{PORT}  "
+          f"(build {BUILD}, pid {os.getpid()}, data: {DATA_DIR})", flush=True)
     if os.environ.get("DEVINX_DUMP"):
         print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
               f"conversation and any credentials the client sends, is being "
