@@ -44,13 +44,23 @@ ENV = {
         "effort,max_effort,xhigh_effort,per_turn_effort",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
     # Claude Code has no catalog entry for a custom model, so it assumes a 200k
-    # window and auto-compacts there, printing a warning at startup. This states
-    # the real one. The value is inherited from the previous working setup rather
-    # than measured here; override with DEVINX_CONTEXT_TOKENS if it is wrong.
-    # Too low only compacts earlier than needed; too high pushes the failure
-    # upstream instead, so err downward if unsure.
+    # window and auto-compacts there unless told otherwise. This states the real
+    # one: 256Ki, what SWE-2 accepts.
+    #
+    # The number matters in one direction far more than the other. Too low only
+    # compacts earlier than needed; too high means auto-compact aims past what
+    # the upstream will take and the turn dies with "prompt is too long"
+    # instead. The previous 305000 did exactly that, and subagents were where it
+    # showed: they ran to ~275k before compaction was due and were refused
+    # first, so they never compacted at all — they just stopped.
+    #
+    # It has to be the environment variable. Serving context_window and
+    # runtime.max_input_tokens on the /v1/models entries looks like the right
+    # answer and is not: measured against 2.1.272, the unrecognised-model notice
+    # still reports the 200k it assumes, so gateway discovery does not size the
+    # model from the catalog. Override with DEVINX_CONTEXT_TOKENS.
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": os.environ.get(
-        "DEVINX_CONTEXT_TOKENS", "305000"),
+        "DEVINX_CONTEXT_TOKENS", str(256 * 1024)),
 }
 
 # Opt-in. Without one of these, nothing is started and nothing is injected: the

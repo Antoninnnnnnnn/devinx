@@ -129,6 +129,7 @@ whatever your Codex config already says; only what it delegates changes.
 | `DEVINX_ORCHESTRATOR=1` | make the orchestrator the default |
 | `DEVINX_SUBAGENT_MCP=1` | give subagents their MCP tools back |
 | `DEVINX_PORT` | change the port for one run |
+| `DEVINX_CONTEXT_TOKENS` | override the context window devinx declares (default 262144) |
 | `DEVINX_ALLOW_BROWSER=1` | accept browser-originated requests (see below) |
 
 `--or` is separate from the client flags on purpose: the SWE-2 layer changes
@@ -378,6 +379,14 @@ conflict on 8316 is the usual cause; `--port` at install time changes it.
 **A SWE-2 turn ends with `permission_denied`.** Cognition's input classifier
 refused the payload. The log says which attempt failed and what was capped; the
 retry shrinks tool descriptions on its own.
+
+**A subagent dies with `prompt is too long` instead of compacting.** It was told
+a larger window than SWE-2 accepts, so auto-compact was still waiting when the
+upstream refused the turn. devinx declares 262144 — the real one — through
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which is the only lever that works: a
+`context_window` on the model catalog is ignored for a model the client does not
+recognise. `DEVINX_CONTEXT_TOKENS` overrides it, and erring low costs only an
+earlier compaction.
 
 **Checking what a Codex session will actually see**, without spending a request:
 

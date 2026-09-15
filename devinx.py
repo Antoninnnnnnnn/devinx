@@ -98,6 +98,13 @@ DEFAULT_TIER = "swe-2-high"
 # a spawn target. Pinning the catalog to V1 is therefore the whole difference
 # between "GPT can delegate to SWE-2" and "it cannot".
 MULTI_AGENT_SURFACE = "v1"
+
+# What SWE-2 actually accepts. A client that assumes more compacts too late and
+# the turn dies upstream with "prompt is too long" instead — which is how this
+# was found, on subagents that never compacted at all. Advertised per model in
+# /v1/models so a client that reads the catalog can size each model on its own,
+# rather than taking one session-wide number for every model it talks to.
+SWE_CONTEXT_TOKENS = int(os.environ.get("DEVINX_CONTEXT_TOKENS", str(256 * 1024)))
 SWE_EFFORTS = ("low", "medium", "high", "xhigh")
 
 SRC_USER, SRC_SYSTEM, SRC_TOOL = 1, 2, 4
@@ -1497,7 +1504,8 @@ class Handler(BaseHTTPRequestHandler):
             "supports_image_detail_original": False,
             "experimental_supported_tools": [],
             "input_modalities": ["text"],
-            "context_window": 305000, "max_context_window": 305000,
+            "context_window": SWE_CONTEXT_TOKENS,
+            "max_context_window": SWE_CONTEXT_TOKENS,
             "supports_search_tool": False,
         }
 
@@ -1549,7 +1557,12 @@ class Handler(BaseHTTPRequestHandler):
         models = [{"type": "model", "id": mid, "display_name": name,
                    "created_at": "2026-01-01T00:00:00Z",
                    "object": "model", "created": 1767225600,
-                   "owned_by": "devinx"}
+                   "owned_by": "devinx",
+                   # Both spellings: a client reads runtime.max_input_tokens
+                   # first and falls back to context_window.
+                   "context_window": SWE_CONTEXT_TOKENS,
+                   "runtime": {"max_input_tokens": SWE_CONTEXT_TOKENS,
+                               "max_output_tokens": 128000}}
                   for mid, name in SWE_MODELS]
         # `data` is what Claude Code reads, `models` what Codex reads; serving
         # both means one endpoint rather than one per client dialect.
