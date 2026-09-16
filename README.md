@@ -402,13 +402,21 @@ upstream named, so the client backs off and resumes. Reporting them as a generic
 refused the payload. The log says which attempt failed and what was capped; the
 retry shrinks tool descriptions on its own.
 
-**A subagent dies with `prompt is too long` instead of compacting.** It was told
-a larger window than SWE-2 accepts, so auto-compact was still waiting when the
-upstream refused the turn. devinx declares 262144 — the real one — through
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which is the only lever that works: a
-`context_window` on the model catalog is ignored for a model the client does not
-recognise. `DEVINX_CONTEXT_TOKENS` overrides it, and erring low costs only an
-earlier compaction.
+**A subagent dies with `prompt is too long` instead of compacting.** Two things
+have to be right and only one of them is the window. devinx declares 262144 —
+the real one — through `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which is the only lever
+that works: a `context_window` on the model catalog is ignored for a model the
+client does not recognise. `DEVINX_CONTEXT_TOKENS` overrides it, and erring low
+costs only an earlier compaction.
+
+The other is the wording of the refusal. A client recovers from an overflow by
+parsing two numbers out of the message, and Cognition's has none in it — it says
+"The prompt is too long for this model" and nothing more, so the recovery never
+fires. devinx rewrites it as `prompt is too long: N tokens > M maximum`, with N
+estimated locally and M the declared window. Measured on one machine before that
+change: 48 overflows in a day, on requests of 1.7MB and 200 messages, while
+every turn that did compact stopped at 257k — the window was being honoured on
+one path and ignored on another.
 
 **Checking what a Codex session will actually see**, without spending a request:
 

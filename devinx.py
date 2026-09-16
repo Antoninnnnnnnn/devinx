@@ -858,16 +858,28 @@ _ERROR_TYPES = {
 _RESET_AFTER = re.compile(r"reset in (\d+) minute")
 
 
-def anthropic_error(err):
-    """Map an upstream error string onto (type, status, message, retry_after)."""
+def anthropic_error(err, body=None):
+    """Map an upstream error string onto (type, status, message, retry_after).
+
+    The overflow message is rewritten rather than forwarded. A client recovers
+    from this one by parsing two numbers out of it — measured against Claude
+    Code 2.1.272, `prompt is too long[^0-9]*(\\d+) tokens? > (\\d+)` — and
+    Cognition sends prose with no numbers in it at all ("The prompt is too long
+    for this model"), so the parse fails, the recovery never fires, and the turn
+    is simply over. Saying the same thing with the figures in it is the
+    difference between an agent that compacts and an agent that stops.
+    """
     code = err.split(":", 1)[0].strip()
     kind, status = _ERROR_TYPES.get(code, ("api_error", 502))
-    retry_after = None
+    retry_after, message = None, err
     if status == 429:
         found = _RESET_AFTER.search(err)
         if found:
             retry_after = int(found.group(1)) * 60
-    return kind, status, err, retry_after
+    elif status == 400 and "too long" in err.lower() and body is not None:
+        message = (f"prompt is too long: {estimate_tokens(body)} tokens > "
+                   f"{SWE_CONTEXT_TOKENS} maximum")
+    return kind, status, message, retry_after
 
 
 def _usage(u):
@@ -1801,12 +1813,12 @@ class Handler(BaseHTTPRequestHandler):
                 # hands an error back instead while the socket is still clean.
                 _, err = run_swe(body, self.wfile)
                 if err:
-                    kind, status, message, wait = anthropic_error(err)
+                    kind, status, message, wait = anthropic_error(err, body)
                     self.send_error_json(status, kind, message, wait)
             else:
                 resp, err = run_swe(body, None)
                 if err:
-                    kind, status, message, wait = anthropic_error(err)
+                    kind, status, message, wait = anthropic_error(err, body)
                     self.send_error_json(status, kind, message, wait)
                 else:
                     self.send_json(200, resp)
