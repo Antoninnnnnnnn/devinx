@@ -390,13 +390,24 @@ disk: a stale service is replaced when idle, and reported rather than cut in
 half when a turn is in flight. `curl 127.0.0.1:8316/api/hello` shows the build,
 pid and how many requests are running right now.
 
-**An agent stops with a rate-limit error.** SWE-2 enforces a token budget over
-a rolling window, and a burst of parallel agents empties it — measured on one
-machine, 1107 refusals against 8598 successful turns, in bursts of up to 133 in
-a row, each naming a wait of one to twelve minutes. devinx reports these as
-`rate_limit_error` with HTTP 429 and a `retry-after` carrying the wait the
-upstream named, so the client backs off and resumes. Reporting them as a generic
-`api_error`, as it used to, is what made an agent stop dead instead.
+**An agent stops with a rate-limit error.** It should no longer get that far.
+SWE-2 enforces a token budget over a rolling window, and a burst of parallel
+agents empties it — measured on one machine, 1107 refusals against 8598
+successful turns, in bursts of up to 133 in a row, each naming a wait of one to
+twelve minutes.
+
+devinx now holds the turn instead of handing the refusal back: it waits the
+delay the upstream named, with jitter so a fan-out of agents does not all return
+together and empty the window again, then retries. The client sees a request
+that took longer; the agent never stops, and the orchestrator is never told
+anything happened. Measured: a subagent refused with "reset in 1 minute" waited
+65 seconds inside one request and finished its task, its parent reporting no
+error at all.
+
+`DEVINX_RATE_WAIT` bounds the total wait (300s by default) — the client has its
+own timeout, and an answer that never comes is worse than one that says to try
+later. Past that budget the refusal does go back, as a 429 `rate_limit_error`
+carrying `retry-after`.
 
 **A SWE-2 turn ends with `permission_denied`.** Cognition's input classifier
 refused the payload. The log says which attempt failed and what was capped; the

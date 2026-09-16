@@ -27,6 +27,7 @@ import gzip
 import hashlib
 import json
 import os
+import random
 import re
 import struct
 import sys
@@ -562,6 +563,16 @@ def _msgid(kind, payload):
 # changes with every client release, the permission_denied retry shrinks the
 # descriptions and tries again. Measured against Codex 0.154: 6000 passes.
 TOOL_DESC_CAPS = (None, 6000, 2500)
+
+# A rate limit is the commonest upstream refusal by a wide margin — measured in
+# one log, 1107 against 13 real context overflows — and the upstream says how
+# long it wants: "Your limit will reset in 1 minute". Handing that back to the
+# client ends the agent and tells the orchestrator its subagent stopped. Holding
+# the request instead, waiting, and retrying keeps the turn alive: the client
+# sees a request that took longer, the agent never stops, and nobody is
+# notified of anything. Bounded, because the client has its own timeout and an
+# answer that never comes is worse than one that says to try later.
+RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "300"))
 
 
 def build_request(body, tool_desc_cap=None):
@@ -1249,7 +1260,8 @@ def run_swe(body, wfile, make_stream=None):
     # Cognition's input classifier denies borderline payloads nondeterministically
     # (the same body has been observed to pass and to fail). Retry while nothing
     # has reached the client yet.
-    for attempt in range(3):
+    attempt, waited = 0, 0.0
+    while attempt < 3:
         try:
             req, model = build_request(body, TOOL_DESC_CAPS[attempt])
         except Exception as e:
@@ -1328,11 +1340,29 @@ def run_swe(body, wfile, make_stream=None):
             err = f"upstream {type(e).__name__}: {e}"
             print(err, flush=True)
 
+        if err and not emitted and "resource_exhausted" in err:
+            # Wait it out rather than end the agent. The upstream named a delay;
+            # jitter keeps a fan-out of subagents from all coming back at once
+            # and emptying the window again together.
+            found = _RESET_AFTER.search(err)
+            wait = min(int(found.group(1)) * 60 if found else 30,
+                       RATE_WAIT_BUDGET - waited)
+            if wait > 0:
+                wait += random.uniform(0, min(5.0, wait * 0.1))
+                print(f"upstream rate limited, holding the turn for "
+                      f"{wait:.0f}s ({waited:.0f}s waited so far)", flush=True)
+                time.sleep(wait)
+                waited += wait
+                continue
+            print(f"upstream rate limited and {RATE_WAIT_BUDGET}s of waiting is "
+                  f"spent; handing it back", flush=True)
+            break
         if err and not emitted and attempt < 2 and "permission_denied" in err:
             nxt = TOOL_DESC_CAPS[attempt + 1]
             print(f"upstream permission_denied, retrying (attempt "
                   f"{attempt + 2}/3, tool descriptions capped at {nxt})",
                   flush=True)
+            attempt += 1
             continue
         break
 
@@ -2103,21 +2133,39 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+def _image_tokens(block):
+    """What an image costs, near enough to decide whether a turn will fit.
+
+    Counted at all, which it was not: a conversation carrying screenshots read
+    as far smaller than it is, so compaction never triggered and the turn died
+    upstream instead. Bounded either side because images are resized before
+    they are charged — a huge one does not cost proportionally more.
+    """
+    src = block.get("source") or {}
+    size = len(src.get("data") or "")
+    return min(1600, max(200, size // 500))
+
+
 def estimate_tokens(body):
-    """Rough local estimate for count_tokens. Cognition exposes no counting
-    endpoint, and Claude Code only uses this as a pre-flight hint."""
-    chars = len(_system_text(body))
+    """Rough local estimate. Cognition exposes no counting endpoint; this is
+    what count_tokens answers and what compaction decides on."""
+    chars, tokens = len(_system_text(body)), 0
     for m in body.get("messages", []):
         for b in _blocks(m.get("content")):
             chars += len(b.get("text") or b.get("thinking") or "")
+            if b.get("type") == "image":
+                tokens += _image_tokens(b)
             if b.get("type") == "tool_result":
                 chars += len(_tool_result_text(b))
+                for inner in _blocks(b.get("content")):
+                    if inner.get("type") == "image":
+                        tokens += _image_tokens(inner)
             if b.get("type") == "tool_use":
                 chars += len(json.dumps(b.get("input") or {}))
     for t in body.get("tools") or []:
         chars += len(t.get("description", "")) + \
             len(json.dumps(t.get("input_schema") or {}))
-    return max(1, chars // 4)
+    return max(1, chars // 4 + tokens)
 
 
 class Server(ThreadingHTTPServer):
