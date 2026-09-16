@@ -107,6 +107,56 @@ MULTI_AGENT_SURFACE = "v1"
 SWE_CONTEXT_TOKENS = int(os.environ.get("DEVINX_CONTEXT_TOKENS", str(256 * 1024)))
 SWE_EFFORTS = ("low", "medium", "high", "xhigh")
 
+# Cognition issues tool call ids like `read_file_0#6bd71a46…`, and Anthropic
+# requires ^[a-zA-Z0-9_-]+$ and rejects the entire request over one that is not.
+# Nothing complains while the conversation stays on swe-2; the moment any turn of
+# it goes to api.anthropic.com — a model switch, a claude-* subagent — the whole
+# history is refused with a 400 naming a block number and nothing else.
+_TOOL_ID_OK = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def safe_tool_id(tid):
+    """A tool id Anthropic will accept, derived from one it might not.
+
+    Deterministic, because the same call has to keep the same id across every
+    replay of the conversation, and suffixed with a digest of the original so
+    two ids that differ only in the characters being replaced cannot collide.
+    """
+    if not tid or _TOOL_ID_OK.match(tid):
+        return tid
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", tid)
+    return f"{cleaned}_{hashlib.sha1(tid.encode()).hexdigest()[:8]}"
+
+
+def repair_tool_ids(body):
+    """Rewrite tool ids a previous devinx wrote into a transcript.
+
+    The relay is a passthrough and stays one for every request that does not
+    need this: the body is only re-serialised when something actually changed.
+    Without it a conversation that ran on swe-2 can never be continued on a
+    claude-* model, because the ids already stored in its transcript are the
+    ones the API refuses.
+    """
+    changed = False
+    for message in body.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            for key in ("id", "tool_use_id"):
+                if block.get("type") not in ("tool_use", "tool_result"):
+                    continue
+                value = block.get(key)
+                if isinstance(value, str):
+                    fixed = safe_tool_id(value)
+                    if fixed != value:
+                        block[key] = fixed
+                        changed = True
+    return changed
+
+
 SRC_USER, SRC_SYSTEM, SRC_TOOL = 1, 2, 4
 REQ_CASCADE, PLANNER_DEFAULT = 5, 1
 STOP_MAX_TOKENS = 3
@@ -729,7 +779,8 @@ def chat_stream(req):
             yield None, f"upstream {status}: {detail}"
             return
         print(f"upstream conn: {time.time() - t_start:.1f}s to headers "
-              f"({n_msgs} msgs, {len(body) // 1024}KB req)", flush=True)
+              f"(model={req.chat_model_uid} {n_msgs} msgs, "
+              f"{len(body) // 1024}KB req)", flush=True)
         buf = b""
         first_frame = True
         end_of_stream = False
@@ -785,6 +836,39 @@ def chat_stream(req):
 # --------------------------------------------------------------------------- #
 # Cognition response -> Anthropic Messages
 # --------------------------------------------------------------------------- #
+
+# Connect error code -> (Anthropic error type, HTTP status). The type is not
+# cosmetic: a client backs off and retries a rate_limit_error, and compacts on an
+# invalid_request_error that says the prompt is too long, while an api_error just
+# ends the turn. Reporting every upstream refusal as api_error is why a
+# rate-limited subagent stopped dead instead of waiting out the minute it was
+# told to wait — measured in one log: 1107 rate limits against 13 real overflows.
+_ERROR_TYPES = {
+    "resource_exhausted": ("rate_limit_error", 429),
+    "invalid_argument": ("invalid_request_error", 400),
+    "permission_denied": ("permission_error", 403),
+    "unauthenticated": ("authentication_error", 401),
+    "deadline_exceeded": ("timeout_error", 408),
+    "unavailable": ("overloaded_error", 503),
+}
+
+
+# The upstream says how long the wait is ("Your limit will reset in 11
+# minutes"). Passing that on as retry-after turns a guess into an instruction.
+_RESET_AFTER = re.compile(r"reset in (\d+) minute")
+
+
+def anthropic_error(err):
+    """Map an upstream error string onto (type, status, message, retry_after)."""
+    code = err.split(":", 1)[0].strip()
+    kind, status = _ERROR_TYPES.get(code, ("api_error", 502))
+    retry_after = None
+    if status == 429:
+        found = _RESET_AFTER.search(err)
+        if found:
+            retry_after = int(found.group(1)) * 60
+    return kind, status, err, retry_after
+
 
 def _usage(u):
     """Cognition usage maps 1:1 onto Anthropic's — no arithmetic in between."""
@@ -931,9 +1015,9 @@ class AnthropicStream:
             "usage": usage})
         self._send("message_stop", {"type": "message_stop"})
 
-    def error(self, message):
+    def error(self, message, kind="api_error"):
         self._send("error", {"type": "error",
-                             "error": {"type": "api_error", "message": message}})
+                             "error": {"type": kind, "message": message}})
 
     def stop(self):
         """End a failed stream. Deliberately no message_delta: there is no
@@ -967,13 +1051,10 @@ def run_swe(body, wfile, make_stream=None):
             # Typically a missing or expired Devin credential, surfaced here
             # rather than at import. The streaming client has had nothing yet, so
             # it needs a real SSE error instead of a silently closed socket.
-            reason = f"request build: {e}"
-            if out:
-                out.start()
-                out.error(reason)
-                out.finish("end_turn", {"input_tokens": 0, "output_tokens": 0})
-                return None, None
-            return None, reason
+            # Nothing has been written yet either way, so this goes back as a
+            # status the client can act on rather than as a 200 stream whose
+            # only content is an error — and never as a finished turn.
+            return None, f"request build: {e}"
 
         thinking, signature, texts = [], None, []
         tool_order, tool_blocks = [], {}
@@ -1000,7 +1081,8 @@ def run_swe(body, wfile, make_stream=None):
                         out.start(); emitted = True
                         out.text(msg.delta_text)
                 for tc in msg.delta_tool_calls:
-                    tid = tc.id or (tool_order[-1] if tool_order else "")
+                    tid = safe_tool_id(tc.id) or (tool_order[-1]
+                                                  if tool_order else "")
                     if not tid:
                         continue
                     if tid not in tool_blocks:
@@ -1053,13 +1135,19 @@ def run_swe(body, wfile, make_stream=None):
     usage = usage or {"input_tokens": 0, "output_tokens": 0}
 
     if out:
+        if err and not emitted:
+            # Nothing has reached the client yet, so the failure can still be
+            # what it actually is: an HTTP status the client knows how to act
+            # on. Opening a 200 stream and putting the error inside it turns a
+            # rate limit the client would have waited out into a dead turn.
+            return None, err
         out.start()
         if err:
             # Never finalise a failed turn as a normal completion. Writing the
             # error into the assistant text and then closing with end_turn made
             # a truncated answer indistinguishable from a finished one, so the
             # client stored it as complete and had no reason to retry.
-            out.error(err)
+            out.error(err, anthropic_error(err)[0])
             out.stop()
             return None, None
         for tid in tool_order:
@@ -1460,10 +1548,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
-    def send_json(self, status, body):
+    def send_json(self, status, body, retry_after=None):
         raw = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
+        if retry_after is not None:
+            self.send_header("retry-after", str(retry_after))
         self.send_header("content-length", str(len(raw)))
         self.send_header("connection", "close")
         self.end_headers()
@@ -1471,9 +1561,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
         self.close_connection = True
 
-    def send_error_json(self, status, kind, message):
+    def send_error_json(self, status, kind, message, retry_after=None):
         self.send_json(status, {"type": "error",
-                                "error": {"type": kind, "message": message}})
+                                "error": {"type": kind, "message": message}},
+                       retry_after=retry_after)
 
     def browser_origin(self):
         """True when the request looks like it came from a web page.
@@ -1693,18 +1784,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(401, "authentication_error",
                                  "Claude Code login missing")
             return
+        # A transcript written before ids were normalised still holds the ones
+        # Anthropic refuses, and would be unusable on a claude-* model forever.
+        # The body is rebuilt only when something actually changed, so every
+        # other request is relayed byte for byte as before.
+        if repair_tool_ids(body):
+            raw = json.dumps(body).encode()
+            print("repaired tool ids carried by an older transcript", flush=True)
         self.relay(raw, model, CLAUDE_UPSTREAM + self.path, "claude")
 
     def serve_swe(self, body):
         stream = bool(body.get("stream"))
         try:
             if stream:
-                # run_swe owns the raw socket from here.
-                run_swe(body, self.wfile)
+                # run_swe owns the raw socket once it has written anything; it
+                # hands an error back instead while the socket is still clean.
+                _, err = run_swe(body, self.wfile)
+                if err:
+                    kind, status, message, wait = anthropic_error(err)
+                    self.send_error_json(status, kind, message, wait)
             else:
                 resp, err = run_swe(body, None)
                 if err:
-                    self.send_error_json(502, "api_error", err)
+                    kind, status, message, wait = anthropic_error(err)
+                    self.send_error_json(status, kind, message, wait)
                 else:
                     self.send_json(200, resp)
         except (BrokenPipeError, ConnectionResetError):

@@ -161,10 +161,15 @@ The service starts on demand the first time and stays up afterwards.
 `--or` turns the session around: your own model stops writing the code and
 starts running the agents that do.
 
-The trade it is built on is that the two sides are scarce in opposite ways. Your
-own context is the thing that runs out; SWE-2 Max, on a Devin subscription, is
-not metered. So execution belongs downstream and judgment stays up top —
-architecture, decomposition, what the diff actually says, what to tell you.
+The trade it is built on is that the two sides are scarce in different ways.
+Your own context is the thing that runs out fastest; SWE-2 is far cheaper but
+not free — it enforces a token budget over a rolling window, and a burst of
+parallel agents empties it, after which calls are refused for one to twelve
+minutes. devinx reports that refusal as a `rate_limit_error` with the wait the
+upstream named, so the client backs off instead of killing the agent.
+
+So execution belongs downstream and judgment stays up top — architecture,
+decomposition, what the diff actually says, what to tell you.
 
 ### The roles
 
@@ -177,9 +182,9 @@ architecture, decomposition, what the diff actually says, what to tell you.
 | `swe2-reviewer` | independent read of a finished change | no |
 | `claude-reviewer` | the same, on your own model, for high-stakes changes | no |
 
-Every SWE role is pinned to `swe-2-max`. There is no tier ladder and no effort
-budget to spend: Max is not rationed, so sending a task to a weaker tier buys
-nothing.
+Every SWE role is pinned to `swe-2-max`, because it is the strongest — not
+because it is free. Under rate limiting a weaker tier is a real lever: the same
+mechanical edit costs less of the shared budget on `swe2-medium`.
 
 On Claude Code the read-only roles are denied `Edit`, `Write` and
 `NotebookEdit` outright. `Bash` can still write, so their prompts say it too —
@@ -384,6 +389,14 @@ fingerprint of its own source, and the launcher compares it against the file on
 disk: a stale service is replaced when idle, and reported rather than cut in
 half when a turn is in flight. `curl 127.0.0.1:8316/api/hello` shows the build,
 pid and how many requests are running right now.
+
+**An agent stops with a rate-limit error.** SWE-2 enforces a token budget over
+a rolling window, and a burst of parallel agents empties it — measured on one
+machine, 1107 refusals against 8598 successful turns, in bursts of up to 133 in
+a row, each naming a wait of one to twelve minutes. devinx reports these as
+`rate_limit_error` with HTTP 429 and a `retry-after` carrying the wait the
+upstream named, so the client backs off and resumes. Reporting them as a generic
+`api_error`, as it used to, is what made an agent stop dead instead.
 
 **A SWE-2 turn ends with `permission_denied`.** Cognition's input classifier
 refused the payload. The log says which attempt failed and what was capped; the
