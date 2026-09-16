@@ -1077,10 +1077,16 @@ def _tail_start(messages, budget):
         if total > budget:
             break
         start = i
-    while start < len(messages):
+    # Step back onto the assistant turn that issued the tool_use, never forward
+    # past the result. Walking forward eats the entire tail when an agent is
+    # doing back-to-back tool calls — every user turn is then a tool_result, so
+    # the boundary marches to the end of the conversation and the agent is left
+    # with none of the work it just did. That is exactly when it needs it: it
+    # reads a file, the read is dropped, and its next edit no longer matches.
+    while start > 1:
         blocks = _blocks(messages[start].get("content"))
         if any(b.get("type") == "tool_result" for b in blocks):
-            start += 1
+            start -= 1
             continue
         break
     return start
