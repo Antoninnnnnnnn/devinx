@@ -422,7 +422,7 @@ of them is spent. `DEVINX_API_KEYS` takes a
 comma-separated list instead. Each request logs the account that served it, so
 which credential a limit belongs to is answerable from the log.
 
-`DEVINX_RATE_WAIT` bounds the total wait (300s by default) — the client has its
+`DEVINX_RATE_WAIT` bounds the total wait (600s by default) — the client has its
 own timeout, and an answer that never comes is worse than one that says to try
 later. Past that budget the refusal does go back, as a 429 `rate_limit_error`
 carrying `retry-after`.

@@ -678,7 +678,7 @@ TOOL_DESC_CAPS = (None, 6000, 2500)
 # sees a request that took longer, the agent never stops, and nobody is
 # notified of anything. Bounded, because the client has its own timeout and an
 # answer that never comes is worse than one that says to try later.
-RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "300"))
+RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "600"))
 
 
 def build_request(body, tool_desc_cap=None):
