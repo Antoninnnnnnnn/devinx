@@ -412,15 +412,28 @@ def reset_key():
         _accounts.clear()
 
 
-def claim_account():
-    """The first credential not currently rate limited, and when the earliest
-    one frees up if they all are."""
+_turn = {"n": 0}
+
+
+def claim_account(avoid=None):
+    """A credential that is not rate limited, and when the earliest one frees up
+    if none is.
+
+    Round robin rather than first-fit. The limits are per credential, so always
+    starting at the same one keeps that one permanently at its ceiling while the
+    others idle — the short limit would still be hit on every burst, merely
+    followed by a switch. Spreading the turns halves the rate each account sees,
+    which is the difference between switching constantly and not being limited.
+    """
     now = time.time()
     with _acct_lock:
-        usable = [a for a in _accounts if a["blocked_until"] <= now] or None
+        usable = [a for a in _accounts
+                  if a["blocked_until"] <= now and a is not avoid]
         if usable:
-            return usable[0], 0.0
-        soonest = min((a["blocked_until"] for a in _accounts), default=now)
+            _turn["n"] += 1
+            return usable[_turn["n"] % len(usable)], 0.0
+        soonest = min((a["blocked_until"] for a in _accounts
+                       if a is not avoid), default=now)
         return None, max(0.0, soonest - now)
 
 
@@ -1429,7 +1442,7 @@ def run_swe(body, wfile, make_stream=None):
             delay = int(found.group(1)) * 60 if found else 30
             if acct is not None:
                 block_account(acct, delay)
-            other, until = claim_account()
+            other, until = claim_account(avoid=acct)
             if other is not None:
                 print(f"upstream rate limited on {acct['name']}, switching to "
                       f"{other['name']}", flush=True)

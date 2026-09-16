@@ -413,9 +413,12 @@ Log in again with the data directory pointed somewhere else and devinx finds it:
 XDG_DATA_HOME="<data dir>/account2" devin auth login
 ```
 
-Every `credentials.toml` under the data directory is loaded, in a stable order.
-On a rate limit the turn moves to the next credential that is not blocked, and
-only waits when every one of them is spent. `DEVINX_API_KEYS` takes a
+Every `credentials.toml` under the data directory is loaded, and turns are
+spread across them round robin — always starting at the same one keeps that one
+permanently at its ceiling while the others idle, which is the difference
+between switching on every burst and not being limited at all. On a rate limit
+the turn moves to another credential immediately, and only waits when every one
+of them is spent. `DEVINX_API_KEYS` takes a
 comma-separated list instead. Each request logs the account that served it, so
 which credential a limit belongs to is answerable from the log.
 
