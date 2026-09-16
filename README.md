@@ -416,7 +416,23 @@ measured: the same subagent then runs to completion, its turns reaching the
 upstream that was always willing to take them. `DEVINX_ENFORCE_WINDOW=1` puts
 the local cap back.
 
-The other two are the window and the wording. devinx declares 262144 —
+The other two are the window and the wording.
+
+And past those, the proxy compacts. A client compacts its main session but not
+an agent: measured, an agent at its limit drops a single message — 30412 tokens
+to 30284 — and then ends with that error, having summarised nothing. So devinx
+does it instead. When a turn would not fit, the first turn is kept (it is the
+task), the recent turns are kept verbatim, and everything between is replaced by
+a summary written with Claude Code's own compaction prompt, read out of its
+binary rather than reinvented. The client's transcript is untouched; only what
+goes upstream is reduced, which the agent experiences as a turn that took a few
+seconds longer. Measured end to end: a subagent whose context reached 158k
+against an 80k threshold compacted to 18k and finished its task.
+
+Compaction is lossy by nature — the agent keeps the summary, not the detail —
+and a threshold set below the size of what the agent is actually working on will
+make it re-read the same files forever. `DEVINX_COMPACT_AT` sets it; the default
+leaves roughly 96k of recent turns verbatim. devinx declares 262144 —
 the real one — through `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which is the only lever
 that works: a `context_window` on the model catalog is ignored for a model the
 client does not recognise. `DEVINX_CONTEXT_TOKENS` overrides it, and erring low

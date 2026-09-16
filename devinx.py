@@ -834,6 +834,191 @@ def chat_stream(req):
 
 
 # --------------------------------------------------------------------------- #
+# Compaction
+# --------------------------------------------------------------------------- #
+
+# A subagent that fills its window is simply killed: measured against Claude
+# Code 2.1.272, the client drops a single message (30412 tokens to 30284) and
+# then ends the agent with "Prompt is too long". It never summarises. The main
+# session compacts; an agent does not, and nothing in its configuration turns
+# that on. So the proxy does it instead — the client's own transcript is left
+# alone and only what goes upstream is reduced, which the agent experiences as a
+# turn that took a few seconds longer rather than as the end of its task.
+COMPACT_AT = int(os.environ.get(
+    "DEVINX_COMPACT_AT", str(int(SWE_CONTEXT_TOKENS * 0.82))))
+# How much of the budget the verbatim tail may keep. The rest leaves room for
+# the summary, the system prompt and the answer.
+COMPACT_TAIL = 0.45
+# Per tool result, and in total, when rendering the dropped turns for the
+# summariser: it has a window too, and a transcript of file reads will exceed it.
+SUMMARY_RESULT_CAP = 4000
+SUMMARY_INPUT_CAP = 200000
+
+# Claude Code's own compaction prompt, read out of the binary rather than
+# rewritten, so a summary made here is the one the agent would have made.
+COMPACT_PROMPT = """Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.
+
+Your summary should include the following sections:
+
+1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail
+2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.
+3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Pay special attention to the most recent messages and include full code snippets where applicable and include a summary of why this file read or edit is important.
+4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
+5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.
+6. All user messages: List ALL user messages that are not tool results. These are critical for understanding the users' feedback and changing intent. Preserve any security-relevant instructions or constraints verbatim so they remain in effect after compaction.
+7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.
+8. Current Work: Describe in detail precisely what was being worked on immediately before this summary request, paying special attention to the most recent messages from both user and assistant. Include file names and code snippets where applicable.
+9. Optional Next Step: List the next step that you will take that is related to the most recent work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most recent explicit requests, and the task you were working on immediately before this summary request. If your last task was concluded, then only list next steps if they are explicitly in line with the users request. Do not start on tangential requests or really old requests that were already completed without confirming with the user first.
+If there is a next step, include direct quotes from the most recent conversation showing exactly what task you were working on and where you left off. This should be verbatim to ensure there's no drift in task interpretation.
+
+Please provide your summary based on the conversation so far, following this structure and ensuring precision and thoroughness in your response."""
+
+# Claude Code's incremental variant, for the turns added since the last summary.
+# Re-summarising the whole prefix every turn is what made compaction cost thirty
+# seconds a turn; this extends the summary instead of rebuilding it.
+COMPACT_PROMPT_MORE = """Your task is to create a detailed summary of the RECENT portion of the conversation — the messages that follow earlier retained context. The earlier messages are being kept intact and do NOT need to be summarized. Focus your summary on what was discussed, learned, and accomplished in the recent messages only.
+
+""" + COMPACT_PROMPT.split("Your summary should include", 1)[1].join(
+    ["Your summary should include", ""])
+
+_summary_lock = threading.Lock()
+_summaries = {}
+
+
+def _render_turns(messages):
+    """Flatten dropped turns into a transcript the summariser can read."""
+    out = []
+    for m in messages:
+        role = m.get("role", "user")
+        for b in _blocks(m.get("content")):
+            kind = b.get("type")
+            if kind == "text":
+                out.append(f"[{role}] {b.get('text', '')}")
+            elif kind == "thinking":
+                continue
+            elif kind == "tool_use":
+                args = json.dumps(b.get("input") or {})[:SUMMARY_RESULT_CAP]
+                out.append(f"[{role} calls {b.get('name')}] {args}")
+            elif kind == "tool_result":
+                text = _tool_result_text(b)
+                if len(text) > SUMMARY_RESULT_CAP:
+                    text = (text[:SUMMARY_RESULT_CAP]
+                            + f"\n… [{len(text) - SUMMARY_RESULT_CAP} more characters]")
+                out.append(f"[tool result] {text}")
+    rendered = "\n\n".join(out)
+    if len(rendered) > SUMMARY_INPUT_CAP:
+        # Keep the end: what happened most recently matters most to continuing.
+        rendered = ("… [earlier turns omitted]\n\n"
+                    + rendered[-SUMMARY_INPUT_CAP:])
+    return rendered
+
+
+def summarise_turns(messages, model, system, previous=None):
+    """Summarise dropped turns with one extra upstream call.
+
+    This is the pause. It costs a request and a few seconds, against an agent
+    that otherwise stops mid-task with nothing to show for the work it did.
+    """
+    body = {
+        "model": model,
+        "max_tokens": 4096,
+        "system": "You are summarising a coding agent's conversation so it can "
+                  "continue working after its context was compacted.",
+        "messages": [{"role": "user", "content": [{"type": "text", "text":
+            (f"<earlier_summary>\n{previous}\n</earlier_summary>\n\n"
+             if previous else "")
+            + f"<conversation>\n{_render_turns(messages)}\n</conversation>\n\n"
+            f"The agent's own instructions began: {system[:2000]}\n\n"
+            + (COMPACT_PROMPT_MORE if previous else COMPACT_PROMPT)}]}],
+    }
+    req, _ = build_request(body)
+    texts = []
+    for msg, err in chat_stream(req):
+        if err:
+            return None
+        if msg.delta_text:
+            texts.append(msg.delta_text)
+    return "".join(texts).strip() or None
+
+
+def _tail_start(messages, budget):
+    """Where the verbatim tail begins.
+
+    Never on a user turn that carries a tool_result, because the tool_use it
+    answers would be in the part being dropped, leaving a result with nothing
+    to attach to.
+    """
+    total, start = 0, len(messages)
+    for i in range(len(messages) - 1, 0, -1):
+        total += len(json.dumps(messages[i], default=str)) // 4
+        if total > budget:
+            break
+        start = i
+    while start < len(messages):
+        blocks = _blocks(messages[start].get("content"))
+        if any(b.get("type") == "tool_result" for b in blocks):
+            start += 1
+            continue
+        break
+    return start
+
+
+def compact_body(body):
+    """Replace the middle of an over-long conversation with a summary.
+
+    The first turn stays: it is the task. The recent turns stay verbatim: they
+    are what the agent is doing right now. Everything between becomes one
+    summary, written with Claude Code's own compaction prompt.
+    """
+    messages = body.get("messages") or []
+    if len(messages) < 4 or estimate_tokens(body) <= COMPACT_AT:
+        return body
+    start = _tail_start(messages, int(COMPACT_AT * COMPACT_TAIL))
+    if start <= 1 or start >= len(messages):
+        # Nothing to drop that would help; the size is the first turn or the
+        # tail alone, and summarising cannot fix either.
+        print("compaction: nothing droppable, forwarding as is", flush=True)
+        return body
+
+    key = _conv_key(body)
+    n_dropped = start - 1
+    with _summary_lock:
+        covered, summary = _summaries.get(key, (0, None))
+    if summary is None or covered < n_dropped:
+        model = resolve_model(body)
+        before = estimate_tokens(body)
+        # Only the turns added since the last summary, extending it rather than
+        # rebuilding it: the difference between a few seconds a turn and half a
+        # minute a turn.
+        fresh = messages[1 + covered:start]
+        new = summarise_turns(fresh, model, _system_text(body), summary)
+        if not new:
+            print("compaction: the summary call failed, forwarding as is",
+                  flush=True)
+            return body
+        summary = f"{summary}\n\n{new}" if summary else new
+        with _summary_lock:
+            if len(_summaries) > 64:
+                _summaries.clear()
+            _summaries[key] = (n_dropped, summary)
+        print(f"compaction: {len(fresh)} more turns summarised "
+              f"({n_dropped} total, {before} tokens estimated, over "
+              f"{COMPACT_AT})", flush=True)
+
+    compacted = dict(body)
+    compacted["messages"] = [messages[0], {"role": "user", "content": [
+        {"type": "text", "text":
+         "This conversation was compacted to fit the context window. The "
+         "summary below replaces the turns between the task above and the "
+         "messages that follow; continue the work from it.\n\n"
+         f"<summary>\n{summary}\n</summary>"}]}] + messages[start:]
+    print(f"compaction: {estimate_tokens(body)} -> "
+          f"{estimate_tokens(compacted)} tokens estimated", flush=True)
+    return compacted
+
+
+# --------------------------------------------------------------------------- #
 # Cognition response -> Anthropic Messages
 # --------------------------------------------------------------------------- #
 
@@ -1049,6 +1234,14 @@ def run_swe(body, wfile, make_stream=None):
     """
     stream = bool(body.get("stream"))
     make_stream = make_stream or AnthropicStream
+    # Before anything is sent: if this turn would not fit, reduce it here rather
+    # than let the upstream refuse it and the client end the agent.
+    try:
+        body = compact_body(body)
+    except Exception as e:
+        # Compaction is a rescue, never a new way to fail. A turn that would
+        # have gone out uncompacted still goes out.
+        print(f"compaction failed, forwarding as is: {e}", flush=True)
     # Report the resolved tier, not the alias, so the tier that actually ran is
     # visible in the client.
     out = make_stream(wfile, resolve_model(body)) if stream else None
