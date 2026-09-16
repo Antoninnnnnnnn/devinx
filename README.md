@@ -404,6 +404,21 @@ anything happened. Measured: a subagent refused with "reset in 1 minute" waited
 65 seconds inside one request and finished its task, its parent reporting no
 error at all.
 
+**More than one Devin account.** Both of Cognition's limits are per credential —
+a short one that recycles in well under a minute, and a longer window that can
+lock for twelve minutes — so a second account is a switch rather than a wait.
+Log in again with the data directory pointed somewhere else and devinx finds it:
+
+```sh
+XDG_DATA_HOME="<data dir>/account2" devin auth login
+```
+
+Every `credentials.toml` under the data directory is loaded, in a stable order.
+On a rate limit the turn moves to the next credential that is not blocked, and
+only waits when every one of them is spent. `DEVINX_API_KEYS` takes a
+comma-separated list instead. Each request logs the account that served it, so
+which credential a limit belongs to is answerable from the log.
+
 `DEVINX_RATE_WAIT` bounds the total wait (300s by default) — the client has its
 own timeout, and an answer that never comes is worse than one that says to try
 later. Past that budget the refusal does go back, as a 429 `rate_limit_error`

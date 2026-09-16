@@ -312,62 +312,130 @@ def protos():
 # Cognition credential and JWT
 # --------------------------------------------------------------------------- #
 
-def _load_key():
-    if os.environ.get("DEVINX_API_KEY"):
-        return os.environ["DEVINX_API_KEY"]
-    for cred in (os.path.join(DATA_DIR, "devin", "credentials.toml"),
-                 os.path.expanduser("~/devin-shim/data/devin/credentials.toml"),
-                 os.path.expanduser("~/.local/share/devin/credentials.toml")):
-        if not os.path.exists(cred):
-            continue
-        with open(cred) as fh:
+def _credential_files():
+    """Every credentials.toml under the data directory, plus the legacy paths.
+
+    A second subscription is a second `devin auth login` with XDG_DATA_HOME
+    pointed somewhere else, so the search is recursive: the file lands at
+    <that dir>/devin/credentials.toml and both are found without configuring
+    anything.
+    """
+    found = sorted(glob.glob(os.path.join(DATA_DIR, "**", "credentials.toml"),
+                             recursive=True))
+    for legacy in (os.path.expanduser("~/devin-shim/data/devin/credentials.toml"),
+                   os.path.expanduser("~/.local/share/devin/credentials.toml")):
+        if os.path.exists(legacy) and legacy not in found:
+            found.append(legacy)
+    return found
+
+
+def _read_key(path):
+    try:
+        with open(path) as fh:
             for line in fh:
                 if line.startswith("windsurf_api_key"):
                     return line.split('"')[1]
-    raise RuntimeError(
-        "no Devin credential found — run:  XDG_DATA_HOME=%s devin auth login"
-        % DATA_DIR)
+    except OSError:
+        pass
+    return None
 
 
-_key_lock = threading.Lock()
-_key = {"value": None}
+def _load_accounts():
+    """Load every credential, in a stable order.
+
+    Both of Cognition's limits are per account — a short one that recycles in
+    well under a minute, and a longer window that can lock for twelve. A second
+    account doubles both, and turning a twelve-minute block into a switch is
+    worth far more than the averages suggest when the work is parallel by
+    design.
+    """
+    keys, names = [], []
+    env = os.environ.get("DEVINX_API_KEYS") or os.environ.get("DEVINX_API_KEY")
+    if env:
+        for i, raw in enumerate(re.split(r"[,\n]", env)):
+            raw = raw.strip()
+            if raw:
+                keys.append(raw)
+                names.append(f"env[{i}]")
+    else:
+        for path in _credential_files():
+            key = _read_key(path)
+            if key and key not in keys:
+                keys.append(key)
+                names.append(os.path.basename(os.path.dirname(path)) or path)
+    if not keys:
+        raise RuntimeError(
+            "no Devin credential found — run:  XDG_DATA_HOME=%s devin auth login"
+            % DATA_DIR)
+    out = []
+    for key, name in zip(keys, names):
+        if not key.startswith(SESSION_PREFIX):
+            key = SESSION_PREFIX + key
+        out.append({"key": key, "name": name, "jwt": None, "exp": 0.0,
+                    "base": None, "blocked_until": 0.0})
+    return out
 
 
-def api_key():
+_acct_lock = threading.Lock()
+_accounts = []
+
+
+def accounts():
     """Resolved on first SWE-2 use, never at import.
 
     The Claude relay needs no Devin credential, so a missing or expired one must
     degrade to "SWE-2 requests fail" rather than "the service refuses to start"
     and take the main session down with it.
     """
-    with _key_lock:
-        if _key["value"] is None:
-            value = _load_key()
-            if not value.startswith(SESSION_PREFIX):
-                value = SESSION_PREFIX + value
-            _key["value"] = value
-        return _key["value"]
+    with _acct_lock:
+        if not _accounts:
+            _accounts.extend(_load_accounts())
+            if len(_accounts) > 1:
+                print(f"devinx: {len(_accounts)} Devin credentials "
+                      f"({', '.join(a['name'] for a in _accounts)})", flush=True)
+        return list(_accounts)
+
+
+def api_key():
+    """The first credential. Only for callers that do not pick an account."""
+    return accounts()[0]["key"]
 
 
 def reset_key():
-    """Forget the memoised credential so the next use re-reads the file.
+    """Forget the memoised credentials so the next use re-reads the files.
 
     Called when the upstream rejects our auth: the usual cause is that the user
     just ran `devin auth login` again, which rewrites credentials.toml while this
     process happily keeps using the string it read at startup.
     """
-    with _key_lock:
-        _key["value"] = None
+    with _acct_lock:
+        _accounts.clear()
+
+
+def claim_account():
+    """The first credential not currently rate limited, and when the earliest
+    one frees up if they all are."""
+    now = time.time()
+    with _acct_lock:
+        usable = [a for a in _accounts if a["blocked_until"] <= now] or None
+        if usable:
+            return usable[0], 0.0
+        soonest = min((a["blocked_until"] for a in _accounts), default=now)
+        return None, max(0.0, soonest - now)
+
+
+def block_account(acct, seconds):
+    with _acct_lock:
+        acct["blocked_until"] = time.time() + seconds
 
 
 _jwt_lock = threading.Lock()
-_jwt = {"token": None, "exp": 0.0, "base": None}
 
 
-def _metadata(jwt=""):
+def _metadata(jwt="", key=None):
     # The real devin-cli leaves session_id and request_id unset on inference calls.
     return {
-        "api_key": api_key(),
+        "api_key": key or api_key(),
         "user_jwt": jwt,
         "ide_name": IDE_NAME,
         "ide_version": IDE_VERSION,
@@ -386,12 +454,15 @@ def _jwt_expiry(token):
         return 0.0
 
 
-def get_jwt(force=False):
+def get_jwt(acct=None, force=False):
+    """A JWT for one account, cached on that account rather than globally."""
+    if acct is None:
+        acct = accounts()[0]
     with _jwt_lock:
         now = time.time()
-        if not force and _jwt["token"] and _jwt["exp"] - 60 > now:
-            return _jwt["token"], _jwt["base"]
-        req = protos()["GetUserJwtRequest"](metadata=_metadata())
+        if not force and acct["jwt"] and acct["exp"] - 60 > now:
+            return acct["jwt"], acct["base"]
+        req = protos()["GetUserJwtRequest"](metadata=_metadata(key=acct["key"]))
         r = SESSION.post(COGNITION_UPSTREAM + AUTH_PATH,
                          data=req.SerializeToString(),
                          headers={"content-type": "application/proto",
@@ -404,10 +475,10 @@ def get_jwt(force=False):
             resp.ParseFromString(gzip.decompress(r.content))
         if not resp.user_jwt:
             raise RuntimeError("GetUserJwt returned empty jwt")
-        _jwt["token"] = resp.user_jwt
-        _jwt["exp"] = _jwt_expiry(resp.user_jwt) or now + 3300
-        _jwt["base"] = resp.custom_api_server_url.strip() or None
-        return _jwt["token"], _jwt["base"]
+        acct["jwt"] = resp.user_jwt
+        acct["exp"] = _jwt_expiry(resp.user_jwt) or now + 3300
+        acct["base"] = resp.custom_api_server_url.strip() or None
+        return acct["jwt"], acct["base"]
 
 
 # --------------------------------------------------------------------------- #
@@ -723,7 +794,7 @@ def build_request(body, tool_desc_cap=None):
     # Real-client request surface: no execution_id, no tool_choice, no
     # disable_parallel_tool_calls, no system_prompt_cache_options — ever.
     req = protos()["GetChatMessageRequest"](
-        metadata=_metadata(get_jwt()[0]),
+        metadata=_metadata(),
         prompt=_scrub_system(_system_text(body)),
         chat_message_prompts=prompts,
         chat_model_uid=model,
@@ -750,9 +821,12 @@ def build_request(body, tool_desc_cap=None):
     return req, model
 
 
-def chat_stream(req):
+def chat_stream(req, acct=None):
     """Yield (GetChatMessageResponse, None) per frame or (None, error) on trailer."""
-    jwt, base = get_jwt()
+    if acct is None:
+        acct = accounts()[0]
+    jwt, base = get_jwt(acct)
+    req.metadata.api_key = acct["key"]
     req.metadata.user_jwt = jwt
     body = req.SerializeToString()
     t_start = time.time()
@@ -782,15 +856,17 @@ def chat_stream(req):
                 # process would otherwise keep retrying with the stale key it
                 # memoised at first use.
                 reset_key()
-                jwt, base = get_jwt(force=True)
+                jwt, base = get_jwt(acct, force=True)
+                req.metadata.api_key = acct["key"]
                 req.metadata.user_jwt = jwt
                 body = req.SerializeToString()
                 continue
-            print(f"upstream HTTP {status}: {detail}", flush=True)
+            print(f"upstream HTTP {status} on {acct['name']}: {detail}",
+                  flush=True)
             yield None, f"upstream {status}: {detail}"
             return
         print(f"upstream conn: {time.time() - t_start:.1f}s to headers "
-              f"(model={req.chat_model_uid} {n_msgs} msgs, "
+              f"(acct={acct['name']} model={req.chat_model_uid} {n_msgs} msgs, "
               f"{len(body) // 1024}KB req)", flush=True)
         buf = b""
         first_frame = True
@@ -817,8 +893,8 @@ def chat_stream(req):
                     if err:
                         code = err.get("code", "error")
                         message = err.get("message", "(no message)")
-                        print(f"upstream trailer error: {code}: {message}",
-                              flush=True)
+                        print(f"upstream trailer error on {acct['name']}: "
+                              f"{code}: {message}", flush=True)
                         yield None, f"{code}: {message}"
                     continue
                 raw = gzip.decompress(payload) if flag & 1 else payload
@@ -1261,6 +1337,7 @@ def run_swe(body, wfile, make_stream=None):
     # (the same body has been observed to pass and to fail). Retry while nothing
     # has reached the client yet.
     attempt, waited = 0, 0.0
+    acct = None
     while attempt < 3:
         try:
             req, model = build_request(body, TOOL_DESC_CAPS[attempt])
@@ -1278,8 +1355,12 @@ def run_swe(body, wfile, make_stream=None):
         usage, stop, err, emitted = {}, 0, None, False
         latency = 0.0
 
+        if acct is None:
+            acct, _ = claim_account()
+            if acct is None:
+                acct = accounts()[0]
         try:
-            for msg, e in chat_stream(req):
+            for msg, e in chat_stream(req, acct):
                 if e:
                     err = e
                     break
@@ -1341,18 +1422,29 @@ def run_swe(body, wfile, make_stream=None):
             print(err, flush=True)
 
         if err and not emitted and "resource_exhausted" in err:
-            # Wait it out rather than end the agent. The upstream named a delay;
-            # jitter keeps a fan-out of subagents from all coming back at once
-            # and emptying the window again together.
+            # Both of Cognition's limits are per account, so another credential
+            # is a switch rather than a wait. Only when every one of them is
+            # spent does the turn actually have to be held.
             found = _RESET_AFTER.search(err)
-            wait = min(int(found.group(1)) * 60 if found else 30,
-                       RATE_WAIT_BUDGET - waited)
+            delay = int(found.group(1)) * 60 if found else 30
+            if acct is not None:
+                block_account(acct, delay)
+            other, until = claim_account()
+            if other is not None:
+                print(f"upstream rate limited on {acct['name']}, switching to "
+                      f"{other['name']}", flush=True)
+                acct = other
+                continue
+            # Every account is blocked; wait for the first one to come back.
+            wait = min(until or delay, RATE_WAIT_BUDGET - waited)
             if wait > 0:
                 wait += random.uniform(0, min(5.0, wait * 0.1))
-                print(f"upstream rate limited, holding the turn for "
-                      f"{wait:.0f}s ({waited:.0f}s waited so far)", flush=True)
+                print(f"upstream rate limited on every credential, holding "
+                      f"the turn for {wait:.0f}s ({waited:.0f}s waited so far)",
+                      flush=True)
                 time.sleep(wait)
                 waited += wait
+                acct, _ = claim_account()
                 continue
             print(f"upstream rate limited and {RATE_WAIT_BUDGET}s of waiting is "
                   f"spent; handing it back", flush=True)
