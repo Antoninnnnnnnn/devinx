@@ -63,6 +63,23 @@ ENV = {
     # model from the catalog. Override with DEVINX_CONTEXT_TOKENS.
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": os.environ.get(
         "DEVINX_CONTEXT_TOKENS", str(256 * 1024)),
+    # And the window must not be enforced locally, because for a subagent that
+    # enforcement is fatal rather than corrective. Measured against 2.1.272 with
+    # a window declared at 20k and a task needing more: the subagent dies with
+    # "Agent terminated early due to an API error: Prompt is too long (error
+    # type invalid_request)" and devinx never receives a single request — the
+    # client refuses on its own estimate, without compacting and without asking.
+    # With this set, the same subagent runs to completion, turns of 37k and 58k
+    # reaching the upstream that was always willing to take them.
+    #
+    # The window above still does real work: it is what /context shows, and what
+    # the overflow message reports as the maximum. What changes is who decides.
+    # A turn that genuinely exceeds what SWE-2 accepts now gets refused by the
+    # upstream, and that refusal the client does recover from — measured, it
+    # compacts and finishes the task. Set DEVINX_ENFORCE_WINDOW=1 to put the
+    # local cap back.
+    **({} if os.environ.get("DEVINX_ENFORCE_WINDOW") == "1" else
+       {"CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"}),
 }
 
 # Opt-in. Without one of these, nothing is started and nothing is injected: the

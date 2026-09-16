@@ -402,8 +402,21 @@ upstream named, so the client backs off and resumes. Reporting them as a generic
 refused the payload. The log says which attempt failed and what was capped; the
 retry shrinks tool descriptions on its own.
 
-**A subagent dies with `prompt is too long` instead of compacting.** Two things
-have to be right and only one of them is the window. devinx declares 262144 —
+**A subagent dies with `prompt is too long` instead of compacting.** Three
+things have to be right, and the one that actually killed agents was none of the
+obvious two.
+
+The client enforces the declared window itself for a model it does not
+recognise, and for a subagent that enforcement is fatal rather than corrective:
+the agent ends with "Agent terminated early due to an API error: Prompt is too
+long (error type invalid_request)" and devinx never receives a request at all —
+refused on the client's own estimate, without compacting and without asking. The
+launcher therefore sets `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT`,
+measured: the same subagent then runs to completion, its turns reaching the
+upstream that was always willing to take them. `DEVINX_ENFORCE_WINDOW=1` puts
+the local cap back.
+
+The other two are the window and the wording. devinx declares 262144 —
 the real one — through `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which is the only lever
 that works: a `context_window` on the model catalog is ignored for a model the
 client does not recognise. `DEVINX_CONTEXT_TOKENS` overrides it, and erring low
