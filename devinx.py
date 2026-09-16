@@ -340,6 +340,21 @@ def _read_key(path):
     return None
 
 
+# Every credentials.toml sits in a directory called "devin", so naming an
+# account after its parent names them all the same and the log stops telling
+# them apart — which is the whole reason the account is logged.
+_GENERIC_DIRS = {"devin", "data", "share", ".local", "devinx", ""}
+
+
+def _credential_name(path):
+    """A label that distinguishes one credential from another in the log."""
+    parts = os.path.normpath(path).split(os.sep)[:-1]
+    for part in reversed(parts):
+        if part not in _GENERIC_DIRS:
+            return part
+    return "default"
+
+
 def _load_accounts():
     """Load every credential, in a stable order.
 
@@ -362,11 +377,18 @@ def _load_accounts():
             key = _read_key(path)
             if key and key not in keys:
                 keys.append(key)
-                names.append(os.path.basename(os.path.dirname(path)) or path)
+                names.append(_credential_name(path))
     if not keys:
         raise RuntimeError(
             "no Devin credential found — run:  XDG_DATA_HOME=%s devin auth login"
             % DATA_DIR)
+    # Two credentials that still land on the same label are worse than useless
+    # in a log line, so make them unique.
+    seen = {}
+    for i, name in enumerate(names):
+        seen[name] = seen.get(name, 0) + 1
+        if names.count(name) > 1:
+            names[i] = f"{name}{seen[name]}"
     out = []
     for key, name in zip(keys, names):
         if not key.startswith(SESSION_PREFIX):
