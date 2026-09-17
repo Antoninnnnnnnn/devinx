@@ -11,6 +11,7 @@ only a temp file.
 """
 
 import copy
+import io
 import json
 import os
 import re
@@ -733,6 +734,33 @@ class ResetDelayTests(unittest.TestCase):
 
     def test_an_unparseable_message_falls_back(self):
         self.assertEqual(devinx.reset_delay("no idea", default=30), 30)
+
+
+class MessageIdTests(unittest.TestCase):
+    """The constant that collapsed every run into three messages.
+
+    Claude Code builds its API messages with a normaliser that merges an
+    assistant turn into an earlier one when the two share a message.id, and the
+    window it keeps is cleared only by a user message that is not a tool_result
+    — of which an agent run has none. A constant id therefore folded a whole
+    run into one assistant message and one user message, which is what every
+    captured swe-2 body looked like. The real API guarantees a unique id per
+    response; this has to as well.
+    """
+
+    def test_every_response_gets_its_own_id(self):
+        ids = {devinx.new_message_id() for _ in range(1000)}
+        self.assertEqual(len(ids), 1000)
+        self.assertTrue(all(i.startswith("msg_") for i in ids))
+        self.assertNotIn("msg_devinx", ids)
+
+    def test_no_constant_id_is_left_on_a_response(self):
+        src = io.open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "devinx.py"), encoding="utf-8").read()
+        # The Responses path builds per-item ids and is a different contract;
+        # the Messages responses must never carry a literal.
+        self.assertNotIn('"id": "msg_devinx"', src)
+        self.assertNotIn("'id': 'msg_devinx'", src)
 
 
 if __name__ == "__main__":

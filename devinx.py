@@ -724,6 +724,30 @@ def _conv_key(body):
     return f"{base}\0{digest}" if base else digest
 
 
+def new_message_id():
+    """A fresh id for every response, because the client merges on it.
+
+    This one constant was the whole collapsed-conversation mystery. Claude Code
+    normalises its transcript into API messages with a function that keeps a
+    map of message.id -> position and merges an assistant turn into the
+    existing entry when the id repeats, instead of appending. The window it
+    keeps is only cleared by a user message that is not a tool_result — and
+    during an agent run there are none, every user turn being a tool answer.
+
+    So with a constant id, every assistant turn of a run folded into the first
+    one and every tool_result folded into the first user message: a hundred and
+    seventy calls arriving as three messages, at any run length. The real API
+    guarantees a unique id per response and the client is right to rely on it.
+    This was never the client's bug; it was this literal.
+
+    It is unique per response and shared by every block of that response, which
+    is exactly what the client needs to reassemble one response from its
+    streamed blocks. The `claude-*` routes were never affected because they are
+    relayed byte for byte and carry Anthropic's own ids.
+    """
+    return f"msg_{uuid.uuid4().hex}"
+
+
 def resolve_model(body):
     """Requested model -> concrete SWE-2 tier.
 
@@ -1706,7 +1730,7 @@ class AnthropicStream:
         self.w.flush()
         self._send("message_start", {
             "type": "message_start",
-            "message": {"id": "msg_devinx", "type": "message", "role": "assistant",
+            "message": {"id": new_message_id(), "type": "message", "role": "assistant",
                         "model": self.model, "content": [], "stop_reason": None,
                         "stop_sequence": None,
                         "usage": usage or {"input_tokens": 0, "output_tokens": 0}}})
@@ -2033,7 +2057,7 @@ def run_swe(body, wfile, make_stream=None):
             continue
         content.append({"type": "tool_use", "id": tid,
                         "name": tool_blocks[tid]["name"], "input": args})
-    return {"id": "msg_devinx", "type": "message", "role": "assistant",
+    return {"id": new_message_id(), "type": "message", "role": "assistant",
             "model": resolve_model(body), "content": content,
             "stop_reason": stop_reason, "stop_sequence": None,
             "usage": usage}, None
