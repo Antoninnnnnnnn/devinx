@@ -206,7 +206,28 @@ STATS_TTL = float(os.environ.get("DEVINX_STATS_TTL", "5"))
 # Reading the dashboard from anywhere but loopback costs this secret. Empty
 # means loopback only, which is the safe default for a service that never
 # expected to be reachable from outside the machine.
-DASHBOARD_TOKEN = os.environ.get("DEVINX_DASHBOARD_TOKEN", "")
+def _dashboard_token():
+    """The env var, or the token file the installer writes beside the log.
+
+    The service is usually started by the launcher, which inherits whatever
+    shell happened to run `devin` — so a token that lives only in one shell's
+    environment disappears on the next restart, and with it the published
+    dashboard. On disk it survives.
+    """
+    env = os.environ.get("DEVINX_DASHBOARD_TOKEN", "")
+    if env:
+        return env
+    try:
+        with open(os.path.join(DATA_DIR, "dashboard-token"), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+DASHBOARD_TOKEN = _dashboard_token()
+# The port the dashboard is published on, separate from the API port on
+# purpose. Opened whenever there is a token to protect it.
+DASHBOARD_PORT = int(os.environ.get("DEVINX_DASHBOARD_PORT", "8317"))
 _stats_lock = threading.Lock()
 _stats = {"at": 0.0, "data": None, "error": None, "running": False}
 
@@ -2593,9 +2614,58 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
 
 
+class DashboardHandler(Handler):
+    """A second listener carrying the dashboard and nothing else.
+
+    Publishing the dashboard means putting a forwarder in front of a port, and
+    a forwarder publishes every route that answers on it — /v1/messages
+    included, spending this machine's Devin account for whoever found the URL.
+    It also erases the one distinction the API route relied on: the tailnet
+    proxy rewrites Host to 127.0.0.1, so the guard that refuses a non-loopback
+    Host sees a local call and waves it through. No header survives that, which
+    is why this is a separate port rather than another check: the API simply
+    does not answer on the one being published.
+    """
+
+    def do_POST(self):
+        self.send_error_json(404, "not_found_error", "Not found")
+
+    def do_GET(self):
+        if urlsplit(self.path).path not in ("/dashboard", "/dashboard/",
+                                            "/api/stats", "/api/hello"):
+            self.send_error_json(404, "not_found_error", "Not found")
+            return
+        Handler.do_GET(self)
+
+    def dashboard_allowed(self):
+        # This port exists to be published, so the token is not optional on it.
+        return bool(DASHBOARD_TOKEN) and Handler.dashboard_allowed(self)
+
+
+def serve_dashboard_port(port):
+    """The dashboard on its own port, for a tailnet or funnel mount."""
+    if not DASHBOARD_TOKEN:
+        print(f"dashboard port {port} not opened: DEVINX_DASHBOARD_TOKEN is "
+              f"unset, and an unauthenticated port is not worth publishing",
+              flush=True)
+        return
+    try:
+        srv = Server((HOST, port), DashboardHandler)
+    except OSError as e:
+        # A port already taken must not take the proxy down with it: the
+        # dashboard is the optional half of this process.
+        print(f"dashboard port {port} not opened: {e}", flush=True)
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"dashboard also on http://{HOST}:{port}/dashboard (token required, "
+          f"no API routes)", flush=True)
+
+
 if __name__ == "__main__":
     print(f"devinx listening on http://{HOST}:{PORT}  "
           f"(build {BUILD}, pid {os.getpid()}, data: {DATA_DIR})", flush=True)
+    if DASHBOARD_PORT:
+        serve_dashboard_port(DASHBOARD_PORT)
     if os.environ.get("DEVINX_DUMP"):
         print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
               f"conversation and any credentials the client sends, is being "

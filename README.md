@@ -371,7 +371,17 @@ can still reach the port.
 http://127.0.0.1:8316/dashboard
 ```
 
-Set `DEVINX_DASHBOARD_TOKEN` and that becomes `…/dashboard?k=<token>`, for every
+Publishing it — a tailnet mount, a funnel, any reverse proxy — means pointing
+that forwarder at `DEVINX_DASHBOARD_PORT` (8317 by default), never at the API
+port. The forwarder publishes every route that answers on the port it is given,
+`/v1/messages` included, and it rewrites `Host` to `127.0.0.1` on the way
+through, so the guard that refuses a non-loopback Host sees a local call and
+waves it past. No header survives that. The dashboard port answers only
+`/dashboard`, `/api/stats` and `/api/hello`, and opens only when a token exists
+— from `DEVINX_DASHBOARD_TOKEN`, or from `dashboard-token` in the data
+directory so it survives a restart the launcher does.
+
+Set `DEVINX_DASHBOARD_TOKEN` and the dashboard becomes `…/dashboard?k=<token>`, for every
 caller including loopback: judging by the `Host` header stops a rebound browser
 and nothing else, since any forwarder — `socat`, `ssh -L`, a tailnet mount —
 delivers its connections from `127.0.0.1` with whatever `Host` the client chose.
