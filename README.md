@@ -371,6 +371,14 @@ can still reach the port.
 http://127.0.0.1:8316/dashboard
 ```
 
+Set `DEVINX_DASHBOARD_TOKEN` and that becomes `…/dashboard?k=<token>`, for every
+caller including loopback: judging by the `Host` header stops a rebound browser
+and nothing else, since any forwarder — `socat`, `ssh -L`, a tailnet mount —
+delivers its connections from `127.0.0.1` with whatever `Host` the client chose.
+A browser pays the token once; the reply sets an `HttpOnly` cookie and the page
+scrubs the token back out of the address bar. Without a token set, the dashboard
+stays loopback-only.
+
 Served by the service itself, so it reads the live log rather than a snapshot:
 turns, tokens and what the cache saved, latency by percentile, the two rate-limit
 counters and what each credential is carrying, how far compaction is reducing a

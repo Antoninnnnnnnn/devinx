@@ -246,15 +246,21 @@ function dur(s){ s = Math.round(s || 0);
   if (h < 48) return h + " h " + m + " min";
   return Math.floor(h/24) + " j " + (h%24) + " h"; }
 
+// Keys reach these tables straight from the log: quota names come out of the
+// upstream's own refusal text, model names out of whatever the client asked
+// for. They are data, not markup.
+const esc = v => String(v ?? "").replace(/[<>&"]/g,
+  ch => ({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[ch]));
+
 const SERIES = ["--s1","--s2","--s3","--s4"];
 const cvar = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
 
 function rows(el, items, color){
   const max = Math.max(...items.map(i => i.v), 1);
-  el.innerHTML = items.map(i => `<div class="row"><div class="lab">${i.k}</div>
+  el.innerHTML = items.map(i => `<div class="row"><div class="lab">${esc(i.k)}</div>
     <div class="track"><div class="fill" style="width:${Math.max(1.5, 100*(i.scale||i.v)/(i.smax||max))}%;
       background:var(${i.c || color || "--s1"})"></div></div>
-    <div class="val">${i.t}</div></div>`).join("");
+    <div class="val">${esc(i.t)}</div></div>`).join("");
 }
 
 function render(d){
@@ -275,7 +281,7 @@ function render(d){
   $("h-tokens-sub").textContent = `${big(tk.input)} entrée · ${big(tk.output)} sortie`;
   const hit = (fun.cache_hit_ratio) || 0;
   $("h-cache").textContent = pct(hit);
-  $("h-cache-sub").textContent = `${big(tk.cache_read)} jetons relus`;
+  $("h-cache-sub").textContent = `${big(tk.cache_read)} jetons relus, sur l'entrée`;
   $("h-rl").textContent = n(rl.total);
   const rate = total ? (rl.total || 0) / total : 0;
   $("h-rl-sub").textContent = `${pct(rate)} des tentatives`;
@@ -285,21 +291,21 @@ function render(d){
                  ["sortie", tk.output, "--s2"]];
   const sum = parts.reduce((a, p) => a + (p[1] || 0), 0) || 1;
   $("tokstack").innerHTML = parts.map(p =>
-    `<div style="width:${100*(p[1]||0)/sum}%;background:var(${p[2]})" title="${p[0]} : ${n(p[1])}"></div>`).join("");
+    `<div style="width:${100*(p[1]||0)/sum}%;background:var(${p[2]})" title="${esc(p[0])} : ${n(p[1])}"></div>`).join("");
   $("toklegend").innerHTML = parts.map(p =>
     `<span><i style="background:var(${p[2]})"></i>${p[0]} <b>${big(p[1])}</b></span>`).join("");
-  $("toknote").textContent = `${big(sum)} jetons au total, dont ${pct((tk.cache_read||0)/sum)} servis par le cache — autant qui n'a pas été recalculé.`;
+  $("toknote").textContent = `${big(sum)} jetons au total, dont ${pct((tk.cache_read||0)/sum)} servis par le cache — autant qui n'a pas été recalculé. Le compteur en tête rapporte la même lecture à la seule entrée, d'où l'écart.`;
 
   $("bymodel").innerHTML = Object.entries(sw.by_model || {})
     .sort((a,b) => b[1].turns - a[1].turns)
-    .map(([k,v]) => `<tr><td>${k}</td><td class="n">${n(v.turns)}</td>
+    .map(([k,v]) => `<tr><td>${esc(k)}</td><td class="n">${n(v.turns)}</td>
       <td class="n">${big(v.input)}</td><td class="n">${big(v.output)}</td></tr>`).join("");
 
   $("byacct").innerHTML = Object.entries(sw.by_account || {})
     .sort((a,b) => b[1].turns - a[1].turns)
     .map(([k,v]) => { const t = v.turns + v.refusals, r = t ? v.refusals/t : 0;
       const cls = r > .15 ? "crit" : r > .02 ? "warn" : "ok";
-      return `<tr><td>${k}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
+      return `<tr><td>${esc(k)}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
         <td class="n"><span class="pill ${cls}">${pct(r)}</span></td></tr>`; }).join("");
 
   const q = Object.entries(rl.by_quota || {}).sort((a,b) => b[1]-a[1]);
@@ -312,7 +318,7 @@ function render(d){
   $("rlkv").innerHTML = [
     ["bascules de compte", n(rl.switches)],
     ["tours tenus en attente", n(rl.holds)],
-    ["temps réellement attendu", dur(rl.held_seconds_total)],
+    ["attente tenue (annoncée)", dur(rl.held_seconds_total)],
     ["budget d'attente épuisé", n(rl.budget_exhausted)],
     ["rafales", n(b.count)],
     ["plus longue rafale", n(b.longest) + " refus"],
@@ -333,11 +339,15 @@ function render(d){
   const h = sw.tool_calls_per_turn || {}, hist = h.histogram || {};
   const keys = Object.keys(hist).map(Number).sort((a,b)=>a-b).slice(0, 21);
   const hmax = Math.max(...keys.map(k => hist[k]), 1);
-  $("toolbars").innerHTML = keys.map(k =>
-    `<div style="height:${Math.max(2, 100*hist[k]/hmax)}%" title="${hist[k]} tours à ${k} appel(s)"></div>`).join("");
+  const hsum = keys.reduce((a,k) => a + hist[k], 0);
+  $("toolbars").innerHTML = keys.map((k,i) =>
+    `<div style="height:${Math.max(2, 100*hist[k]/hmax)}%${
+      i && k > keys[i-1] + 1 ? ";margin-left:10px" : ""}"
+      title="${hist[k]} tours à ${k} appel(s)"></div>`).join("");
   $("toolaxis").innerHTML = keys.map((k,i) =>
-    `<div>${(i===0||i===keys.length-1||k%5===0)?k:""}</div>`).join("");
-  $("toolnote").textContent = `Médiane ${h.p50 ?? 0} appel(s), maximum observé ${h.max ?? 0}. Un éventail de noms est du parallélisme normal ; un seul nom répété des centaines de fois serait un flux mal assemblé.`;
+    `<div style="${i && k > keys[i-1] + 1 ? "margin-left:10px" : ""}">${
+      (i===0||i===keys.length-1||k%5===0)?k:""}</div>`).join("");
+  $("toolnote").textContent = `Médiane ${h.p50 ?? 0} appel(s), maximum observé ${h.max ?? 0}, sur ${n(hsum)} tours — les seuls dont le journal note le nombre d'appels, sur ${n(sw.turns_ok)} réussis. Les valeurs absentes creusent un écart dans l'axe. Un éventail de noms est du parallélisme normal ; un seul nom répété des centaines de fois serait un flux mal assemblé.`;
 
   const bt = cp.before_tokens || {}, at = cp.after_tokens || {};
   const cmax = bt.max || 1;
@@ -385,7 +395,9 @@ function render(d){
     ["Temps passé à attendre l'amont", dur(sw.latency?.total_seconds),
      `${hours ? (hours/24).toFixed(1).replace(".",",") : 0} jours cumulés dans des appels réseau`],
     ["Le tour le plus long", dur(sw.latency?.max),
-     `${big(fun.busiest_single_turn?.input)} jetons d'entrée sur un seul tour`],
+     "un seul appel, du départ à la dernière trame"],
+    ["Le tour le plus chargé", `${big(fun.busiest_single_turn?.input)} jetons`,
+     `en entrée, plus ${big(fun.busiest_single_turn?.output)} en sortie — un autre tour que le plus long`],
     ["Plus grosse requête envoyée", `${n(sw.request_kb?.max)} Ko`,
      `la médiane est à ${n(sw.request_kb?.p50)} Ko`],
     ["Volume total transféré", `${n(sw.request_kb?.total_mb)} Mo`,
@@ -393,10 +405,10 @@ function render(d){
     ["Conversation la plus longue", `${n(sw.messages_per_request?.max)} messages`,
      `médiane : ${n(sw.messages_per_request?.p50)}`],
     ["Jetons par heure d'appel", big(fun.tokens_per_hour_of_calls),
-     "entrée seule, cache exclu"],
+     "entrée, sortie et cache confondus, rapportés au temps passé en ligne"],
     ["Redémarrages du service", n(lg.restarts),
      `${(lg.builds||[]).length} versions différentes servies`],
-    ["Taille du journal", `${(lg.bytes/1048576).toFixed(1).replace(".",",")} Mo`,
+    ["Taille du journal", `${((lg.bytes||0)/1048576).toFixed(1).replace(".",",")} Mo`,
      `${n(lg.lines)} lignes analysées à chaque rafraîchissement`],
     ["Attente annoncée cumulée", dur(rl.wait_seconds?.announced_total),
      "si chaque refus avait été attendu intégralement"],
@@ -407,25 +419,46 @@ function render(d){
   $("f-log").textContent = lg.path || "";
 }
 
-let fails = 0;
+let fails = 0, inFlight = false;
 async function tick(){
+  if (inFlight) return;   // a slow poll must not stack another on top of it
+  inFlight = true;
   try{
     // Relative to the page, so the dashboard works both at :8316/dashboard and
     // behind a path mount such as https://<host>/devinx/dashboard.
     const url = new URL("api/stats", location.href.replace(/\/dashboard\/?$/, "/"));
-    const r = await fetch(url, {cache:"no-store"});
+    const r = await fetch(url, {cache:"no-store", signal: AbortSignal.timeout(20000)});
     if(!r.ok) throw new Error(r.status);
     const d = await r.json();
     render(d);
     fails = 0;
-    $("dot").classList.remove("stale");
-    $("livetxt").textContent = "en direct";
+    // The service answers even when the extractor behind it does not: the
+    // figures are then the last good ones, and saying "en direct" over them
+    // would be a lie told in green.
+    const stale = !!d.error;
+    $("dot").classList.toggle("stale", stale);
+    $("livetxt").textContent = stale
+      ? `extracteur en échec — chiffres figés depuis ${dur(d.cached_age)}`
+      : "en direct";
+    $("livetxt").title = stale ? d.error : "";
   }catch(e){
     fails++;
     $("dot").classList.add("stale");
     $("livetxt").textContent = fails > 2 ? "service injoignable" : "reconnexion…";
+  }finally{
+    inFlight = false;
   }
 }
+
+// The token travelled in the URL; the cookie holds it now. Keep it out of the
+// address bar, the history and any Referer the page goes on to send.
+try{
+  const u = new URL(location.href);
+  if (u.searchParams.has("k")){
+    u.searchParams.delete("k");
+    history.replaceState(null, "", u.pathname + (u.search || "") + u.hash);
+  }
+}catch(e){}
 $("theme").addEventListener("click", () => {
   const cur = document.documentElement.getAttribute("data-theme");
   const next = cur === "dark" ? "light" : cur === "light" ? "" : "dark";

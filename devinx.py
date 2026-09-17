@@ -208,22 +208,30 @@ STATS_TTL = float(os.environ.get("DEVINX_STATS_TTL", "5"))
 # expected to be reachable from outside the machine.
 DASHBOARD_TOKEN = os.environ.get("DEVINX_DASHBOARD_TOKEN", "")
 _stats_lock = threading.Lock()
-_stats = {"at": 0.0, "data": None, "error": None}
+_stats = {"at": 0.0, "data": None, "error": None, "running": False}
 
 
 def _log_tail(n):
-    """The last non-routine log lines, for the live activity panel."""
-    path = os.path.join(DATA_DIR, "devinx.log")
+    """The last non-routine log lines, for the live activity panel.
+
+    The same file the extractor reads, override included: a feed and a figure
+    panel drawn from two different logs would quietly disagree.
+    """
+    path = os.environ.get("DEVINX_LOG", os.path.join(DATA_DIR, "devinx.log"))
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
-            fh.seek(max(0, size - 200000))
+            start = max(0, size - 200000)
+            fh.seek(start)
             chunk = fh.read().decode("utf-8", "replace")
     except OSError:
         return []
+    lines = chunk.splitlines()
+    if start and lines:
+        # The seek landed mid-line; only then is the first one a fragment.
+        lines = lines[1:]
     skip = ("upstream conn:", "upstream first-frame:", "route=")
-    keep = [l for l in chunk.splitlines()[1:]
-            if l and not l.startswith(skip)]
+    keep = [l for l in lines if l and not l.startswith(skip)]
     return keep[-n:]
 
 
@@ -2224,23 +2232,33 @@ class Handler(BaseHTTPRequestHandler):
         """
         now = time.time()
         with _stats_lock:
-            fresh = _stats["at"] > now - STATS_TTL and _stats["data"]
-        if not fresh:
-            data, err = {}, None
+            fresh = _stats["at"] > now - STATS_TTL
+            mine = not fresh and not _stats["running"]
+            if mine:
+                _stats["running"] = True
+        if mine:
+            # One pass at a time. Ten tabs, or one tab whose fetch outlives the
+            # poll interval, must not each spawn their own extractor.
+            data, err = None, None
             try:
                 r = subprocess.run(
                     [sys.executable, os.path.join(HERE, "tools", "log_stats.py")],
                     capture_output=True, text=True, timeout=60)
-                data = json.loads(r.stdout) if r.returncode == 0 else {}
-                err = None if data else (r.stderr or "stats failed")[:200]
+                data = json.loads(r.stdout) if r.returncode == 0 else None
+                if data is None:
+                    err = (r.stderr or "stats failed").strip()[:200]
             except Exception as e:
-                err = f"{type(e).__name__}: {e}"
+                data, err = None, f"{type(e).__name__}: {e}"
             with _stats_lock:
-                _stats["at"], _stats["data"], _stats["error"] = now, data, err
+                _stats["at"], _stats["error"], _stats["running"] = time.time(), err, False
+                # A failed pass keeps the last good figures rather than
+                # replacing them with zeros that read as a healthy idle service.
+                if data is not None:
+                    _stats["data"] = data
         with _stats_lock:
             payload = dict(_stats["data"] or {})
             payload["error"] = _stats["error"]
-            payload["cached_age"] = round(now - _stats["at"], 1)
+            payload["cached_age"] = round(time.time() - _stats["at"], 1)
         with _inflight_lock:
             busy = _inflight["n"]
         payload["service"] = {"build": BUILD, "pid": os.getpid(), "port": PORT,
@@ -2251,25 +2269,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, payload)
 
     def dashboard_allowed(self):
-        """Loopback needs nothing; anything else needs the token.
+        """Without a token, loopback only; with one, everybody pays it.
 
         The dashboard rides on the port that also carries the API, and a host
-        exposing one path publicly exposes them all. The SWE-2 route refuses a
-        non-loopback Host on its own, but the figures are still the user's to
-        keep, so reading them from outside costs a secret.
+        exposing one path publicly exposes them all. Judging by the Host header
+        stops a rebound browser, which cannot forge one, but nothing else: any
+        forwarder — socat, ssh -L, a tailnet mount — delivers its connections
+        from 127.0.0.1 with whatever Host the client chose. So once a token
+        exists it is the guard, for every caller. A browser pays it once, in a
+        ?k= link, and rides the cookie afterwards.
         """
-        host = (self.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
-        if host in ("", "127.0.0.1", "localhost", "::1"):
-            return True
-        token = DASHBOARD_TOKEN
-        if not token:
-            return False
+        if not DASHBOARD_TOKEN:
+            host = (self.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
+            return host in ("", "127.0.0.1", "localhost", "::1")
         given = (parse_qs(urlsplit(self.path).query).get("k") or [""])[0]
         cookie = ""
         for part in (self.headers.get("cookie") or "").split(";"):
             if part.strip().startswith("dxk="):
                 cookie = part.strip()[4:]
-        return hmac.compare_digest(given, token) or hmac.compare_digest(cookie, token)
+        return self.token_ok(given) or self.token_ok(cookie)
+
+    @staticmethod
+    def token_ok(given):
+        """compare_digest on str raises on anything non-ASCII: compare bytes."""
+        if not given:
+            return False
+        return hmac.compare_digest(given.encode("utf-8", "surrogatepass"),
+                                   DASHBOARD_TOKEN.encode("utf-8"))
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -2287,9 +2313,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
             given = (parse_qs(urlsplit(self.path).query).get("k") or [""])[0]
-            if given and DASHBOARD_TOKEN and hmac.compare_digest(given, DASHBOARD_TOKEN):
+            if self.token_ok(given):
+                # HttpOnly: no script on the page ever needs to read it, and a
+                # script that could would be reading it to send it elsewhere.
                 self.send_header("set-cookie",
-                                 f"dxk={given}; Path=/; Max-Age=2592000; SameSite=Lax")
+                                 f"dxk={given}; Path=/; Max-Age=2592000; "
+                                 "SameSite=Lax; HttpOnly")
             self.send_header("content-length", str(len(page)))
             self.send_header("connection", "close")
             self.end_headers()
