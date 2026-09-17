@@ -25,6 +25,7 @@ import base64
 import glob
 import gzip
 import hashlib
+import hmac
 import json
 import os
 import random
@@ -37,7 +38,7 @@ import time
 import uuid
 from http.cookiejar import DefaultCookiePolicy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import requests
 from urllib3.util.retry import Retry
@@ -202,6 +203,10 @@ _STARTED = time.time()
 # lines costs about a second, so a short cache keeps several open tabs from
 # each paying for it.
 STATS_TTL = float(os.environ.get("DEVINX_STATS_TTL", "5"))
+# Reading the dashboard from anywhere but loopback costs this secret. Empty
+# means loopback only, which is the safe default for a service that never
+# expected to be reachable from outside the machine.
+DASHBOARD_TOKEN = os.environ.get("DEVINX_DASHBOARD_TOKEN", "")
 _stats_lock = threading.Lock()
 _stats = {"at": 0.0, "data": None, "error": None}
 
@@ -1119,6 +1124,11 @@ def _tail_start(messages, budget):
     # the boundary marches to the end of the conversation and the agent is left
     # with none of the work it just did. That is exactly when it needs it: it
     # reads a file, the read is dropped, and its next edit no longer matches.
+    # When even the last message alone overruns the budget the loop above never
+    # advances, and start stays past the end: indexing it raised, compaction was
+    # abandoned, and the turn went upstream uncompacted — exactly the turns that
+    # could least afford it.
+    start = min(start, len(messages) - 1)
     while start > 1:
         blocks = _blocks(messages[start].get("content"))
         if any(b.get("type") == "tool_result" for b in blocks):
@@ -1148,7 +1158,21 @@ def compact_body(body):
     key = _conv_key(body)
     n_dropped = start - 1
     with _summary_lock:
-        covered, summary = _summaries.get(key, (0, None))
+        covered, summary, built_at = _summaries.get(key, (0, None, 0))
+    # A resumed agent is the same task under the same system prompt in the same
+    # session, so it hashes to the same key — and would inherit the summary of
+    # the run that failed, then extend it rather than rebuild it, so each resume
+    # starts further from the truth than the last. A conversation that is
+    # suddenly shorter than when the summary was built is a new run, not a
+    # continuation: the summary is dropped and rebuilt from what is actually
+    # there. Only the summary is reset; the cascade id stays, because that is
+    # what keeps the upstream prefix cache and it is worth about 60% of the
+    # input tokens.
+    if summary is not None and len(messages) < built_at:
+        print(f"compaction: conversation restarted ({len(messages)} msgs, was "
+              f"{built_at}); dropping the summary from the previous run",
+              flush=True)
+        covered, summary = 0, None
     if summary is None or covered < n_dropped:
         model = resolve_model(body)
         before = estimate_tokens(body)
@@ -1165,7 +1189,7 @@ def compact_body(body):
         with _summary_lock:
             if len(_summaries) > 64:
                 _summaries.clear()
-            _summaries[key] = (n_dropped, summary)
+            _summaries[key] = (n_dropped, summary, len(messages))
         print(f"compaction: {len(fresh)} more turns summarised "
               f"({n_dropped} total, {before} tokens estimated, over "
               f"{COMPACT_AT})", flush=True)
@@ -2156,8 +2180,33 @@ class Handler(BaseHTTPRequestHandler):
         payload["tail"] = _log_tail(60)
         self.send_json(200, payload)
 
+    def dashboard_allowed(self):
+        """Loopback needs nothing; anything else needs the token.
+
+        The dashboard rides on the port that also carries the API, and a host
+        exposing one path publicly exposes them all. The SWE-2 route refuses a
+        non-loopback Host on its own, but the figures are still the user's to
+        keep, so reading them from outside costs a secret.
+        """
+        host = (self.headers.get("host") or "").rsplit(":", 1)[0].strip("[]")
+        if host in ("", "127.0.0.1", "localhost", "::1"):
+            return True
+        token = DASHBOARD_TOKEN
+        if not token:
+            return False
+        given = (parse_qs(urlsplit(self.path).query).get("k") or [""])[0]
+        cookie = ""
+        for part in (self.headers.get("cookie") or "").split(";"):
+            if part.strip().startswith("dxk="):
+                cookie = part.strip()[4:]
+        return hmac.compare_digest(given, token) or hmac.compare_digest(cookie, token)
+
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path in ("/dashboard", "/dashboard/", "/api/stats") and not self.dashboard_allowed():
+            self.send_error_json(403, "permission_error",
+                                 "dashboard token missing or wrong")
+            return
         if path == "/dashboard" or path == "/dashboard/":
             try:
                 with open(os.path.join(HERE, "tools", "dashboard.html"), "rb") as fh:
@@ -2167,6 +2216,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
+            given = (parse_qs(urlsplit(self.path).query).get("k") or [""])[0]
+            if given and DASHBOARD_TOKEN and hmac.compare_digest(given, DASHBOARD_TOKEN):
+                self.send_header("set-cookie",
+                                 f"dxk={given}; Path=/; Max-Age=2592000; SameSite=Lax")
             self.send_header("content-length", str(len(page)))
             self.send_header("connection", "close")
             self.end_headers()
