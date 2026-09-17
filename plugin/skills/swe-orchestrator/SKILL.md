@@ -109,7 +109,13 @@ validation". If you do not specify, it will pick something, and you will be
 reviewing that choice instead of the code.
 
 **Name the files it owns.** List them. State that everything else is
-off-limits, including formatting. One writer per file, always.
+off-limits, including formatting. One writer per file, always. Set
+`DEVINX_OWNED_PATHS` to the same list, colon-separated, when you launch the
+agent: prose is a request, that variable is a wall. Measured on this fleet, an
+agent read "you own exactly these five files" and "stop and report rather than
+reaching for `apps/`", agreed to both, and then spent twelve and a half hours
+editing a file under `apps/`. The wall is not distrust of the model; it is
+what turns a boundary into one.
 
 **Give acceptance criteria a machine can settle.** "`pytest
 tests/test_export.py -k currency` passes and nothing else in that file breaks"
@@ -136,6 +142,41 @@ Skeleton:
 > **Done when** — `<command>` produces `<result>`.
 > **Return** — files changed, the diff of the core change, commands run, their output verbatim, anything you could not do.
 > **Stop and report instead of deciding if** — the task needs an architectural call, a new dependency, a schema change, or touches files outside your scope.
+
+## The budget is requests, not tokens
+
+The upstream meters this fleet in requests. One turn is one request whatever it
+carries, so a turn that reads one file costs exactly what a turn that reads ten
+costs. That single fact should shape how you brief.
+
+**Tell the executor to batch its reads.** Ten files in one turn is one request;
+ten files over ten turns is ten. The tool call surface allows a whole batch at
+once and agents under-use it badly — measured here, the median turn issues one
+call while the ceiling seen in practice is twenty. A brief that says "read
+these six files first, in one turn, then start" is worth more than any amount
+of token trimming.
+
+**Front-load the context you already have** — the same rule as above, now with
+a price on it. Every file location you withhold is a turn the executor spends
+finding it, and every one of those is a request off the same counter that
+serves the actual work.
+
+**Do not send an agent to re-orient.** The most expensive shape observed on
+this fleet was not failure, it was hesitation: five agents spent between three
+and ten hours each on resumption tasks where 84% of their commands were `git
+status`, `git log` and `ls` — thousands of requests, almost no errors, no
+convergence. An agent picking up unfinished work needs to be *told* the state:
+what is done, what is left, which files carry it, what the last commit was.
+Handing it "continue where the previous agent left off" buys you an hour of an
+agent reading the repository to itself.
+
+**Prefer one longer task to three short ones with the same total work.** Every
+hand-off re-establishes context from scratch, and re-establishment is pure
+request cost. Split for clarity of ownership, not for granularity.
+
+**Re-running is not free.** A verification pass that reruns the whole suite to
+check one change spends the same quota as the change did. Ask for the narrowest
+command that settles the question.
 
 ## Trust nothing you did not verify
 
