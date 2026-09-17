@@ -32,6 +32,8 @@ import random
 import re
 import struct
 import subprocess
+import signal
+import socket
 import sys
 import threading
 import time
@@ -202,6 +204,8 @@ _STARTED = time.time()
 # The dashboard reads the log through the extractor in tools/. Parsing 120k
 # lines costs about a second, so a short cache keeps several open tabs from
 # each paying for it.
+# How long a process leaving gives the turns it is already carrying.
+DRAIN_SECONDS = int(os.environ.get("DEVINX_DRAIN", "300"))
 STATS_TTL = float(os.environ.get("DEVINX_STATS_TTL", "5"))
 # Reading the dashboard from anywhere but loopback costs this secret. Empty
 # means loopback only, which is the safe default for a service that never
@@ -2840,6 +2844,50 @@ def estimate_tokens(body):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
+    def server_bind(self):
+        # SO_REUSEPORT so a new build can bind the port while the old process
+        # is still finishing its turns. Without it a deploy is a choice between
+        # waiting for a quiet moment that never comes — an agent fleet keeps
+        # this port busy around the clock — and cutting live turns, which is
+        # not a deploy, it is an outage. With it, the new process takes the new
+        # connections and the old one drains.
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        return ThreadingHTTPServer.server_bind(self)
+
+
+def drain_and_exit(srv):
+    """Stop taking work, finish what is in hand, then go.
+
+    A turn cut in half reaches the agent as a closed socket mid-stream, and an
+    agent does not always survive that — one was lost to exactly this earlier
+    today. So the signal that ends this process is a request to stop
+    accepting, not a request to stop.
+    """
+    def handler(signum, frame):
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+        deadline = time.time() + DRAIN_SECONDS
+        while time.time() < deadline:
+            with _inflight_lock:
+                busy = _inflight["n"]
+            if not busy:
+                break
+            time.sleep(0.5)
+        with _inflight_lock:
+            busy = _inflight["n"]
+        print(f"devinx: draining complete, exiting"
+              + (f" with {busy} turn(s) still in flight after "
+                 f"{DRAIN_SECONDS}s" if busy else ""), flush=True)
+        os._exit(0)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass
+
 
 class DashboardHandler(Handler):
     """A second listener carrying the dashboard and nothing else.
@@ -2893,9 +2941,11 @@ if __name__ == "__main__":
           f"(build {BUILD}, pid {os.getpid()}, data: {DATA_DIR})", flush=True)
     if DASHBOARD_PORT:
         serve_dashboard_port(DASHBOARD_PORT)
+    _srv = Server((HOST, PORT), Handler)
+    drain_and_exit(_srv)
     if os.environ.get("DEVINX_DUMP"):
         print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
               f"conversation and any credentials the client sends, is being "
               f"written verbatim to {os.environ['DEVINX_DUMP']}.*.json",
               flush=True)
-    Server((HOST, PORT), Handler).serve_forever()
+    _srv.serve_forever()
