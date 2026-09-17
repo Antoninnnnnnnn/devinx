@@ -1151,13 +1151,38 @@ def summarise_turns(messages, model, system, previous=None):
             + (COMPACT_PROMPT_MORE if previous else COMPACT_PROMPT)}]}],
     }
     req, _ = build_request(body)
-    texts = []
-    for msg, err in chat_stream(req):
-        if err:
+    acct, _ = claim_account()
+    if acct is None:
+        # Every credential is already blocked. Try one anyway: the block is a
+        # local estimate of when a limit resets, not a fact.
+        acct = accounts()[0] if accounts() else None
+    for _ in range(len(accounts()) + 1):
+        texts, err = [], None
+        for msg, e in chat_stream(req, acct):
+            if e:
+                err = e
+                break
+            if msg.delta_text:
+                texts.append(msg.delta_text)
+        if not err:
+            return "".join(texts).strip() or None
+        if "resource_exhausted" not in err:
             return None
-        if msg.delta_text:
-            texts.append(msg.delta_text)
-    return "".join(texts).strip() or None
+        # Both limits are per account, so another credential is a switch and
+        # not a wait — and this call must never wait: it is already the pause
+        # the agent is paying before its own turn goes out. When every
+        # credential refuses, the summary is given up on and the turn is
+        # handled by the caller, which does know how to hold.
+        found = _RESET_AFTER.search(err)
+        if acct is not None:
+            block_account(acct, int(found.group(1)) * 60 if found else 30)
+        other, _until = claim_account(avoid=acct)
+        if other is None:
+            return None
+        print(f"summary: rate limited on {acct['name'] if acct else '?'}, "
+              f"retrying on {other['name']}", flush=True)
+        acct = other
+    return None
 
 
 # Below this many calls collapsed into one message the shape is just an agent
@@ -1366,11 +1391,20 @@ def compact_body(body):
         # rebuilding it: the difference between a few seconds a turn and half a
         # minute a turn.
         new = summarise_turns(_regroup(fresh), model, _system_text(body), summary)
-        if not new:
+        if not new and summary is None:
             print("compaction: the summary call failed, forwarding as is",
                   flush=True)
             return body
-        summary = f"{summary}\n\n{new}" if summary else new
+        if not new:
+            # An extension failed but the earlier summary still stands. Going
+            # out with it is worse than going out with a current one and much
+            # better than going out whole: an oversized body comes back
+            # refused, and a subagent does not survive being refused.
+            print(f"compaction: the summary could not be extended; going out "
+                  f"with the one covering {covered} of {len(span)} blocks",
+                  flush=True)
+        else:
+            summary = f"{summary}\n\n{new}" if summary else new
         if len(summary) // 4 > SUMMARY_TOTAL_CAP:
             # Fold rather than grow. Summarising the summary keeps one document
             # of the whole run instead of a chain of appendices, and costs one
@@ -1382,14 +1416,16 @@ def compact_body(body):
                 print(f"compaction: summary folded, {len(summary) // 4} -> "
                       f"{len(folded) // 4} tokens", flush=True)
                 summary = folded
-        covered = len(span)
+        if new:
+            covered = len(span)
         with _summary_lock:
             if len(_summaries) > 64:
                 _summaries.clear()
             _summaries[key] = (covered, summary, total_blocks)
-        print(f"compaction: {len(fresh)} more blocks summarised "
-              f"({covered} of {len(span)} covered, {before} tokens estimated, "
-              f"over {COMPACT_AT})", flush=True)
+        if new:
+            print(f"compaction: {len(fresh)} more blocks summarised "
+                  f"({covered} of {len(span)} covered, {before} tokens "
+                  f"estimated, over {COMPACT_AT})", flush=True)
 
     compacted = dict(body)
     compacted["messages"] = [messages[0], {"role": "user", "content": [

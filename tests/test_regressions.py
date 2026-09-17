@@ -471,6 +471,67 @@ class UnflattenTests(unittest.TestCase):
                            10 * devinx.estimate_tokens(flat_out))
 
 
+class SummaryResilienceTests(unittest.TestCase):
+    """The summariser's own call is a request like any other, and was the only
+    one in the process with no answer to a refusal. One rate limit on it and
+    compaction gave up, so the turn went upstream whole — which for a subagent
+    is not a slower turn, it is the end of the run."""
+
+    class _Msg:
+        delta_text = "SUMMARY"
+        delta_thinking = delta_signature = None
+
+    def test_a_rate_limited_summary_moves_to_the_other_credential(self):
+        seen = []
+
+        def flaky(req, acct=None):
+            seen.append(acct and acct.get("name"))
+            if len(seen) == 1:
+                yield None, "upstream trailer error: resource_exhausted: Reached"
+                return
+            yield self._Msg(), None
+
+        with mock.patch.object(devinx, "chat_stream", flaky), \
+             mock.patch.object(devinx, "build_request", lambda b, **k: (None, None)):
+            out = devinx.summarise_turns(
+                [{"role": "user", "content": [{"type": "text", "text": "x"}]}],
+                "swe-2-max", "sys")
+        self.assertEqual(out, "SUMMARY")
+        self.assertEqual(len(seen), 2, "it gave up instead of switching")
+        self.assertNotEqual(seen[0], seen[1], "it retried the same credential")
+
+    def test_an_unextendable_summary_still_compacts_the_turn(self):
+        fat = "x" * 4000
+
+        def body(pairs):
+            return {"model": "swe-2-max", "system": "s",
+                    "metadata": {"user_id": "u-stale"}, "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "task"}]},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": f"t{i}", "name": "Read",
+                             "input": {}} for i in range(pairs)]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": f"t{i}",
+                             "content": [{"type": "text", "text": fat}]}
+                            for i in range(pairs)]},
+                        {"role": "system", "content": [
+                            {"type": "text", "text": "keep going"}]},
+                    ]}
+
+        devinx._summaries.clear()
+        with mock.patch.object(devinx, "summarise_turns",
+                               lambda *a, **k: "FIRST-SUMMARY"):
+            devinx.compact_body(body(260))
+        # Every credential is now refusing: the extension cannot be made.
+        with mock.patch.object(devinx, "summarise_turns", lambda *a, **k: None):
+            out = devinx.compact_body(body(300))
+        self.assertIn("FIRST-SUMMARY", json.dumps(out),
+                      "the standing summary was thrown away")
+        self.assertLess(devinx.estimate_tokens(out),
+                        devinx.estimate_tokens(body(300)) // 2,
+                        "the turn went out whole and would have been refused")
+
+
 class UnknownRoleTests(unittest.TestCase):
     """`system` messages inside `messages` are not in the Messages API, and
     Claude Code sends them anyway. The branch that only knew `user` dropped
