@@ -149,6 +149,16 @@ The upstream meters this fleet in requests. One turn is one request whatever it
 carries, so a turn that reads one file costs exactly what a turn that reads ten
 costs. That single fact should shape how you brief.
 
+**You are not on the same meter they are.** Your turns run on the root
+model's own quota; theirs run on the one that is scarce. Measured on this
+fleet: 33 936 requests on the executors' counter against 7 421 on yours — and
+it is the executors' counter that runs out. So work you *can* do yourself is
+work that costs nothing on the binding constraint. Reading a file to find out
+where something lives, checking what a test asserts, deciding which of three
+approaches applies: doing that yourself and handing over the answer is
+strictly cheaper than delegating the question. Delegate the *writing*, not the
+finding out.
+
 **Tell the executor to batch its reads.** Ten files in one turn is one request;
 ten files over ten turns is ten. The tool call surface allows a whole batch at
 once and agents under-use it badly — measured here, the median turn issues one
