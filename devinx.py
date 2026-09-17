@@ -1392,10 +1392,17 @@ def compact_body(body):
         # minute a turn.
         new = summarise_turns(_regroup(fresh), model, _system_text(body), summary)
         if not new and summary is None:
-            print("compaction: the summary call failed, forwarding as is",
+            # No summary could be made and there is no earlier one to stand in.
+            # Forwarding the turn whole was the old answer and it is not an
+            # answer: an oversized body comes back refused, and a refusal ends
+            # a subagent. The turns are dropped without a summary instead. The
+            # agent loses the middle of its run, which is a real loss, and it
+            # keeps its task, its recent work and its life.
+            print(f"compaction: no summary available ({before} tokens, over "
+                  f"{COMPACT_AT}); dropping {len(span)} blocks unsummarised",
                   flush=True)
-            return body
-        if not new:
+            summary = None
+        elif not new:
             # An extension failed but the earlier summary still stands. Going
             # out with it is worse than going out with a current one and much
             # better than going out whole: an oversized body comes back
@@ -1405,7 +1412,7 @@ def compact_body(body):
                   flush=True)
         else:
             summary = f"{summary}\n\n{new}" if summary else new
-        if len(summary) // 4 > SUMMARY_TOTAL_CAP:
+        if summary and len(summary) // 4 > SUMMARY_TOTAL_CAP:
             # Fold rather than grow. Summarising the summary keeps one document
             # of the whole run instead of a chain of appendices, and costs one
             # short call against a record that would otherwise never stop.
@@ -1427,13 +1434,21 @@ def compact_body(body):
                   f"({covered} of {len(span)} covered, {before} tokens "
                   f"estimated, over {COMPACT_AT})", flush=True)
 
+    if summary:
+        bridge = ("This conversation was compacted to fit the context window. "
+                  "The summary below replaces the turns between the task above "
+                  "and the messages that follow; continue the work from it."
+                  f"\n\n<summary>\n{summary}\n</summary>")
+    else:
+        bridge = ("This conversation was compacted to fit the context window "
+                  "and no summary of the removed turns could be made. The "
+                  "turns between the task above and the messages that follow "
+                  "are gone. Re-establish what you need from the working tree "
+                  "rather than assuming it, and say so if the task no longer "
+                  "makes sense without them.")
     compacted = dict(body)
     compacted["messages"] = [messages[0], {"role": "user", "content": [
-        {"type": "text", "text":
-         "This conversation was compacted to fit the context window. The "
-         "summary below replaces the turns between the task above and the "
-         "messages that follow; continue the work from it.\n\n"
-         f"<summary>\n{summary}\n</summary>"}]}] + messages[start:]
+        {"type": "text", "text": bridge}]}] + messages[start:]
     # Diagnostic: what the conversation is actually made of. The tail collapses
     # when single messages are large enough to spend its whole budget, and that
     # is worth knowing from measurement rather than assumption.
@@ -1517,6 +1532,23 @@ def _usage(u):
     if u.cache_write_tokens:
         out["cache_creation_input_tokens"] = int(u.cache_write_tokens)
     return out
+
+
+def _json_cut(err, raw):
+    """Where the arguments stopped making sense, without quoting them.
+
+    A call dropped for unparseable arguments has two very different causes and
+    the same log line today. If the parser gave up at the very end of the
+    string, the model was cut off mid-call and reporting max_tokens is exactly
+    right. If it gave up in the middle, the stream was assembled wrong here and
+    the turn was ours to lose. The position tells them apart; the arguments are
+    the user's work and do not belong in a log.
+    """
+    pos = getattr(err, "pos", None)
+    if pos is None:
+        return "position unknown"
+    where = "at the end" if pos >= len(raw) - 2 else "mid-string"
+    return f"parser stopped at {pos}/{len(raw)}, {where}: {getattr(err, 'msg', '')}"
 
 
 def _stop_reason(stop, has_tools):
@@ -1865,10 +1897,10 @@ def run_swe(body, wfile, make_stream=None):
             raw_args = tool_blocks[tid]["json"] or "{}"
             try:
                 json.loads(raw_args)
-            except ValueError:
+            except ValueError as e:
                 print(f"tool call {tool_blocks[tid]['name']} has unparseable "
-                      f"arguments ({len(raw_args)} chars); dropping it and "
-                      f"reporting max_tokens", flush=True)
+                      f"arguments ({len(raw_args)} chars, {_json_cut(e, raw_args)}); "
+                      f"dropping it and reporting max_tokens", flush=True)
                 stop_reason = "max_tokens"
                 continue
             out.tool(tid, tool_blocks[tid]["name"], raw_args)
@@ -1890,13 +1922,13 @@ def run_swe(body, wfile, make_stream=None):
         raw_args = tool_blocks[tid]["json"] or "{}"
         try:
             args = json.loads(raw_args)
-        except ValueError:
+        except ValueError as e:
             # Substituting {} would hand the client a well-formed call with its
             # arguments quietly removed — a truncated `Bash` becomes a no-arg
             # `Bash`. Report the turn as cut short instead.
             print(f"tool call {tool_blocks[tid]['name']} has unparseable "
-                  f"arguments ({len(raw_args)} chars); reporting max_tokens",
-                  flush=True)
+                  f"arguments ({len(raw_args)} chars, {_json_cut(e, raw_args)}); "
+                  f"reporting max_tokens", flush=True)
             stop_reason = "max_tokens"
             continue
         content.append({"type": "tool_use", "id": tid,

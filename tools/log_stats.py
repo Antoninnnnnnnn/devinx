@@ -14,6 +14,9 @@ logs a new conn first) and is only approximate under interleaved concurrent
 requests. Turns from before those fields existed land under "unknown".
 
 Definitions:
+  - "refusals" here are quota rejections and nothing else: the model never
+    refused anything on content. A credential pointed at a spent quota looks
+    alarming in this column and means only that it was spent.
   - a rate-limit refusal is a resource_exhausted trailer error or an
     upstream HTTP 429; relay route=... status=429 lines are the client
     side of the same event and stay under "relay".

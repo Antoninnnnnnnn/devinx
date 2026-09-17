@@ -174,11 +174,11 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
   <div class="card">
     <h3>Par credential</h3>
     <div class="tw"><table><thead><tr><th>compte</th><th class="n">tours</th>
-      <th class="n">refus</th><th class="n">taux</th></tr></thead>
+      <th class="n">refus de quota</th><th class="n">taux</th></tr></thead>
       <tbody id="byacct"></tbody></table></div>
   </div>
   <div class="card">
-    <h3>Nature des refus</h3>
+    <h3>Nature des refus de quota</h3>
     <div class="rows" id="quotas"></div>
     <div class="note" id="quotanote"></div>
   </div>
@@ -312,7 +312,7 @@ function render(d){
   rows($("quotas"), q.map(([k,v],i) => ({k, v, t: n(v), c: SERIES[i%4]})));
   $("quotanote").textContent = q.length
     ? "Deux compteurs distincts sur le même usage : l'un se recharge en secondes, l'autre peut bloquer douze minutes."
-    : "Aucun refus enregistré.";
+    : "Aucun refus de quota enregistré.";
 
   const w = rl.wait_seconds || {}, b = rl.bursts || {};
   $("rlkv").innerHTML = [

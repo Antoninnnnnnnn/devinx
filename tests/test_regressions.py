@@ -500,6 +500,37 @@ class SummaryResilienceTests(unittest.TestCase):
         self.assertEqual(len(seen), 2, "it gave up instead of switching")
         self.assertNotEqual(seen[0], seen[1], "it retried the same credential")
 
+    def test_a_turn_is_never_forwarded_oversized(self):
+        """The last resort is dropping turns, never sending the body whole.
+
+        An oversized body comes back refused and a refusal ends a subagent, so
+        there is no state of the world in which forwarding it is the better
+        move — not even when no summary can be made at all.
+        """
+        fat = "x" * 4000
+        body = {"model": "swe-2-max", "system": "s",
+                "metadata": {"user_id": "u-nosum"}, "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "task"}]},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": f"t{i}", "name": "Read",
+                         "input": {}} for i in range(260)]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": f"t{i}",
+                         "content": [{"type": "text", "text": fat}]}
+                        for i in range(260)]},
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "keep going"}]},
+                ]}
+        devinx._summaries.clear()
+        with mock.patch.object(devinx, "summarise_turns", lambda *a, **k: None):
+            out = devinx.compact_body(devinx.unflatten_body(copy.deepcopy(body)))
+        self.assertLess(devinx.estimate_tokens(out), devinx.COMPACT_AT,
+                        "the turn went out over the limit and would be refused")
+        self.assertIn("no summary of the removed turns could be made",
+                      json.dumps(out), "the agent was not told what it lost")
+        # The task and the recent work are what it keeps.
+        self.assertIn("task", json.dumps(out["messages"][0]))
+
     def test_an_unextendable_summary_still_compacts_the_turn(self):
         fat = "x" * 4000
 
@@ -548,6 +579,49 @@ class UnknownRoleTests(unittest.TestCase):
         wire = str(req)
         self.assertIn("MARKER-A", wire)
         self.assertIn("MARKER-B", wire)
+
+
+class EditLoopGuardTests(unittest.TestCase):
+    """The loop that cost one agent a whole night ends on the fourth try."""
+
+    GUARD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "plugin", "hooks", "edit_loop_guard.py")
+
+    def _call(self, session, target="/a/b.py", old="X", new="Y", tool="Edit"):
+        import subprocess
+        event = json.dumps({"session_id": session, "tool_name": tool,
+                            "tool_input": {"file_path": target,
+                                           "old_string": old,
+                                           "new_string": new}})
+        return subprocess.run([sys.executable, self.GUARD], input=event,
+                              capture_output=True, text=True)
+
+    def setUp(self):
+        self.session = "test-" + os.urandom(6).hex()
+
+    def test_the_fourth_identical_edit_is_refused(self):
+        for attempt in range(3):
+            self.assertEqual(self._call(self.session).returncode, 0,
+                             f"attempt {attempt + 1} should pass")
+        blocked = self._call(self.session)
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("Read /a/b.py", blocked.stderr)
+        self.assertIn("outside the Edit tool", blocked.stderr)
+
+    def test_different_edits_never_collide(self):
+        for i in range(12):
+            r = self._call(self.session, old=f"X{i}", new=f"Y{i}")
+            self.assertEqual(r.returncode, 0, "distinct edits were counted together")
+
+    def test_a_malformed_event_never_blocks_work(self):
+        import subprocess
+        r = subprocess.run([sys.executable, self.GUARD], input="not json",
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0)
+
+    def test_other_tools_pass_through(self):
+        for _ in range(8):
+            self.assertEqual(self._call(self.session, tool="Write").returncode, 0)
 
 
 if __name__ == "__main__":
