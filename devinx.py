@@ -2930,6 +2930,37 @@ def estimate_tokens(body):
     return max(1, chars // 4 + tokens)
 
 
+class _Stamped:
+    """Every log line gets the time it was written.
+
+    Without it the journal can say what happened and never when: a rate per
+    minute, a retention trend over days, the distance between two refusals —
+    none of them are answerable from a file of undated lines, and all of them
+    are what you need to pace a fleet against a limit metered in requests.
+    Wrapping stdout rather than touching several hundred print() calls keeps
+    the change in one place and makes it impossible to forget one.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._fresh = True
+
+    def write(self, text):
+        if not text:
+            return 0
+        out, stamp = [], time.strftime("%Y-%m-%dT%H:%M:%S")
+        for piece in text.splitlines(keepends=True):
+            if self._fresh and piece.strip():
+                out.append(f"{stamp} {piece}")
+            else:
+                out.append(piece)
+            self._fresh = piece.endswith("\n")
+        return self._stream.write("".join(out))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -3026,6 +3057,8 @@ def serve_dashboard_port(port):
 
 
 if __name__ == "__main__":
+    sys.stdout = _Stamped(sys.stdout)
+    sys.stderr = _Stamped(sys.stderr)
     print(f"devinx listening on http://{HOST}:{PORT}  "
           f"(build {BUILD}, pid {os.getpid()}, data: {DATA_DIR})", flush=True)
     if DASHBOARD_PORT:

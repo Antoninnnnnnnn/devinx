@@ -39,25 +39,33 @@ from datetime import datetime
 LOG_PATH = os.environ.get(
     "DEVINX_LOG", os.path.expanduser("~/.local/share/devinx/devinx.log"))
 
+# Lines written since 2026-09-17 carry an ISO timestamp; older ones do not, and
+# both have to parse or the history disappears the day the format changed.
+# Non-capturing on purpose: it prefixes patterns whose groups are read by
+# position, and a capture here would shift every one of them by a slot.
+STAMP = r"^(?:\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d )?"
+RE_STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d) ")
+STAMP_LEN = len("2026-09-17T22:00:00 ")
+
 RE_CONN = re.compile(
-    r"^upstream conn: [\d.]+s to headers "
+    STAMP + r"upstream conn: [\d.]+s to headers "
     r"\((?:acct=(\S+) )?(?:model=(\S+) )?(\d+) msgs, (\d+)KB req\)")
 RE_DONE = re.compile(
-    r"^upstream done: (?:stop=([a-z_]+)/\d+ calls=(\d+) )?"
+    STAMP + r"upstream done: (?:stop=([a-z_]+)/\d+ calls=(\d+) )?"
     r"latency=([\d.]+)s usage in=(\d+) out=(\d+) cr=(\d+) cw=(\d+)")
 RE_TRAILER = re.compile(
-    r"^upstream trailer error(?: on (\S+))?: (\w+)(?:: ?(.*))?$")
-RE_HTTP = re.compile(r"^upstream HTTP (\d+) on (\S+):")
+    STAMP + r"upstream trailer error(?: on (\S+))?: (\w+)(?:: ?(.*))?$")
+RE_HTTP = re.compile(STAMP + r"upstream HTTP (\d+) on (\S+):")
 RE_HOLD = re.compile(r"holding the turn for (\d+)s")
 RE_QUOTA = re.compile(r"Reached (.+?) rate limit")
 RE_RESET = re.compile(r"reset in (\d+) (minute|second)s?\b")
-RE_COMPACT = re.compile(r"^compaction: (\d+) -> (\d+) tokens")
-RE_BIGTOOL = re.compile(r"^WARNING: (\d+) tool calls in one turn: (.*)$")
+RE_COMPACT = re.compile(STAMP + r"compaction: (\d+) -> (\d+) tokens")
+RE_BIGTOOL = re.compile(STAMP + r"WARNING: (\d+) tool calls in one turn: (.*)$")
 RE_TOOLNAME = re.compile(r"'([^']+)': (\d+)")
-RE_UNPARSEABLE = re.compile(r"^tool call (\S+) has unparseable arguments")
-RE_ROUTE = re.compile(r"^route=(\S+) model=\S+ status=(\S+)")
+RE_UNPARSEABLE = re.compile(STAMP + r"tool call (\S+) has unparseable arguments")
+RE_ROUTE = re.compile(STAMP + r"route=(\S+) model=\S+ status=(\S+)")
 RE_BUILD = re.compile(r"\(build ([0-9a-f]+),")
-RE_UPSTREAM_ERR = re.compile(r"^upstream ([A-Z]\w+):")
+RE_UPSTREAM_ERR = re.compile(STAMP + r"upstream ([A-Z]\w+):")
 
 
 def pct(values, p):
@@ -90,12 +98,31 @@ def collect(path):
         "unparseable": 0, "unparseable_by_tool": Counter(),
         "big_tool_turns": [],
         "busiest": None,  # (input + output, latency, input, output)
+        # Per-minute buckets, for the only question a request-metered quota
+        # really asks: how close to the ceiling is this fleet running. Only
+        # timestamped lines land here, so the series starts the day the log
+        # learned to write the time.
+        "per_min_req": Counter(), "per_min_ref": Counter(),
+        "retention_day": defaultdict(list),
+        "first_stamp": None, "last_stamp": None,
     }
     seen_builds = set()
     last_acct = None
     last_model = None
 
-    def refusal(acct, msg):
+    def stamp_of(line):
+        m = RE_STAMP.match(line)
+        if not m:
+            return None
+        at = m.group(1)
+        if st["first_stamp"] is None:
+            st["first_stamp"] = at
+        st["last_stamp"] = at
+        return at
+
+    def refusal(acct, msg, minute=None):
+        if minute:
+            st["per_min_ref"][minute] += 1
         st["rl_total"] += 1
         st["cur_burst"] += 1
         q = RE_QUOTA.search(msg or "")
@@ -115,10 +142,17 @@ def collect(path):
         return st
 
     with fh:
-        for line in fh:
+        for raw in fh:
             st["lines"] += 1
+            # The timestamp comes off here, once, rather than being tolerated
+            # by every pattern and every startswith below it.
+            at = stamp_of(raw)
+            line = raw[STAMP_LEN:] if at else raw
+            minute = at[:16] if at else None
             try:
                 if line.startswith("upstream conn:"):
+                    if minute:
+                        st["per_min_req"][minute] += 1
                     m = RE_CONN.match(line)
                     if m:
                         st["msgs"].append(int(m.group(3)))
@@ -158,7 +192,7 @@ def collect(path):
                     m = RE_TRAILER.match(line)
                     if m:
                         if m.group(2) == "resource_exhausted":
-                            refusal(m.group(1), m.group(3))
+                            refusal(m.group(1), m.group(3), minute)
                         else:
                             st["turns_failed"] += 1
                 elif line.startswith("upstream rate limited"):
@@ -175,7 +209,7 @@ def collect(path):
                     m = RE_HTTP.match(line)
                     if m:
                         if m.group(1) == "429":
-                            refusal(m.group(2), line)
+                            refusal(m.group(2), line, minute)
                         else:
                             st["turns_failed"] += 1
                 elif line.startswith("upstream stream"):
@@ -202,8 +236,11 @@ def collect(path):
                     m = RE_COMPACT.match(line)
                     if m:
                         st["comp_count"] += 1
-                        st["before"].append(int(m.group(1)))
-                        st["after"].append(int(m.group(2)))
+                        before, after = int(m.group(1)), int(m.group(2))
+                        st["before"].append(before)
+                        st["after"].append(after)
+                        if at and before:
+                            st["retention_day"][at[:10]].append(100.0 * after / before)
                     elif "summary call failed" in line:
                         st["comp_fail"] += 1
                     # "more turns summarised" and "nothing droppable" are
@@ -239,6 +276,60 @@ def collect(path):
     if st["cur_burst"]:
         st["bursts"].append(st["cur_burst"])
     return st
+
+
+def _throughput(st, swe_total=0):
+    """What a request-metered quota actually asks: how close to the ceiling.
+
+    Only timestamped lines carry this, so the series begins the day the log
+    learned to write the time. Everything here is per wall-clock minute, which
+    is the unit the upstream's own limit is expressed in.
+    """
+    req, ref = st["per_min_req"], st["per_min_ref"]
+    minutes = sorted(req)
+    counts = [req[m] for m in minutes]
+    recent = minutes[-60:]
+    rec_req = sum(req[m] for m in recent)
+    rec_ref = sum(ref.get(m, 0) for m in recent)
+    served = [req[m] - ref.get(m, 0) for m in minutes]
+    relayed = sum(st["relay"][r].total() if hasattr(st["relay"][r], "total")
+                  else sum(st["relay"][r].values()) for r in st["relay"])
+    return {
+        "minutes_measured": len(minutes),
+        # Which meter the fleet is actually spending. The relayed routes run on
+        # the root model's own subscription; only the SWE ones touch the quota
+        # that runs out.
+        "on_metered_quota": swe_total,
+        "relayed": relayed,
+        "metered_share": (round(swe_total / (swe_total + relayed), 3)
+                          if swe_total + relayed else 0),
+        "first": st["first_stamp"],
+        "last": st["last_stamp"],
+        "req_per_min": {
+            "p50": pct(counts, 0.5), "p90": pct(counts, 0.9),
+            "max": max(counts, default=0),
+        },
+        # The best minute that was not mostly refusals is the closest thing to
+        # an observed ceiling: the upstream never says what the limit is.
+        "served_per_min_max": max(served, default=0),
+        "recent_60min": {
+            "requests": rec_req, "refusals": rec_ref,
+            "refusal_share": round(rec_ref / rec_req, 3) if rec_req else 0,
+            "req_per_min": round(rec_req / len(recent), 1) if recent else 0,
+        },
+        "series": [{"at": m, "req": req[m], "ref": ref.get(m, 0)}
+                   for m in minutes[-120:]],
+    }
+
+
+def _retention_days(st):
+    out = []
+    for day in sorted(st["retention_day"]):
+        vals = st["retention_day"][day]
+        out.append({"day": day, "n": len(vals),
+                    "p50": round(pct(vals, 0.5), 1),
+                    "p90": round(pct(vals, 0.9), 1)})
+    return out
 
 
 def main():
@@ -296,6 +387,8 @@ def main():
                 "histogram": dict(st["calls_hist"]),
             },
         },
+        "throughput": _throughput(st, st["turns_ok"] + st["turns_failed"]
+                                   + st["rl_total"]),
         "rate_limits": {
             "total": st["rl_total"],
             "by_quota": dict(st["by_quota"]),
@@ -316,6 +409,7 @@ def main():
             },
         },
         "compaction": {
+            "retention_by_day": _retention_days(st),
             "count": st["comp_count"],
             "summary_failures": st["comp_fail"],
             "before_tokens": {

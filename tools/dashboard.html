@@ -57,7 +57,21 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-
 .g4{grid-template-columns:repeat(4,1fr)}
 .g3{grid-template-columns:repeat(3,1fr)}
 .g2{grid-template-columns:repeat(2,1fr)}
-@media (max-width:900px){.g4,.g3,.g2{grid-template-columns:repeat(2,1fr)}}
+.g1{grid-template-columns:1fr}
+/* Une colonne empilée par minute : refusé au-dessus de servi, même échelle. */
+.bars.tall{height:130px;gap:1px}
+.bars .col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;
+  min-height:2px;background:none}
+.bars .col > div{border-radius:2px 2px 0 0;min-height:0}
+.bars .col:hover{opacity:.75}
+@media (max-width:900px){.g4,.g3,.g2{grid-template-columns:repeat(2,1fr)}
+.g1{grid-template-columns:1fr}
+/* Une colonne empilée par minute : refusé au-dessus de servi, même échelle. */
+.bars.tall{height:130px;gap:1px}
+.bars .col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;
+  min-height:2px;background:none}
+.bars .col > div{border-radius:2px 2px 0 0;min-height:0}
+.bars .col:hover{opacity:.75}}
 @media (max-width:560px){.g4,.g3,.g2{grid-template-columns:1fr}}
 
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
@@ -169,6 +183,34 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
   </div>
 </div>
 
+<h2>Débit et plafond</h2>
+<div class="grid g3">
+  <div class="card hero"><div class="k">requêtes par minute</div>
+    <div class="v accent" id="h-rpm">—</div><div class="sub" id="h-rpm-sub">—</div></div>
+  <div class="card hero"><div class="k">plafond observé</div>
+    <div class="v" id="h-ceil">—</div><div class="sub" id="h-ceil-sub">—</div></div>
+  <div class="card hero"><div class="k">part refusée, 60 min</div>
+    <div class="v" id="h-refshare">—</div><div class="sub" id="h-refshare-sub">—</div></div>
+</div>
+<div class="grid g1">
+  <div class="card">
+    <h3>Sur quel compteur</h3>
+    <div class="stack" id="meterstack"></div>
+    <div class="legend" id="meterlegend"></div>
+    <div class="note" id="meternote"></div>
+  </div>
+</div>
+<div class="grid g1">
+  <div class="card">
+    <h3>Requêtes par minute <span style="color:var(--ink-3);font-weight:400">(deux dernières heures)</span></h3>
+    <div class="bars tall" id="rpmbars"></div>
+    <div class="xaxis" id="rpmaxis"></div>
+    <div class="legend"><span><i style="background:var(--s1)"></i>servies</span>
+      <span><i style="background:var(--s2)"></i>refusées</span></div>
+    <div class="note" id="rpmnote"></div>
+  </div>
+</div>
+
 <h2>Quotas et comptes</h2>
 <div class="grid g3">
   <div class="card">
@@ -203,6 +245,13 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 </div>
 
 <h2>Compaction</h2>
+<div class="grid g1">
+  <div class="card">
+    <h3>Ce qui repart en clair, par jour</h3>
+    <div class="rows" id="retday"></div>
+    <div class="note" id="retnote"></div>
+  </div>
+</div>
 <div class="grid g2">
   <div class="card">
     <h3>Ce que le proxy reçoit, ce qu'il envoie</h3>
@@ -308,6 +357,55 @@ function render(d){
       return `<tr><td>${esc(k)}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
         <td class="n"><span class="pill ${cls}">${pct(r)}</span></td></tr>`; }).join("");
 
+  // débit — la seule question qu'un quota compté en requêtes pose vraiment
+  const th = d.throughput || {}, rpm = th.req_per_min || {}, r60 = th.recent_60min || {};
+  const measured = th.minutes_measured || 0;
+  $("h-rpm").textContent = measured ? (r60.req_per_min ?? 0).toString().replace(".", ",") : "—";
+  $("h-rpm-sub").textContent = measured
+    ? `médiane ${rpm.p50 ?? 0} · p90 ${rpm.p90 ?? 0} · pic ${rpm.max ?? 0}`
+    : "en attente de lignes horodatées";
+  $("h-ceil").textContent = measured ? n(th.served_per_min_max) : "—";
+  $("h-ceil-sub").textContent =
+    "la meilleure minute jamais servie — l'amont ne dit jamais sa limite";
+  $("h-refshare").textContent = measured ? pct(r60.refusal_share || 0) : "—";
+  $("h-refshare-sub").textContent =
+    `${n(r60.refusals)} refus sur ${n(r60.requests)} requêtes`;
+
+  const meters = [["quota contraint (exécuteurs)", th.on_metered_quota, "--s2"],
+                  ["relayé (quota de la racine)", th.relayed, "--s3"]];
+  const msum = meters.reduce((a, m) => a + (m[1] || 0), 0) || 1;
+  $("meterstack").innerHTML = meters.map(m =>
+    `<div style="width:${100*(m[1]||0)/msum}%;background:var(${m[2]})" title="${esc(m[0])} : ${n(m[1])}"></div>`).join("");
+  $("meterlegend").innerHTML = meters.map(m =>
+    `<span><i style="background:var(${m[2]})"></i>${esc(m[0])} <b>${big(m[1])}</b></span>`).join("");
+  $("meternote").textContent = `${pct(th.metered_share || 0)} des requêtes tombent sur le compteur qui s'épuise. Les tours de la racine passent par son propre abonnement : ce qu'elle fait elle-même ne coûte rien sur la contrainte qui mord.`;
+
+  const series = th.series || [];
+  const smax = Math.max(...series.map(p => p.req), 1);
+  $("rpmbars").innerHTML = series.map(p => {
+    const served = Math.max(0, p.req - p.ref);
+    return `<div class="col" title="${esc(p.at)} — ${p.req} requêtes, ${p.ref} refusées">
+      <div style="height:${100*p.ref/smax}%;background:var(--s2)"></div>
+      <div style="height:${100*served/smax}%;background:var(--s1)"></div></div>`;
+  }).join("");
+  $("rpmaxis").innerHTML = series.map((p,i) =>
+    `<div>${(i===0||i===series.length-1||i===Math.floor(series.length/2))
+      ? esc(p.at.slice(11)) : ""}</div>`).join("");
+  $("rpmnote").textContent = measured
+    ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. Une minute entièrement servie est loin du plafond ; une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
+    : "Le journal n'a appris à écrire l'heure qu'aujourd'hui : cette série commence au premier redémarrage après ça.";
+
+  const days = (cp.retention_by_day || []).slice(-14);
+  if (days.length) {
+    const dmax = Math.max(...days.map(x => x.p90), 1);
+    rows($("retday"), days.map(x => ({k: x.day.slice(5), v: x.p50,
+      t: `${String(x.p50).replace(".", ",")} %`, smax: dmax, c: "--s3"})));
+    $("retnote").textContent =
+      `Part de la conversation qui repart en clair après compaction, médiane par jour, sur ${n(days.reduce((a,x)=>a+x.n,0))} compactions. Elle tombe quand la sortie est bloquée pendant que les conversations grossissent — c'était le symptôme du résumé gelé.`;
+  } else {
+    $("retnote").textContent = "Pas encore de journée horodatée complète.";
+  }
+
   const q = Object.entries(rl.by_quota || {}).sort((a,b) => b[1]-a[1]);
   rows($("quotas"), q.map(([k,v],i) => ({k, v, t: n(v), c: SERIES[i%4]})));
   $("quotanote").textContent = q.length
@@ -350,6 +448,7 @@ function render(d){
   $("toolnote").textContent = `Médiane ${h.p50 ?? 0} appel(s), maximum observé ${h.max ?? 0}, sur ${n(hsum)} tours — les seuls dont le journal note le nombre d'appels, sur ${n(sw.turns_ok)} réussis. Les valeurs absentes creusent un écart dans l'axe. Un éventail de noms est du parallélisme normal ; un seul nom répété des centaines de fois serait un flux mal assemblé.`;
 
   const bt = cp.before_tokens || {}, at = cp.after_tokens || {};
+  void 0;
   const cmax = bt.max || 1;
   rows($("compact"), [
     {k:"reçu (médiane)", v:bt.p50, t:big(bt.p50), smax:cmax, c:"--s2"},
