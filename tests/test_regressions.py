@@ -400,16 +400,28 @@ class UnflattenTests(unittest.TestCase):
 
     def test_pairs_get_their_own_turns_in_order(self):
         out = devinx.unflatten_body({"messages": self._flat(40)})["messages"]
-        self.assertEqual(len(out), 1 + 40 * 2)
+        # task, then what led into the run, then one turn per call and answer.
+        self.assertEqual(len(out), 2 + 40 * 2)
+        self.assertEqual(out[1]["content"][0]["type"], "thinking")
         for i in range(40):
-            call = out[1 + 2 * i]
-            answer = out[2 + 2 * i]
+            call = out[2 + 2 * i]
+            answer = out[3 + 2 * i]
             self.assertEqual(call["role"], "assistant")
             self.assertEqual(call["content"][-1]["id"], f"t{i}")
             self.assertEqual(answer["role"], "user")
             self.assertEqual(answer["content"][0]["tool_use_id"], f"t{i}")
-        # What led into the run rides on its first turn, not on all of them.
-        self.assertEqual(out[1]["content"][0]["type"], "thinking")
+
+    def test_a_huge_narration_does_not_become_one_unsplittable_turn(self):
+        flat = self._flat(40)
+        flat[1]["content"] = (
+            [{"type": "thinking", "thinking": "z" * 40000} for _ in range(4)]
+            + [{"type": "text", "text": "what I am doing"}]
+            + [b for b in flat[1]["content"] if b.get("type") == "tool_use"])
+        out = devinx.unflatten_body({"messages": flat})["messages"]
+        lead = out[1]["content"]
+        self.assertTrue(all(b["type"] == "text" for b in lead),
+                        "replayed thinking was kept past the cap")
+        self.assertIn("what I am doing", json.dumps(lead))
 
     def test_nothing_is_invented_and_nothing_is_lost(self):
         flat = self._flat(20)
@@ -622,6 +634,53 @@ class EditLoopGuardTests(unittest.TestCase):
     def test_other_tools_pass_through(self):
         for _ in range(8):
             self.assertEqual(self._call(self.session, tool="Write").returncode, 0)
+
+
+class OwnershipGuardTests(unittest.TestCase):
+    """The boundary the agent read, agreed to, and crossed for 12.6 hours."""
+
+    GUARD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "plugin", "hooks", "ownership_guard.py")
+
+    def _call(self, target, owned=None, tool="Edit", cwd="/repo"):
+        import subprocess
+        env = dict(os.environ)
+        if owned is None:
+            env.pop("DEVINX_OWNED_PATHS", None)
+        else:
+            env["DEVINX_OWNED_PATHS"] = owned
+        event = json.dumps({"tool_name": tool, "cwd": cwd,
+                            "tool_input": {"file_path": target}})
+        return subprocess.run([sys.executable, self.GUARD], input=event,
+                              capture_output=True, text=True, env=env)
+
+    def test_an_unowned_file_is_refused(self):
+        r = self._call("/repo/apps/backend/relay/pricing/rules.py",
+                       owned="/repo/tests/test_pricing.py:/repo/tests/conftest.py")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not one of the files you own", r.stderr)
+        self.assertIn("stop and report", r.stderr)
+
+    def test_owned_files_pass(self):
+        for target in ("/repo/tests/test_pricing.py", "/repo/tests/conftest.py"):
+            r = self._call(target, owned="/repo/tests/test_pricing.py:/repo/tests/conftest.py")
+            self.assertEqual(r.returncode, 0, target)
+
+    def test_a_directory_carries_what_is_under_it(self):
+        r = self._call("/repo/tests/unit/test_deep.py", owned="/repo/tests")
+        self.assertEqual(r.returncode, 0)
+
+    def test_patterns_and_relative_paths_work(self):
+        self.assertEqual(self._call("/repo/tests/test_a.py", owned="tests/*.py").returncode, 0)
+        self.assertEqual(self._call("/repo/apps/x.py", owned="tests/*.py").returncode, 2)
+
+    def test_without_a_declared_boundary_nothing_is_enforced(self):
+        r = self._call("/anywhere/at/all.py", owned=None)
+        self.assertEqual(r.returncode, 0)
+
+    def test_reads_are_never_blocked(self):
+        r = self._call("/repo/apps/x.py", owned="/repo/tests", tool="Read")
+        self.assertEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,15 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/edit_loop_guard.py\""
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/ownership_guard.py\""
+          }
+        ]
       }
     ]
   }

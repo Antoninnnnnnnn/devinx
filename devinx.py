@@ -1184,9 +1184,8 @@ def summarise_turns(messages, model, system, previous=None):
         # the agent is paying before its own turn goes out. When every
         # credential refuses, the summary is given up on and the turn is
         # handled by the caller, which does know how to hold.
-        found = _RESET_AFTER.search(err)
         if acct is not None:
-            block_account(acct, int(found.group(1)) * 60 if found else 30)
+            block_account(acct, reset_delay(err))
         other, _until = claim_account(avoid=acct)
         if other is None:
             return None
@@ -1204,6 +1203,9 @@ def summarise_turns(messages, model, system, previous=None):
 # sequence that never happened, so the threshold sits well clear of the top of
 # the measured range rather than just above it.
 FLAT_RUN = 32
+# Past this, the blocks that led into a collapsed run are too big to sit on one
+# turn, and the replayed thinking among them gives way to the text.
+LEAD_CAP = int(os.environ.get("DEVINX_LEAD_CAP", "8000"))
 
 
 def _is_flattened(messages):
@@ -1258,12 +1260,28 @@ def _unflatten(messages):
                 i += 1
                 continue
             lead = [b for b in blocks if b.get("type") != "tool_use"]
-            for j, u in enumerate(uses):
-                out.append({"role": "assistant",
-                            "content": (lead if j == 0 else []) + [u]})
+            if lead:
+                size = sum(len(json.dumps(b, default=str)) for b in lead) // 4
+                if size > LEAD_CAP:
+                    # A whole run's narration on one message, and no record of
+                    # which call each piece belonged to. Kept whole it becomes a
+                    # message compaction cannot split, so if it ever lands in
+                    # the verbatim tail the tail collapses to it alone. The text
+                    # is what the agent said it was doing; the thinking is
+                    # replayed reasoning it has already acted on. The text stays.
+                    text = [b for b in lead if b.get("type") == "text"]
+                    dropped = len(lead) - len(text)
+                    print(f"unflatten: {size}t of leading blocks on one turn; "
+                          f"keeping {len(text)} text, dropping {dropped} "
+                          f"replayed thinking", flush=True)
+                    lead = text
+                out.append({"role": "assistant", "content": lead})
+            for u in uses:
+                out.append({"role": "assistant", "content": [u]})
                 got = by_id.pop(u.get("id"), None)
                 if got:
                     out.append({"role": "user", "content": got})
+                    continue
             leftovers = [b for b in answers
                          if b.get("type") != "tool_result"
                          or b.get("tool_use_id") in by_id]
@@ -1507,7 +1525,23 @@ _ERROR_TYPES = {
 
 # The upstream says how long the wait is ("Your limit will reset in 11
 # minutes"). Passing that on as retry-after turns a guess into an instruction.
-_RESET_AFTER = re.compile(r"reset in (\d+) minute")
+_RESET_AFTER = re.compile(r"reset in (\d+) (second|minute|hour)")
+
+
+def reset_delay(err, default=30):
+    """How long the upstream said to wait, in seconds.
+
+    It answers in whichever unit reads best — "reset in 20 seconds" as often as
+    "reset in 11 minutes" — and the pattern only ever matched minutes. Every
+    short refusal therefore blocked the credential for the 30-second default
+    instead of the 3 or 20 it asked for, and under saturation that is the
+    difference between a credential coming back and a fleet waiting on it.
+    """
+    found = _RESET_AFTER.search(err or "")
+    if not found:
+        return default
+    n, unit = int(found.group(1)), found.group(2)
+    return n * {"second": 1, "minute": 60, "hour": 3600}[unit]
 
 
 def anthropic_error(err, body=None):
@@ -1839,8 +1873,7 @@ def run_swe(body, wfile, make_stream=None):
             # Both of Cognition's limits are per account, so another credential
             # is a switch rather than a wait. Only when every one of them is
             # spent does the turn actually have to be held.
-            found = _RESET_AFTER.search(err)
-            delay = int(found.group(1)) * 60 if found else 30
+            delay = reset_delay(err)
             if acct is not None:
                 block_account(acct, delay)
             other, until = claim_account(avoid=acct)
