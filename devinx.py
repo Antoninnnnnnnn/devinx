@@ -2939,22 +2939,58 @@ def _image_tokens(block):
     return min(1600, max(200, size // 500))
 
 
+# Counted on their own, in tokens rather than characters, or not content at
+# all: an image's base64 payload has its own cost model, and a replayed
+# thinking signature is opaque bytes this proxy mostly drops before sending.
+_UNCOUNTED_KEYS = {"data", "signature"}
+
+
+def _content_chars(obj):
+    """Every character of content in a block, whatever shape it arrived in.
+
+    Reading named fields — b["text"], b["thinking"], the text of a tool_result
+    — misses anything shaped differently, and the miss is silent and one-sided:
+    a body estimated at a hundredth of its weight is a body compaction believes
+    it has room for. Measured on a real turn, a message of 97 598 tokens was
+    estimated at 801, the turn went out whole and the upstream refused it.
+
+    The two shapes that did it were a content block with no `type` key and a
+    content list of bare strings, neither of which the named-field reading
+    recognised. Walking everything is not more precise, it is merely impossible
+    to be blindsided by: a shape nobody anticipated still gets counted.
+    """
+    if isinstance(obj, str):
+        return len(obj)
+    if isinstance(obj, dict):
+        return sum(_content_chars(v) for k, v in obj.items()
+                   if k not in _UNCOUNTED_KEYS)
+    if isinstance(obj, (list, tuple)):
+        return sum(_content_chars(v) for v in obj)
+    return 0
+
+
+def _image_tokens_in(obj):
+    """Image cost anywhere in a block, at whatever depth it sits."""
+    total = 0
+    if isinstance(obj, dict):
+        if obj.get("type") == "image":
+            return _image_tokens(obj)
+        for v in obj.values():
+            total += _image_tokens_in(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            total += _image_tokens_in(v)
+    return total
+
+
 def estimate_tokens(body):
     """Rough local estimate. Cognition exposes no counting endpoint; this is
     what count_tokens answers and what compaction decides on."""
     chars, tokens = len(_system_text(body)), 0
     for m in body.get("messages", []):
         for b in _blocks(m.get("content")):
-            chars += len(b.get("text") or b.get("thinking") or "")
-            if b.get("type") == "image":
-                tokens += _image_tokens(b)
-            if b.get("type") == "tool_result":
-                chars += len(_tool_result_text(b))
-                for inner in _blocks(b.get("content")):
-                    if inner.get("type") == "image":
-                        tokens += _image_tokens(inner)
-            if b.get("type") == "tool_use":
-                chars += len(json.dumps(b.get("input") or {}))
+            chars += _content_chars(b)
+            tokens += _image_tokens_in(b)
     for t in body.get("tools") or []:
         chars += len(t.get("description", "")) + \
             len(json.dumps(t.get("input_schema") or {}))

@@ -736,6 +736,54 @@ class ResetDelayTests(unittest.TestCase):
         self.assertEqual(devinx.reset_delay("no idea", default=30), 30)
 
 
+class EstimateTests(unittest.TestCase):
+    """A body estimated at a hundredth of its weight is one compaction thinks
+    it has room for. Measured on a real turn: a message of 97 598 tokens
+    estimated at 801, the turn went out whole, the upstream refused it with
+    invalid_argument and the session ended."""
+
+    BIG = "z" * 200000
+
+    def _one(self, block):
+        body = {"messages": [{"role": "user", "content": [block]}]}
+        raw = len(json.dumps(body, default=str)) // 4
+        return raw, devinx.estimate_tokens(body)
+
+    def test_every_tool_result_shape_is_counted(self):
+        shapes = [
+            {"type": "tool_result", "tool_use_id": "t", "content": self.BIG},
+            {"type": "tool_result", "tool_use_id": "t",
+             "content": [{"type": "text", "text": self.BIG}]},
+            # No `type` key, and a bare string in the list: the two shapes that
+            # were silently worth nothing.
+            {"type": "tool_result", "tool_use_id": "t",
+             "content": [{"text": self.BIG}]},
+            {"type": "tool_result", "tool_use_id": "t", "content": [self.BIG]},
+            {"type": "tool_result", "tool_use_id": "t",
+             "content": [{"a": {"b": [{"c": self.BIG}]}}]},
+        ]
+        for block in shapes:
+            raw, est = self._one(block)
+            self.assertGreater(est, raw * 0.9,
+                               f"{json.dumps(block)[:60]} estimated at {est} of {raw}")
+
+    def test_an_image_is_counted_as_tokens_not_as_base64(self):
+        raw, est = self._one({"type": "tool_result", "tool_use_id": "t", "content": [
+            {"type": "image", "source": {"type": "base64",
+                                         "media_type": "image/png",
+                                         "data": "A" * 200000}}]})
+        self.assertLess(est, 5000, "base64 was counted as text")
+        self.assertGreater(est, 0)
+
+    def test_thinking_and_text_still_count(self):
+        for block in ({"type": "text", "text": self.BIG},
+                      {"type": "thinking", "thinking": self.BIG},
+                      {"type": "tool_use", "id": "t", "name": "Bash",
+                       "input": {"command": self.BIG}}):
+            raw, est = self._one(block)
+            self.assertGreater(est, raw * 0.9, block.get("type"))
+
+
 class MessageIdTests(unittest.TestCase):
     """The constant that collapsed every run into three messages.
 
