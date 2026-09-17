@@ -354,18 +354,26 @@ class FlattenedConversationTests(unittest.TestCase):
         return re.findall(r"SUMMARY#\d+", text)
 
     def test_summary_is_extended_as_the_conversation_grows(self):
+        # The steps are large on purpose. What the summary does not cover is
+        # carried verbatim while it fits, so a few more turns cost no upstream
+        # call at all — the summary only has to grow when the room runs out,
+        # and that is what must still work.
         seen = []
-        for pairs in (260, 263, 266, 269):
+        for pairs in (260, 300, 340, 380):
             out = devinx.compact_body(self._body(pairs))
             marks = self._summary_of(out)
             self.assertTrue(marks, "the body was not compacted at all")
             seen.append(marks[-1])
-        self.assertEqual(len(set(seen)), len(seen),
-                         f"the summary never changed: {seen}")
-        # The first pass covers the whole span; each later one only what arrived
-        # since, which is what keeps a refresh worth a few seconds.
+        self.assertGreater(len(set(seen)), 1,
+                           f"the summary never changed: {seen}")
+        # And it costs fewer upstream calls than there were compactions: the
+        # quota that matters here is metered in requests, not tokens.
+        self.assertLess(len(self.calls), len(seen),
+                        f"a summary call on every compaction: {self.calls}")
+        # The first pass covers the whole span; each later one only what
+        # arrived since, which is what keeps a refresh worth a few seconds.
         self.assertGreater(self.calls[0], 100)
-        self.assertTrue(all(c < 20 for c in self.calls[1:]), self.calls)
+        self.assertTrue(all(c < 300 for c in self.calls[1:]), self.calls)
 
     def test_a_shorter_conversation_drops_the_previous_summary(self):
         devinx.compact_body(self._body(269))
@@ -681,6 +689,50 @@ class OwnershipGuardTests(unittest.TestCase):
     def test_reads_are_never_blocked(self):
         r = self._call("/repo/apps/x.py", owned="/repo/tests", tool="Read")
         self.assertEqual(r.returncode, 0)
+
+
+class PacingTests(unittest.TestCase):
+    """Under a rate limit, concurrency multiplies the bill instead of the work."""
+
+    def test_a_credential_serving_normally_is_never_held_back(self):
+        acct = {"name": "t", "blocked_until": 0}
+        with devinx.paced(acct):
+            pass
+        self.assertIsNone(acct.get("pace"), "a semaphore was created for nothing")
+
+    def test_a_credential_that_just_refused_is_capped(self):
+        import threading, time
+        acct = {"name": "t", "blocked_until": 0, "refused_at": time.time()}
+        held, peak, lock = [0], [0], threading.Lock()
+
+        def worker():
+            with devinx.paced(acct):
+                with lock:
+                    held[0] += 1
+                    peak[0] = max(peak[0], held[0])
+                time.sleep(0.1)
+                with lock:
+                    held[0] -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertLessEqual(peak[0], devinx.PACE_CONCURRENCY)
+        self.assertEqual(held[0], 0, "the cap was not released")
+
+
+class ResetDelayTests(unittest.TestCase):
+    """The upstream answers in whichever unit reads best."""
+
+    def test_every_unit_is_understood(self):
+        self.assertEqual(devinx.reset_delay("Your limit will reset in 20 seconds."), 20)
+        self.assertEqual(devinx.reset_delay("reset in 2 minutes"), 120)
+        self.assertEqual(devinx.reset_delay("reset in 1 hour"), 3600)
+
+    def test_an_unparseable_message_falls_back(self):
+        self.assertEqual(devinx.reset_delay("no idea", default=30), 30)
 
 
 if __name__ == "__main__":

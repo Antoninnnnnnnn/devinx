@@ -22,6 +22,7 @@ to sit in the middle. Two consequences worth knowing:
     the middle discarded unsigned thinking blocks on their way back up.
 """
 import base64
+import contextlib
 import glob
 import gzip
 import hashlib
@@ -532,6 +533,31 @@ def claim_account(avoid=None):
 def block_account(acct, seconds):
     with _acct_lock:
         acct["blocked_until"] = time.time() + seconds
+        acct["refused_at"] = time.time()
+
+
+def paced(acct):
+    """Hold the fleet to a few turns at a time on a credential that just refused.
+
+    The limit is a rate, so sending sixteen turns at a credential the instant
+    it comes back does not get sixteen turns served: the first few are served
+    and the rest come back refused, each refusal being itself a request against
+    the same limit. Concurrency does not raise throughput here, it multiplies
+    the bill — and the quota is metered in requests.
+
+    So the cap applies only where it costs nothing: for a while after a
+    credential has actually refused something. While a credential is serving
+    normally, every turn goes straight through and this does nothing at all.
+    """
+    if not acct or PACE_CONCURRENCY <= 0:
+        return contextlib.nullcontext()
+    if time.time() - acct.get("refused_at", 0) > PACE_WINDOW:
+        return contextlib.nullcontext()
+    sem = acct.get("pace")
+    if sem is None:
+        with _acct_lock:
+            sem = acct.setdefault("pace", threading.Semaphore(PACE_CONCURRENCY))
+    return sem
 
 
 _jwt_lock = threading.Lock()
@@ -749,6 +775,10 @@ TOOL_DESC_CAPS = (None, 6000, 2500)
 # notified of anything. Bounded, because the client has its own timeout and an
 # answer that never comes is worse than one that says to try later.
 RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "600"))
+# How many turns may be in flight on a credential that has refused something
+# recently, and for how long after that refusal the cap applies. 0 disables it.
+PACE_CONCURRENCY = int(os.environ.get("DEVINX_PACE", "4"))
+PACE_WINDOW = int(os.environ.get("DEVINX_PACE_WINDOW", "120"))
 
 # A connection that breaks mid-response is transient and costs an agent its
 # turn: measured in one log, 103 of them — connection resets and streams ending
@@ -1074,10 +1104,6 @@ COMPACT_TAIL = 0.45
 # summariser: it has a window too, and a transcript of file reads will exceed it.
 SUMMARY_RESULT_CAP = 4000
 SUMMARY_INPUT_CAP = 200000
-# How much new material has to pile up before the summary is extended again.
-# Extending costs an upstream call, so not every turn; leaving it un-extended
-# costs the agent the memory of that material, so not many turns either.
-SUMMARY_BATCH = 2000
 # Ceiling on the accumulated summary. Past it the summary is summarised: the
 # alternative, extending forever, eventually spends the whole window on the
 # record of the work rather than the work.
@@ -1412,8 +1438,22 @@ def compact_body(body):
     # Everything in the span the summary does not account for yet. Blocks only
     # ever arrive at the end of it, so the covered part is a stable prefix.
     fresh = span[covered:]
-    fresh_tokens = sum(len(json.dumps(b, default=str)) for _, b in fresh) // 4
-    if summary is None or fresh_tokens > SUMMARY_BATCH:
+    # What the summary does not cover yet does not have to be summarised to be
+    # kept: it can ride verbatim between the summary and the tail, which is
+    # better for the agent and costs nothing. So the question is not "has
+    # enough arrived" but "does it still fit" — and while it fits, no upstream
+    # call is made at all. That is the difference between summarising on most
+    # turns and summarising on one turn in ten, on a quota metered in requests
+    # rather than tokens.
+    def fits(text, uncovered):
+        head = [messages[0], {"role": "user", "content": [
+            {"type": "text", "text": text or ""}]}]
+        trial = dict(body)
+        trial["messages"] = head + _regroup(uncovered) + messages[start:]
+        return estimate_tokens(trial) <= COMPACT_AT, trial
+
+    room, _ = fits(summary, fresh)
+    if summary is None or not room:
         model = resolve_model(body)
         before = estimate_tokens(body)
         # Only what arrived since the last summary, extending it rather than
@@ -1463,6 +1503,10 @@ def compact_body(body):
                   f"({covered} of {len(span)} covered, {before} tokens "
                   f"estimated, over {COMPACT_AT})", flush=True)
 
+    # Uncovered turns ride verbatim only when there is a summary in front of
+    # them. With none — the summariser could not be reached — they are what had
+    # to go, and carrying them is exactly the oversized body this must not send.
+    carried = _regroup(span[covered:]) if summary else []
     if summary:
         bridge = ("This conversation was compacted to fit the context window. "
                   "The summary below replaces the turns between the task above "
@@ -1475,9 +1519,20 @@ def compact_body(body):
                   "are gone. Re-establish what you need from the working tree "
                   "rather than assuming it, and say so if the task no longer "
                   "makes sense without them.")
-    compacted = dict(body)
-    compacted["messages"] = [messages[0], {"role": "user", "content": [
-        {"type": "text", "text": bridge}]}] + messages[start:]
+    def assemble(keep):
+        out = dict(body)
+        out["messages"] = ([messages[0], {"role": "user", "content": [
+            {"type": "text", "text": bridge}]}] + keep + messages[start:])
+        return out
+
+    compacted = assemble(carried)
+    if carried and estimate_tokens(compacted) > COMPACT_AT:
+        # The summary could not be extended far enough to make room. Whatever
+        # it does not cover goes, because a body over the limit comes back
+        # refused and that ends the agent.
+        print(f"compaction: dropping {len(carried)} uncovered turns to fit",
+              flush=True)
+        compacted = assemble([])
     # Diagnostic: what the conversation is actually made of. The tail collapses
     # when single messages are large enough to spend its whole budget, and that
     # is worth knowing from measurement rather than assumption.
@@ -1795,6 +1850,7 @@ def run_swe(body, wfile, make_stream=None):
             if acct is None:
                 acct = accounts()[0]
         try:
+          with paced(acct):
             for msg, e in chat_stream(req, acct):
                 if e:
                     err = e
