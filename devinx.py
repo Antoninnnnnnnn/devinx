@@ -1141,8 +1141,28 @@ def compact_body(body):
          "summary below replaces the turns between the task above and the "
          "messages that follow; continue the work from it.\n\n"
          f"<summary>\n{summary}\n</summary>"}]}] + messages[start:]
-    print(f"compaction: {estimate_tokens(body)} -> "
-          f"{estimate_tokens(compacted)} tokens estimated", flush=True)
+    # Diagnostic: what the conversation is actually made of. The tail collapses
+    # when single messages are large enough to spend its whole budget, and that
+    # is worth knowing from measurement rather than assumption.
+    def anatomy(m):
+        raw = len(json.dumps(m, default=str)) // 4
+        est = estimate_tokens({"messages": [m]})
+        parts = []
+        for b in _blocks(m.get("content")):
+            kind = b.get("type")
+            size = len(json.dumps(b, default=str)) // 4
+            name = b.get("name") or ""
+            sample = (b.get("text") or b.get("thinking")
+                      or _tool_result_text(b) or json.dumps(b.get("input") or {}))
+            parts.append(f"{kind}{'/' + name if name else ''}={size}t"
+                         f"[{sample[:60]!r}]")
+        return raw, est, m.get("role"), len(_blocks(m.get("content"))), parts[:3]
+
+    worst = max(messages, key=lambda m: len(json.dumps(m, default=str)))
+    raw, est, role, nblocks, parts = anatomy(worst)
+    print(f"compaction: {estimate_tokens(body)} -> {estimate_tokens(compacted)} "
+          f"tokens; {len(messages)} msgs; biggest: role={role} blocks={nblocks} "
+          f"raw={raw}t est={est}t :: {' | '.join(parts)}", flush=True)
     return compacted
 
 
@@ -1424,6 +1444,22 @@ def run_swe(body, wfile, make_stream=None):
                                                   if tool_order else "")
                     if not tid:
                         continue
+                    if tid not in tool_blocks and tool_order:
+                        # A fresh id while the call before it is still an
+                        # unfinished JSON fragment is a continuation wearing a
+                        # new name, not a second call. Taking it at face value
+                        # turns one call into one call per frame: measured on a
+                        # real turn, 2322 tool_use blocks in a single assistant
+                        # message, every one of them executed by the client.
+                        prev = tool_blocks[tool_order[-1]]
+                        incomplete = True
+                        try:
+                            json.loads(prev["json"] or "{}")
+                            incomplete = False
+                        except ValueError:
+                            pass
+                        if incomplete and (not tc.name or tc.name == prev["name"]):
+                            tid = tool_order[-1]
                     if tid not in tool_blocks:
                         tool_blocks[tid] = {"name": tc.name, "json": ""}
                         tool_order.append(tid)
@@ -1499,6 +1535,16 @@ def run_swe(body, wfile, make_stream=None):
             continue
         break
 
+    if len(tool_order) > 8:
+        # An assistant turn does not legitimately issue hundreds of tool calls.
+        # If this fires, the stream is being split into one call per fragment
+        # rather than accumulated, and the client will execute every one of them.
+        names = {}
+        for t in tool_order:
+            n = tool_blocks[t]["name"] or "?"
+            names[n] = names.get(n, 0) + 1
+        print(f"WARNING: {len(tool_order)} tool calls in one turn: {names}",
+              flush=True)
     stop_reason = _stop_reason(stop, bool(tool_order))
     usage = usage or {"input_tokens": 0, "output_tokens": 0}
 
