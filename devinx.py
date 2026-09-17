@@ -735,6 +735,7 @@ def build_request(body, tool_desc_cap=None):
 
     seen_ids = {}
     dropped = []
+    unknown_roles = set()
 
     def mid(kind, payload):
         """Content-derived id, disambiguated if the same content repeats.
@@ -751,7 +752,16 @@ def build_request(body, tool_desc_cap=None):
     for m in body.get("messages", []):
         role = m.get("role")
         blocks = _blocks(m.get("content"))
-        if role == "user":
+        if role != "assistant":
+            # Anything that is not the model speaking is context addressed to
+            # it. The Messages API defines only user and assistant, but clients
+            # do send other roles — Claude Code puts `system` messages inside
+            # `messages` — and the branch that only knew `user` dropped them
+            # without a word, instructions included. Upstream has no separate
+            # source for them; the user channel keeps both the content and its
+            # place in the sequence.
+            if role != "user":
+                unknown_roles.add(str(role))
             # tool_result blocks ride in user messages; they become their own
             # SRC_TOOL prompts and must keep their position in the sequence.
             text_parts, images = [], []
@@ -788,7 +798,7 @@ def build_request(body, tool_desc_cap=None):
                                 "source": SRC_USER,
                                 "prompt": "".join(text_parts),
                                 "images": images})
-        elif role == "assistant":
+        else:   # the model's own turn
             texts, thinkings, signature, tool_calls = [], [], None, []
             for b in blocks:
                 kind = b.get("type")
@@ -828,6 +838,9 @@ def build_request(body, tool_desc_cap=None):
         # client side, where the model simply appears not to have seen something.
         print(f"warning: dropped unsupported content blocks: "
               f"{', '.join(sorted(set(dropped)))}", flush=True)
+    if unknown_roles:
+        print(f"warning: messages with role {', '.join(sorted(unknown_roles))} "
+              f"sent upstream as user content", flush=True)
 
     def describe(t):
         text = _TOOL_DESC_REWRITES.get(t.get("name"), t.get("description", ""))
@@ -1016,6 +1029,14 @@ COMPACT_TAIL = 0.45
 # summariser: it has a window too, and a transcript of file reads will exceed it.
 SUMMARY_RESULT_CAP = 4000
 SUMMARY_INPUT_CAP = 200000
+# How much new material has to pile up before the summary is extended again.
+# Extending costs an upstream call, so not every turn; leaving it un-extended
+# costs the agent the memory of that material, so not many turns either.
+SUMMARY_BATCH = 2000
+# Ceiling on the accumulated summary. Past it the summary is summarised: the
+# alternative, extending forever, eventually spends the whole window on the
+# record of the work rather than the work.
+SUMMARY_TOTAL_CAP = 12000
 
 # Claude Code's own compaction prompt, read out of the binary rather than
 # rewritten, so a summary made here is the one the agent would have made.
@@ -1105,6 +1126,39 @@ def summarise_turns(messages, model, system, previous=None):
     return "".join(texts).strip() or None
 
 
+def _span_blocks(messages, start):
+    """Every content block the summary has to cover, in order.
+
+    Counted in blocks and not in messages because the client does not always
+    send one turn per message: a flattened body carries the whole history as
+    five messages whose block counts climb turn after turn. A summary whose
+    freshness is judged by len(messages) is then built once and never again —
+    the conversation grows, the summary does not, and the agent works from a
+    record of what it was doing hours ago. Blocks grow in both shapes.
+    """
+    out = []
+    for m in messages[1:start]:
+        role = m.get("role", "user")
+        for b in _blocks(m.get("content")):
+            out.append((role, b))
+    return out
+
+
+def _regroup(pairs):
+    """(role, block) pairs back into messages, merging consecutive roles."""
+    out = []
+    for role, b in pairs:
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].append(b)
+        else:
+            out.append({"role": role, "content": [b]})
+    return out
+
+
+def _count_blocks(messages):
+    return sum(len(_blocks(m.get("content"))) for m in messages)
+
+
 def _tail_start(messages, budget):
     """Where the verbatim tail begins.
 
@@ -1156,7 +1210,8 @@ def compact_body(body):
         return body
 
     key = _conv_key(body)
-    n_dropped = start - 1
+    span = _span_blocks(messages, start)
+    total_blocks = _count_blocks(messages)
     with _summary_lock:
         covered, summary, built_at = _summaries.get(key, (0, None, 0))
     # A resumed agent is the same task under the same system prompt in the same
@@ -1168,31 +1223,46 @@ def compact_body(body):
     # there. Only the summary is reset; the cascade id stays, because that is
     # what keeps the upstream prefix cache and it is worth about 60% of the
     # input tokens.
-    if summary is not None and len(messages) < built_at:
-        print(f"compaction: conversation restarted ({len(messages)} msgs, was "
+    if summary is not None and total_blocks < built_at:
+        print(f"compaction: conversation restarted ({total_blocks} blocks, was "
               f"{built_at}); dropping the summary from the previous run",
               flush=True)
         covered, summary = 0, None
-    if summary is None or covered < n_dropped:
+    # Everything in the span the summary does not account for yet. Blocks only
+    # ever arrive at the end of it, so the covered part is a stable prefix.
+    fresh = span[covered:]
+    fresh_tokens = sum(len(json.dumps(b, default=str)) for _, b in fresh) // 4
+    if summary is None or fresh_tokens > SUMMARY_BATCH:
         model = resolve_model(body)
         before = estimate_tokens(body)
-        # Only the turns added since the last summary, extending it rather than
+        # Only what arrived since the last summary, extending it rather than
         # rebuilding it: the difference between a few seconds a turn and half a
         # minute a turn.
-        fresh = messages[1 + covered:start]
-        new = summarise_turns(fresh, model, _system_text(body), summary)
+        new = summarise_turns(_regroup(fresh), model, _system_text(body), summary)
         if not new:
             print("compaction: the summary call failed, forwarding as is",
                   flush=True)
             return body
         summary = f"{summary}\n\n{new}" if summary else new
+        if len(summary) // 4 > SUMMARY_TOTAL_CAP:
+            # Fold rather than grow. Summarising the summary keeps one document
+            # of the whole run instead of a chain of appendices, and costs one
+            # short call against a record that would otherwise never stop.
+            folded = summarise_turns(
+                [{"role": "user", "content": [{"type": "text", "text": summary}]}],
+                model, _system_text(body), None)
+            if folded:
+                print(f"compaction: summary folded, {len(summary) // 4} -> "
+                      f"{len(folded) // 4} tokens", flush=True)
+                summary = folded
+        covered = len(span)
         with _summary_lock:
             if len(_summaries) > 64:
                 _summaries.clear()
-            _summaries[key] = (n_dropped, summary, len(messages))
-        print(f"compaction: {len(fresh)} more turns summarised "
-              f"({n_dropped} total, {before} tokens estimated, over "
-              f"{COMPACT_AT})", flush=True)
+            _summaries[key] = (covered, summary, total_blocks)
+        print(f"compaction: {len(fresh)} more blocks summarised "
+              f"({covered} of {len(span)} covered, {before} tokens estimated, "
+              f"over {COMPACT_AT})", flush=True)
 
     compacted = dict(body)
     compacted["messages"] = [messages[0], {"role": "user", "content": [

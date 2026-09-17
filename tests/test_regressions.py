@@ -300,5 +300,99 @@ class PackagedAgentsTests(unittest.TestCase):
         self.assertNotIn("Edit", blocked)
 
 
+class FlattenedConversationTests(unittest.TestCase):
+    """Claude Code does not always send one turn per message.
+
+    Measured on the wire: the whole history arrives as five messages —
+    `user, system, assistant, user, system` — one assistant message holding
+    every tool_use of the run and one user message holding every tool_result,
+    both growing block by block while len(messages) stays at five. Compaction
+    judged its summary fresh by the message count, so on that shape the summary
+    was built once and never again: 17 629 of 33 136 upstream calls left with
+    the first message and a summary of what the agent had been doing hours
+    earlier, which is what re-reading the same files forever looks like.
+    """
+
+    def setUp(self):
+        self.calls = []
+        # The summary cache outlives a request on purpose; it must not outlive
+        # a test, or the second one starts from the first one's summary.
+        devinx._summaries.clear()
+
+        def fake(messages, model, system, previous):
+            n = sum(len(devinx._blocks(m.get("content"))) for m in messages)
+            self.calls.append(n)
+            return f"SUMMARY#{len(self.calls)}"
+
+        patcher = mock.patch.object(devinx, "summarise_turns", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _body(pairs):
+        fat = "x" * 4000
+        return {
+            "model": "swe-2-max", "system": "you are an agent",
+            "metadata": {"user_id": "u1"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "the task"}]},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "<system-reminder>be careful</system-reminder>"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": f"t{i}", "name": "Read",
+                     "input": {"file_path": f"/f{i}"}} for i in range(pairs)]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": f"t{i}",
+                     "content": [{"type": "text", "text": fat}]} for i in range(pairs)]},
+                {"role": "system", "content": [
+                    {"type": "text", "text": "<system-reminder>keep going</system-reminder>"}]},
+            ],
+        }
+
+    def _summary_of(self, out):
+        text = json.dumps(out["messages"][1])
+        return re.findall(r"SUMMARY#\d+", text)
+
+    def test_summary_is_extended_as_the_conversation_grows(self):
+        seen = []
+        for pairs in (260, 263, 266, 269):
+            out = devinx.compact_body(self._body(pairs))
+            marks = self._summary_of(out)
+            self.assertTrue(marks, "the body was not compacted at all")
+            seen.append(marks[-1])
+        self.assertEqual(len(set(seen)), len(seen),
+                         f"the summary never changed: {seen}")
+        # The first pass covers the whole span; each later one only what arrived
+        # since, which is what keeps a refresh worth a few seconds.
+        self.assertGreater(self.calls[0], 100)
+        self.assertTrue(all(c < 20 for c in self.calls[1:]), self.calls)
+
+    def test_a_shorter_conversation_drops_the_previous_summary(self):
+        devinx.compact_body(self._body(269))
+        first = len(self.calls)
+        devinx.compact_body(self._body(260))
+        self.assertGreater(self.calls[-1], 100,
+                           "a restarted run re-summarised only the new blocks")
+        self.assertGreater(len(self.calls), first)
+
+
+class UnknownRoleTests(unittest.TestCase):
+    """`system` messages inside `messages` are not in the Messages API, and
+    Claude Code sends them anyway. The branch that only knew `user` dropped
+    them with no warning — instructions to the agent, discarded on the way."""
+
+    def test_system_role_content_reaches_upstream(self):
+        body = {"model": "swe-2-max", "system": "s", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "task"}]},
+            {"role": "system", "content": [{"type": "text", "text": "MARKER-A"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "system", "content": [{"type": "text", "text": "MARKER-B"}]},
+        ]}
+        req, _ = devinx.build_request(body)
+        wire = str(req)
+        self.assertIn("MARKER-A", wire)
+        self.assertIn("MARKER-B", wire)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
