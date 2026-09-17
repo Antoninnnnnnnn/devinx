@@ -30,6 +30,7 @@ import os
 import random
 import re
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -195,6 +196,30 @@ def data_dir():
 
 
 DATA_DIR = data_dir()
+_STARTED = time.time()
+
+# The dashboard reads the log through the extractor in tools/. Parsing 120k
+# lines costs about a second, so a short cache keeps several open tabs from
+# each paying for it.
+STATS_TTL = float(os.environ.get("DEVINX_STATS_TTL", "5"))
+_stats_lock = threading.Lock()
+_stats = {"at": 0.0, "data": None, "error": None}
+
+
+def _log_tail(n):
+    """The last non-routine log lines, for the live activity panel."""
+    path = os.path.join(DATA_DIR, "devinx.log")
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - 200000))
+            chunk = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    skip = ("upstream conn:", "upstream first-frame:", "route=")
+    keep = [l for l in chunk.splitlines()[1:]
+            if l and not l.startswith(skip)]
+    return keep[-n:]
 
 
 def _build_id():
@@ -1479,7 +1504,12 @@ def run_swe(body, wfile, make_stream=None):
             # so reading it at stop time reported in=0 out=0 for every turn while
             # the response returned to the client had the real figures all along.
             if not err:
-                print(f"upstream done: latency={latency:.1f}s "
+                # The stop reason is what separates "the agent decided it was
+                # finished" from "the turn was cut short", and reading it back
+                # from the client is impossible.
+                print(f"upstream done: stop={_stop_reason(stop, bool(tool_order))}"
+                      f"/{stop} calls={len(tool_order)} "
+                      f"latency={latency:.1f}s "
                       f"usage in={usage.get('input_tokens', 0)} "
                       f"out={usage.get('output_tokens', 0)} "
                       f"cr={usage.get('cache_read_input_tokens', 0)} "
@@ -2091,7 +2121,61 @@ class Handler(BaseHTTPRequestHandler):
                 entry["multi_agent_version"] = MULTI_AGENT_SURFACE
         return rows + upstream
 
+    def serve_stats(self):
+        """Live figures for the dashboard.
+
+        The extractor runs as a subprocess rather than an import: it owns its
+        own shape and this stays decoupled from it. A short cache means ten open
+        tabs cost one pass over the log, not ten.
+        """
+        now = time.time()
+        with _stats_lock:
+            fresh = _stats["at"] > now - STATS_TTL and _stats["data"]
+        if not fresh:
+            data, err = {}, None
+            try:
+                r = subprocess.run(
+                    [sys.executable, os.path.join(HERE, "tools", "log_stats.py")],
+                    capture_output=True, text=True, timeout=60)
+                data = json.loads(r.stdout) if r.returncode == 0 else {}
+                err = None if data else (r.stderr or "stats failed")[:200]
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+            with _stats_lock:
+                _stats["at"], _stats["data"], _stats["error"] = now, data, err
+        with _stats_lock:
+            payload = dict(_stats["data"] or {})
+            payload["error"] = _stats["error"]
+            payload["cached_age"] = round(now - _stats["at"], 1)
+        with _inflight_lock:
+            busy = _inflight["n"]
+        payload["service"] = {"build": BUILD, "pid": os.getpid(), "port": PORT,
+                              "inflight": busy, "started": _STARTED,
+                              "uptime": round(time.time() - _STARTED),
+                              "accounts": [a["name"] for a in _accounts]}
+        payload["tail"] = _log_tail(60)
+        self.send_json(200, payload)
+
     def do_GET(self):
+        path = urlsplit(self.path).path
+        if path == "/dashboard" or path == "/dashboard/":
+            try:
+                with open(os.path.join(HERE, "tools", "dashboard.html"), "rb") as fh:
+                    page = fh.read()
+            except OSError:
+                self.send_error_json(404, "not_found_error", "dashboard.html is missing")
+                return
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(page)))
+            self.send_header("connection", "close")
+            self.end_headers()
+            self.wfile.write(page)
+            self.close_connection = True
+            return
+        if path == "/api/stats":
+            self.serve_stats()
+            return
         if urlsplit(self.path).path == "/api/hello":
             with _inflight_lock:
                 busy = _inflight["n"]

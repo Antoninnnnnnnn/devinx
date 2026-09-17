@@ -365,6 +365,20 @@ Set `DEVINX_ALLOW_BROWSER=1` if you are deliberately driving it from a local web
 UI. This is not isolation between users of the machine: anything running as you
 can still reach the port.
 
+## Dashboard
+
+```
+http://127.0.0.1:8316/dashboard
+```
+
+Served by the service itself, so it reads the live log rather than a snapshot:
+turns, tokens and what the cache saved, latency by percentile, the two rate-limit
+counters and what each credential is carrying, how far compaction is reducing a
+conversation before it goes upstream, and the incidents worth watching — with the
+last non-routine log lines streaming underneath. `GET /api/stats` returns the
+same figures as JSON. The log is re-read on demand and cached for a few seconds,
+so several open tabs cost one pass.
+
 ## Troubleshooting
 
 Logs are in `devinx.log`, in the data directory printed by the installer
