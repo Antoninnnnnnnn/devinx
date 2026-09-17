@@ -761,6 +761,16 @@ class MessageIdTests(unittest.TestCase):
         # the Messages responses must never carry a literal.
         self.assertNotIn('"id": "msg_devinx"', src)
         self.assertNotIn("'id': 'msg_devinx'", src)
+        # The Codex route correlates streamed pieces by item id the same way,
+        # so no literal may survive there either.
+        for literal in ('msg_devinx_', 'call_devinx_', 'resp_devinx'):
+            self.assertNotIn(literal, src, f"{literal} is still a constant")
+
+    def test_two_codex_streams_do_not_share_item_ids(self):
+        a = devinx.ResponsesStream(io.BytesIO(), "swe-2-max")
+        b = devinx.ResponsesStream(io.BytesIO(), "swe-2-max")
+        self.assertNotEqual(a.item_prefix, b.item_prefix)
+        self.assertNotEqual(a.response_id, b.response_id)
 
 
 if __name__ == "__main__":

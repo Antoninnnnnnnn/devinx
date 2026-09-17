@@ -2226,6 +2226,13 @@ class ResponsesStream:
         self.seq = 0
         self.index = -1
         self.item_id = None
+        # Unique per response, for the same reason the Messages route learned
+        # it the hard way: identifiers a client uses to correlate streamed
+        # pieces must not repeat across responses. Reused ones let a client
+        # conclude that two answers are one, and here they would also collide
+        # in whatever store it keeps its items in.
+        self.item_prefix = f"msg_{uuid.uuid4().hex[:16]}"
+        self.response_id = f"resp_{uuid.uuid4().hex}"
         self.open_text = False
         self.text_buf = []
         self.started = False
@@ -2238,7 +2245,7 @@ class ResponsesStream:
         self.w.flush()
 
     def _response(self, status, usage=None):
-        out = {"id": "resp_devinx", "object": "response",
+        out = {"id": self.response_id, "object": "response",
                "created_at": int(time.time()), "status": status,
                "model": self.model, "output": [], "error": None,
                "instructions": None, "incomplete_details": None,
@@ -2280,7 +2287,7 @@ class ResponsesStream:
         if self.open_text:
             return
         self.index += 1
-        self.item_id = f"msg_devinx_{self.index}"
+        self.item_id = f"{self.item_prefix}_{self.index}"
         self.open_text = True
         self._send("response.output_item.added", {
             "type": "response.output_item.added", "output_index": self.index,
@@ -2325,7 +2332,7 @@ class ResponsesStream:
         for tid, b in self.tools.items():
             self._close_text()
             self.index += 1
-            item_id = f"call_devinx_{self.index}"
+            item_id = f"call_{self.item_prefix[4:]}_{self.index}"
             is_custom = b["name"] in self.custom
             try:
                 args = json.loads(b["json"] or "{}")
