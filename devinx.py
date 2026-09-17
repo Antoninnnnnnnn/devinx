@@ -680,6 +680,17 @@ TOOL_DESC_CAPS = (None, 6000, 2500)
 # answer that never comes is worse than one that says to try later.
 RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "600"))
 
+# A connection that breaks mid-response is transient and costs an agent its
+# turn: measured in one log, 103 of them — connection resets and streams ending
+# prematurely — every one ending the turn, because the retry loop only ever
+# caught rate limits and classifier refusals. urllib3's own retries cannot help
+# here: with stream=True the window closes once the response headers are read,
+# so a body-phase failure surfaces to us and to nobody else.
+NETWORK_RETRIES = int(os.environ.get("DEVINX_NETWORK_RETRIES", "2"))
+_TRANSIENT = ("ConnectionResetError", "ChunkedEncodingError", "ConnectionError",
+              "ReadTimeout", "ProtocolError", "IncompleteRead",
+              "stream truncated")
+
 
 def build_request(body, tool_desc_cap=None):
     """Translate one Anthropic Messages body into a GetChatMessageRequest.
@@ -1397,7 +1408,7 @@ def run_swe(body, wfile, make_stream=None):
     # Cognition's input classifier denies borderline payloads nondeterministically
     # (the same body has been observed to pass and to fail). Retry while nothing
     # has reached the client yet.
-    attempt, waited = 0, 0.0
+    attempt, waited, retries = 0, 0.0, 0
     acct = None
     while attempt < 3:
         try:
@@ -1498,6 +1509,14 @@ def run_swe(body, wfile, make_stream=None):
             err = f"upstream {type(e).__name__}: {e}"
             print(err, flush=True)
 
+        if (err and not emitted and retries < NETWORK_RETRIES
+                and any(t in err for t in _TRANSIENT)):
+            retries += 1
+            delay = 1.5 * retries
+            print(f"upstream connection failed ({err[:60]}), retrying in "
+                  f"{delay:.0f}s ({retries}/{NETWORK_RETRIES})", flush=True)
+            time.sleep(delay)
+            continue
         if err and not emitted and "resource_exhausted" in err:
             # Both of Cognition's limits are per account, so another credential
             # is a switch rather than a wait. Only when every one of them is
