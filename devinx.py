@@ -1455,22 +1455,6 @@ def run_swe(body, wfile, make_stream=None):
                                                   if tool_order else "")
                     if not tid:
                         continue
-                    if tid not in tool_blocks and tool_order:
-                        # A fresh id while the call before it is still an
-                        # unfinished JSON fragment is a continuation wearing a
-                        # new name, not a second call. Taking it at face value
-                        # turns one call into one call per frame: measured on a
-                        # real turn, 2322 tool_use blocks in a single assistant
-                        # message, every one of them executed by the client.
-                        prev = tool_blocks[tool_order[-1]]
-                        incomplete = True
-                        try:
-                            json.loads(prev["json"] or "{}")
-                            incomplete = False
-                        except ValueError:
-                            pass
-                        if incomplete and (not tc.name or tc.name == prev["name"]):
-                            tid = tool_order[-1]
                     if tid not in tool_blocks:
                         tool_blocks[tid] = {"name": tc.name, "json": ""}
                         tool_order.append(tid)
@@ -1554,10 +1538,13 @@ def run_swe(body, wfile, make_stream=None):
             continue
         break
 
-    if len(tool_order) > 8:
-        # An assistant turn does not legitimately issue hundreds of tool calls.
-        # If this fires, the stream is being split into one call per fragment
-        # rather than accumulated, and the client will execute every one of them.
+    if len(tool_order) > 30:
+        # A turn issuing this many calls is worth seeing. Parallel tool use is
+        # normal — 13 calls across Read and Bash was measured and is legitimate
+        # — but a message carrying 2322 tool_result blocks was also measured,
+        # and nothing in the stream has yet explained it. The names here are
+        # what will tell the two apart: one repeated name is a stream being
+        # split, a spread of names is an agent working.
         names = {}
         for t in tool_order:
             n = tool_blocks[t]["name"] or "?"
