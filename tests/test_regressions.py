@@ -376,6 +376,101 @@ class FlattenedConversationTests(unittest.TestCase):
         self.assertGreater(len(self.calls), first)
 
 
+class UnflattenTests(unittest.TestCase):
+    """Restoring turn order is what lets every later heuristic work.
+
+    On the collapsed shape the verbatim tail was one small message — the agent
+    kept a summary of its own recent work and none of it in clear, so it read
+    the same files again to find out what it had just read.
+    """
+
+    @staticmethod
+    def _flat(pairs):
+        return [
+            {"role": "user", "content": [{"type": "text", "text": "the task"}]},
+            {"role": "assistant", "content":
+                [{"type": "thinking", "thinking": "planning"}]
+                + [{"type": "tool_use", "id": f"t{i}", "name": "Read",
+                    "input": {"file_path": f"/f{i}"}} for i in range(pairs)]},
+            {"role": "user", "content":
+                [{"type": "tool_result", "tool_use_id": f"t{i}",
+                  "content": [{"type": "text", "text": f"body of /f{i}"}]}
+                 for i in range(pairs)]},
+        ]
+
+    def test_pairs_get_their_own_turns_in_order(self):
+        out = devinx.unflatten_body({"messages": self._flat(40)})["messages"]
+        self.assertEqual(len(out), 1 + 40 * 2)
+        for i in range(40):
+            call = out[1 + 2 * i]
+            answer = out[2 + 2 * i]
+            self.assertEqual(call["role"], "assistant")
+            self.assertEqual(call["content"][-1]["id"], f"t{i}")
+            self.assertEqual(answer["role"], "user")
+            self.assertEqual(answer["content"][0]["tool_use_id"], f"t{i}")
+        # What led into the run rides on its first turn, not on all of them.
+        self.assertEqual(out[1]["content"][0]["type"], "thinking")
+
+    def test_nothing_is_invented_and_nothing_is_lost(self):
+        flat = self._flat(20)
+        # One answer never came back, one answers a call that is not there.
+        flat[2]["content"] = [b for b in flat[2]["content"]
+                              if b["tool_use_id"] != "t7"]
+        flat[2]["content"].append({"type": "tool_result", "tool_use_id": "zz",
+                                   "content": [{"type": "text", "text": "orphan"}]})
+        out = devinx.unflatten_body({"messages": flat})["messages"]
+        wire = json.dumps(out)
+        self.assertIn("orphan", wire, "an unmatched answer was dropped")
+        ids = [b["tool_use_id"] for m in out for b in m["content"]
+               if b.get("type") == "tool_result"]
+        self.assertNotIn("t7", ids, "an answer was invented for a call")
+        self.assertEqual(len(ids), 20, "content went missing")
+
+    def test_parallel_calls_in_a_real_turn_are_left_alone(self):
+        """20 calls in one turn is the most this proxy has ever measured."""
+        normal = [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content":
+                [{"type": "tool_use", "id": f"t{i}", "name": "Read", "input": {}}
+                 for i in range(20)]},
+            {"role": "user", "content":
+                [{"type": "tool_result", "tool_use_id": f"t{i}", "content": []}
+                 for i in range(20)]},
+        ]
+        self.assertEqual(devinx.unflatten_body({"messages": normal})["messages"],
+                         normal)
+
+    def test_the_tail_survives_compaction_once_order_is_restored(self):
+        fat = "x" * 4000
+        flat = [
+            {"role": "user", "content": [{"type": "text", "text": "the task"}]},
+            {"role": "assistant", "content":
+                [{"type": "tool_use", "id": f"t{i}", "name": "Read",
+                  "input": {"file_path": f"/f{i}"}} for i in range(260)]},
+            {"role": "user", "content":
+                [{"type": "tool_result", "tool_use_id": f"t{i}",
+                  "content": [{"type": "text", "text": fat}]} for i in range(260)]},
+            # The shape measured on the wire ends on a system message, and that
+            # one message is the whole verbatim tail compaction has to work with.
+            {"role": "system", "content":
+                [{"type": "text", "text": "<system-reminder>keep going</system-reminder>"}]},
+        ]
+        body = {"model": "swe-2-max", "system": "s", "metadata": {"user_id": "u"},
+                "messages": flat}
+        devinx._summaries.clear()
+        with mock.patch.object(devinx, "summarise_turns",
+                               lambda *a, **k: "SUMMARY"):
+            flat_out = devinx.compact_body(copy.deepcopy(body))
+            devinx._summaries.clear()
+            restored = devinx.compact_body(devinx.unflatten_body(copy.deepcopy(body)))
+        # Collapsed, the tail is whatever single message fits, and here that is
+        # nothing at all. Restored, the recent turns come through in clear.
+        self.assertNotIn("/f259", json.dumps(flat_out))
+        self.assertIn("/f259", json.dumps(restored))
+        self.assertGreater(devinx.estimate_tokens(restored),
+                           10 * devinx.estimate_tokens(flat_out))
+
+
 class UnknownRoleTests(unittest.TestCase):
     """`system` messages inside `messages` are not in the Messages API, and
     Claude Code sends them anyway. The branch that only knew `user` dropped

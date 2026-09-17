@@ -1155,6 +1155,99 @@ def summarise_turns(messages, model, system, previous=None):
     return "".join(texts).strip() or None
 
 
+# Below this many calls collapsed into one message the shape is just an agent
+# doing parallel tool calls in a single turn, which is legitimate and must be
+# left alone. The most this proxy has ever measured in one real turn is 20;
+# the collapsed bodies carry 174. There is a lot of room between the two, and
+# the cost of guessing wrong is splitting a genuine parallel turn into a
+# sequence that never happened, so the threshold sits well clear of the top of
+# the measured range rather than just above it.
+FLAT_RUN = 32
+
+
+def _is_flattened(messages):
+    """One message holding a whole run of calls, the next holding every answer.
+
+    That is not what the Messages API describes and not what the client's own
+    transcript on disk contains, but it is what arrives on the wire for swe-2:
+    the history collapsed into five messages. Every heuristic downstream reads
+    a conversation as a sequence of turns, so the shape has to be restored
+    before any of them runs, not worked around in each of them.
+    """
+    for i, m in enumerate(messages[:-1]):
+        if m.get("role") != "assistant":
+            continue
+        uses = sum(1 for b in _blocks(m.get("content"))
+                   if b.get("type") == "tool_use")
+        nxt = messages[i + 1]
+        if nxt.get("role") != "user":
+            continue
+        results = sum(1 for b in _blocks(nxt.get("content"))
+                      if b.get("type") == "tool_result")
+        if uses >= FLAT_RUN and results >= FLAT_RUN:
+            return True
+    return False
+
+
+def _unflatten(messages):
+    """Pair each call back with its answer and give each pair its own turn.
+
+    Order is reconstructed from the tool_use ids, which is the only record of
+    it left once the blocks have been grouped by role. Thinking and text that
+    led into the run stay on the first turn of it. Nothing is invented: a call
+    whose answer is missing keeps its turn alone, and an answer whose call is
+    missing is kept too rather than dropped, because its content is work the
+    agent did.
+    """
+    out, i = [], 0
+    while i < len(messages):
+        m = messages[i]
+        nxt = messages[i + 1] if i + 1 < len(messages) else None
+        blocks = _blocks(m.get("content"))
+        uses = [b for b in blocks if b.get("type") == "tool_use"]
+        if (m.get("role") == "assistant" and len(uses) >= FLAT_RUN
+                and nxt is not None and nxt.get("role") == "user"):
+            answers = _blocks(nxt.get("content"))
+            by_id = {}
+            for b in answers:
+                if b.get("type") == "tool_result":
+                    by_id.setdefault(b.get("tool_use_id"), []).append(b)
+            if len(by_id) < FLAT_RUN:
+                out.append(m)
+                i += 1
+                continue
+            lead = [b for b in blocks if b.get("type") != "tool_use"]
+            for j, u in enumerate(uses):
+                out.append({"role": "assistant",
+                            "content": (lead if j == 0 else []) + [u]})
+                got = by_id.pop(u.get("id"), None)
+                if got:
+                    out.append({"role": "user", "content": got})
+            leftovers = [b for b in answers
+                         if b.get("type") != "tool_result"
+                         or b.get("tool_use_id") in by_id]
+            if leftovers:
+                out.append({"role": "user", "content": leftovers})
+            i += 2
+            continue
+        out.append(m)
+        i += 1
+    return out
+
+
+def unflatten_body(body):
+    """The body as a sequence of turns, whatever shape it arrived in."""
+    messages = body.get("messages") or []
+    if not _is_flattened(messages):
+        return body
+    restored = _unflatten(messages)
+    print(f"unflattened: {len(messages)} messages -> {len(restored)} turns",
+          flush=True)
+    out = dict(body)
+    out["messages"] = restored
+    return out
+
+
 def _span_blocks(messages, start):
     """Every content block the summary has to cover, in order.
 
@@ -1544,6 +1637,10 @@ def run_swe(body, wfile, make_stream=None):
     # Before anything is sent: if this turn would not fit, reduce it here rather
     # than let the upstream refuse it and the client end the agent.
     try:
+        # Order first, then size: compaction decides what to keep verbatim by
+        # walking back over turns, and on a collapsed body there is only ever
+        # one turn to walk back over.
+        body = unflatten_body(body)
         body = compact_body(body)
     except Exception as e:
         # Compaction is a rescue, never a new way to fail. A turn that would
