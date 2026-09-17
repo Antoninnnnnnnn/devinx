@@ -868,8 +868,13 @@ def build_request(body, tool_desc_cap=None):
         print(f"warning: dropped unsupported content blocks: "
               f"{', '.join(sorted(set(dropped)))}", flush=True)
     if unknown_roles:
+        # Naming the model matters: the two client anomalies this proxy sees —
+        # roles the Messages API does not define, and a history collapsed by
+        # role — do not come from the same place, and telling them apart needs
+        # to be possible from the log rather than from memory.
         print(f"warning: messages with role {', '.join(sorted(unknown_roles))} "
-              f"sent upstream as user content", flush=True)
+              f"sent upstream as user content (model={body.get('model')})",
+              flush=True)
 
     def describe(t):
         text = _TOOL_DESC_REWRITES.get(t.get("name"), t.get("description", ""))
@@ -1241,8 +1246,8 @@ def unflatten_body(body):
     if not _is_flattened(messages):
         return body
     restored = _unflatten(messages)
-    print(f"unflattened: {len(messages)} messages -> {len(restored)} turns",
-          flush=True)
+    print(f"unflattened: {len(messages)} messages -> {len(restored)} turns "
+          f"(model={body.get('model')})", flush=True)
     out = dict(body)
     out["messages"] = restored
     return out
