@@ -228,6 +228,13 @@ DASHBOARD_TOKEN = _dashboard_token()
 # The port the dashboard is published on, separate from the API port on
 # purpose. Opened whenever there is a token to protect it.
 DASHBOARD_PORT = int(os.environ.get("DEVINX_DASHBOARD_PORT", "8317"))
+# How many times one conversation may be told the mid-conversation system
+# turns are not accepted before the proxy gives up and carries them anyway. A
+# client that honours the contract needs one.
+MID_CONV_SYSTEM_REFUSALS = int(os.environ.get("DEVINX_MID_CONV_REFUSALS", "3"))
+_capability_lock = threading.Lock()
+_capability_refusals = {}
+
 _stats_lock = threading.Lock()
 _stats = {"at": 0.0, "data": None, "error": None, "running": False}
 
@@ -2488,6 +2495,53 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(given.encode("utf-8", "surrogatepass"),
                                    DASHBOARD_TOKEN.encode("utf-8"))
 
+    def reject_mid_conv_system(self, body):
+        """Decline the mid-conversation system turns instead of carrying them.
+
+        Claude Code sends `{role: "system"}` messages inside `messages`, which
+        the Messages API does not define. Carrying them as user content kept
+        their content, and kept the shape: the same feature drops base messages
+        and replaces them with these markers, which is how a whole run arrives
+        as five messages with every call in one of them.
+
+        It does not have to be carried at all. The client publishes a contract
+        for gateways — devinx is one — and it says a capability the upstream
+        will not take should come back as HTTP 400 whose entire error.message
+        is the token `capability_rejected: <class>`. The client matches that
+        token, drops the capability, retries, and sticky-rejects it for the
+        rest of the session. Its own log line for this path reads: "falling
+        back to a body with no {role:\"system\"} turn".
+
+        So this is the cure rather than the compensation: the shape stops being
+        produced, instead of being repaired on every request forever.
+
+        The cap exists because a client that did not honour it would retry the
+        same body: after a few refusals per conversation the old behaviour
+        takes over and the turn goes through carrying them.
+        """
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return False
+        if not any(isinstance(m, dict) and m.get("role") not in ("user", "assistant")
+                   for m in messages):
+            return False
+        key = _conv_key(body)
+        with _capability_lock:
+            n = _capability_refusals.get(key, 0) + 1
+            if len(_capability_refusals) > 256:
+                _capability_refusals.clear()
+            _capability_refusals[key] = n
+        if n > MID_CONV_SYSTEM_REFUSALS:
+            print(f"mid-conv-system: still sent after {n - 1} refusals; "
+                  f"carrying them as user content instead", flush=True)
+            return False
+        print(f"mid-conv-system: declining the turn ({n}/"
+              f"{MID_CONV_SYSTEM_REFUSALS}); the client drops the beta and "
+              f"retries", flush=True)
+        self.send_error_json(400, "invalid_request_error",
+                             "capability_rejected: mid_conv_system")
+        return True
+
     def do_GET(self):
         path = urlsplit(self.path).path
         if path in ("/dashboard", "/dashboard/", "/api/stats") and not self.dashboard_allowed():
@@ -2601,6 +2655,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(
                 403, "permission_error",
                 "Refusing a browser-originated request on the SWE-2 route")
+            return
+
+        if model in SWE_MODEL_IDS and self.reject_mid_conv_system(body):
             return
 
         if model in SWE_MODEL_IDS:
