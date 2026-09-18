@@ -171,7 +171,7 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 <div class="grid g4">
   <div class="card hero"><div class="k">tours SWE-2 aboutis</div>
     <div class="v accent" id="h-turns">—</div><div class="sub" id="h-turns-sub">—</div></div>
-  <div class="card hero"><div class="k">jetons traités</div>
+  <div class="card hero"><div class="k">tokens traités</div>
     <div class="v" id="h-tokens">—</div><div class="sub" id="h-tokens-sub">—</div></div>
   <div class="card hero"><div class="k">taux de cache</div>
     <div class="v" id="h-cache">—</div><div class="sub" id="h-cache-sub">—</div></div>
@@ -179,7 +179,7 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
     <div class="v" id="h-rl">—</div><div class="sub" id="h-rl-sub">—</div></div>
 </div>
 
-<h2>Jetons</h2>
+<h2>Tokens</h2>
 <div class="grid g2">
   <div class="card">
     <h3>Répartition de ce qui a été envoyé et reçu</h3>
@@ -376,15 +376,16 @@ function render(d){
   $("h-turns").textContent = n(sw.turns_ok);
   $("h-turns-sub").textContent = `${n(sw.turns_failed)} échecs · ${n(total)} tentatives`;
   $("h-tokens").textContent = big((tk.input||0) + (tk.output||0) + (tk.cache_read||0));
-  $("h-tokens-sub").textContent = `${big(tk.input)} entrée · ${big(tk.output)} sortie`;
+  $("h-tokens-sub").textContent =
+    `${big(tk.cache_read)} cache · ${big(tk.input)} entrée · ${big(tk.output)} sortie`;
   const hit = (fun.cache_hit_ratio) || 0;
   $("h-cache").textContent = pct(hit);
-  $("h-cache-sub").textContent = `${big(tk.cache_read)} jetons relus, sur l'entrée`;
+  $("h-cache-sub").textContent = `${big(tk.cache_read)} tokens relus, sur l'entrée`;
   $("h-rl").textContent = n(rl.total);
   const rate = total ? (rl.total || 0) / total : 0;
   $("h-rl-sub").textContent = `${pct(rate)} des tentatives`;
 
-  // jetons — barre empilée sur une seule échelle
+  // tokens — barre empilée sur une seule échelle
   const parts = [["cache relu", tk.cache_read, "--s1"], ["entrée neuve", tk.input, "--s3"],
                  ["sortie", tk.output, "--s2"]];
   const sum = parts.reduce((a, p) => a + (p[1] || 0), 0) || 1;
@@ -392,7 +393,7 @@ function render(d){
     `<div style="width:${100*(p[1]||0)/sum}%;background:var(${p[2]})" title="${esc(p[0])} : ${n(p[1])}"></div>`).join("");
   $("toklegend").innerHTML = parts.map(p =>
     `<span><i style="background:var(${p[2]})"></i>${p[0]} <b>${big(p[1])}</b></span>`).join("");
-  $("toknote").textContent = `${big(sum)} jetons au total, dont ${pct((tk.cache_read||0)/sum)} servis par le cache — autant qui n'a pas été recalculé. Le compteur en tête rapporte la même lecture à la seule entrée, d'où l'écart.`;
+  $("toknote").textContent = `${big(sum)} tokens au total, dont ${pct((tk.cache_read||0)/sum)} servis par le cache — autant qui n'a pas été recalculé. Le compteur en tête rapporte la même lecture à la seule entrée, d'où l'écart.`;
 
   $("bymodel").innerHTML = Object.entries(sw.by_model || {})
     .sort((a,b) => b[1].turns - a[1].turns)
@@ -524,7 +525,7 @@ function render(d){
     {k:"envoyé (max)", v:at.max, t:big(at.max), smax:cmax, c:"--s3"},
   ]);
   const ratio = bt.p50 ? (1 - at.p50/bt.p50) : 0;
-  $("compactnote").textContent = `${n(cp.count)} compactions, ${n(cp.summary_failures)} résumés échoués. La conversation médiane est réduite de ${pct(ratio)} avant d'être envoyée — SWE-2 n'accepte que 262 144 jetons.`;
+  $("compactnote").textContent = `${n(cp.count)} compactions, ${n(cp.summary_failures)} résumés échoués. La conversation médiane est réduite de ${pct(ratio)} avant d'être envoyée — SWE-2 n'accepte que 262 144 tokens.`;
 
   const ua = inc.unparseable_tool_args || {};
   const items = [
@@ -561,7 +562,7 @@ function render(d){
      `${hours ? (hours/24).toFixed(1).replace(".",",") : 0} jours cumulés dans des appels réseau`],
     ["Le tour le plus long", dur(sw.latency?.max),
      "un seul appel, du départ à la dernière trame"],
-    ["Le tour le plus chargé", `${big(fun.busiest_single_turn?.input)} jetons`,
+    ["Le tour le plus chargé", `${big(fun.busiest_single_turn?.input)} tokens`,
      `en entrée, plus ${big(fun.busiest_single_turn?.output)} en sortie — un autre tour que le plus long`],
     ["Plus grosse requête envoyée", `${n(sw.request_kb?.max)} Ko`,
      `la médiane est à ${n(sw.request_kb?.p50)} Ko`],
@@ -569,7 +570,7 @@ function render(d){
      "en corps de requêtes, compression comprise"],
     ["Conversation la plus longue", `${n(sw.messages_per_request?.max)} messages`,
      `médiane : ${n(sw.messages_per_request?.p50)}`],
-    ["Jetons par heure d'appel", big(fun.tokens_per_hour_of_calls),
+    ["Tokens par heure d'appel", big(fun.tokens_per_hour_of_calls),
      "entrée, sortie et cache confondus, rapportés au temps passé en ligne"],
     ["Redémarrages du service", n(lg.restarts),
      `${(lg.builds||[]).length} versions différentes servies`],
