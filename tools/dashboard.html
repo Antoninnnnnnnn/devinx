@@ -107,6 +107,20 @@ td.n,th.n{text-align:right;font-family:var(--mono)}
 .bars > div:hover{background:var(--s2)}
 .xaxis{display:flex;gap:3px;margin-top:6px;font-family:var(--mono);font-size:10px;color:var(--ink-3)}
 .xaxis > div{flex:1;text-align:center}
+/* Un repère par point rend chaque case large de deux pixels, dans laquelle un
+   libellé de cinq caractères se coupe lettre par lettre et se lit comme une
+   colonne de chiffres. Trois repères, aux extrémités et au milieu. */
+.xaxis.ends{justify-content:space-between}
+.xaxis.ends > div{flex:0 0 auto}
+
+/* Ce que la souris — ou le doigt — désigne, écrit en toutes lettres. Un
+   attribut title ne s'affiche pas sur un téléphone et se fait attendre
+   ailleurs. */
+.readout{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  margin-bottom:8px;font-family:var(--mono);font-size:12px;color:var(--ink-2);
+  min-height:18px}
+.readout b{color:var(--ink);font-weight:600}
+.readout .muted{color:var(--ink-3)}
 
 .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;
   font-weight:600;font-family:var(--mono)}
@@ -201,8 +215,9 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 <div class="grid g1">
   <div class="card">
     <h3>Requêtes par minute <span style="color:var(--ink-3);font-weight:400">(deux dernières heures)</span></h3>
+    <div class="readout" id="rpmread"></div>
     <div class="bars tall" id="rpmbars"></div>
-    <div class="xaxis" id="rpmaxis"></div>
+    <div class="xaxis ends" id="rpmaxis"></div>
     <div class="legend"><span><i style="background:var(--s1)"></i>servies</span>
       <span><i style="background:var(--s2)"></i>refusées</span></div>
     <div class="note" id="rpmnote"></div>
@@ -236,6 +251,7 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
   </div>
   <div class="card">
     <h3>Appels d'outils par tour</h3>
+    <div class="readout" id="toolread"></div>
     <div class="bars" id="toolbars"></div>
     <div class="xaxis" id="toolaxis"></div>
     <div class="note" id="toolnote"></div>
@@ -301,6 +317,41 @@ const esc = v => String(v ?? "").replace(/[<>&"]/g,
 
 const SERIES = ["--s1","--s2","--s3","--s4"];
 const cvar = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+
+// Le survol écrit dans une ligne fixe plutôt que dans une bulle : une bulle
+// suit un curseur qu'un téléphone n'a pas, et sort du cadre au bord droit. La
+// ligne répond aussi au toucher, et reprend sa valeur par défaut quand on la
+// quitte — jamais vide, pour ne pas faire sauter la mise en page.
+function readout(barsId, readId, fallback){
+  const bars = $(barsId), read = $(readId);
+  if (!bars || !read) return;
+  // Deux textes, posés avec textContent : ce sont des chiffres et une heure,
+  // mais la page n'a aucune raison de savoir construire du balisage à partir
+  // d'un attribut, et tout ce qui vient du journal est une donnée.
+  const show = el => {
+    const a = el ? el.dataset.a : fallback()[0];
+    const b = el ? el.dataset.b : fallback()[1];
+    read.textContent = "";
+    const left = document.createElement("span");
+    left.textContent = a || "";
+    const right = document.createElement("span");
+    right.textContent = b || "";
+    if (!el) { left.className = "muted"; right.className = "muted"; }
+    read.append(left, right);
+  };
+  show(null);
+  if (bars.dataset.wired) { bars.dataset.fresh = "1"; }
+  else {
+    bars.dataset.wired = "1";
+    const at = e => {
+      const el = e.target.closest("[data-a]");
+      if (el) show(el);
+    };
+    bars.addEventListener("pointermove", at);
+    bars.addEventListener("pointerdown", at);
+    bars.addEventListener("pointerleave", () => show(null));
+  }
+}
 
 function rows(el, items, color){
   const max = Math.max(...items.map(i => i.v), 1);
@@ -382,13 +433,22 @@ function render(d){
   const smax = Math.max(...series.map(p => p.req), 1);
   $("rpmbars").innerHTML = series.map(p => {
     const served = Math.max(0, p.req - p.ref);
-    return `<div class="col" title="${esc(p.at)} — ${p.req} requêtes, ${p.ref} refusées">
+    const b = `${p.req} requête${p.req > 1 ? "s" : ""}`
+      + (p.ref ? ` · ${p.ref} refusée${p.ref > 1 ? "s" : ""}` : "");
+    return `<div class="col" data-a="${esc(p.at.slice(11))}" data-b="${esc(b)}">
       <div style="height:${100*p.ref/smax}%;background:var(--s2)"></div>
       <div style="height:${100*served/smax}%;background:var(--s1)"></div></div>`;
   }).join("");
-  $("rpmaxis").innerHTML = series.map((p,i) =>
-    `<div>${(i===0||i===series.length-1||i===Math.floor(series.length/2))
-      ? esc(p.at.slice(11)) : ""}</div>`).join("");
+  const ends = series.length
+    ? [series[0], series[Math.floor(series.length/2)], series[series.length-1]]
+    : [];
+  $("rpmaxis").innerHTML = ends.map(p => `<div>${esc(p.at.slice(11))}</div>`).join("");
+  readout("rpmbars", "rpmread", () => {
+    const p = series[series.length-1];
+    return p ? [`dernière minute · ${p.at.slice(11)}`,
+                `${p.req} requête${p.req > 1 ? "s" : ""}`]
+             : ["aucune minute mesurée", ""];
+  });
   $("rpmnote").textContent = measured
     ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. Une minute entièrement servie est loin du plafond ; une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
     : "Le journal n'a appris à écrire l'heure qu'aujourd'hui : cette série commence au premier redémarrage après ça.";
@@ -444,7 +504,11 @@ function render(d){
   $("toolbars").innerHTML = keys.map((k,i) =>
     `<div style="height:${Math.max(2, 100*hist[k]/hmax)}%${
       i && k > keys[i-1] + 1 ? ";" + gapmark : ""}"
-      title="${hist[k]} tours à ${k} appel(s)"></div>`).join("");
+      data-a="${k} appel${k > 1 ? "s" : ""} par tour"
+      data-b="${n(hist[k])} tour${hist[k] > 1 ? "s" : ""} · ${
+        pct(hist[k]/(hsum||1))} des tours mesurés"></div>`).join("");
+  readout("toolbars", "toolread", () =>
+    [`médiane ${h.p50 ?? 0} appel(s) par tour`, `${n(hsum)} tours mesurés`]);
   $("toolaxis").innerHTML = keys.map((k,i) =>
     `<div>${(i===0||i===keys.length-1||k%5===0)?k:""}</div>`).join("");
   $("toolnote").textContent = `Médiane ${h.p50 ?? 0} appel(s), maximum observé ${h.max ?? 0}, sur ${n(hsum)} tours — les seuls dont le journal note le nombre d'appels, sur ${n(sw.turns_ok)} réussis. Les valeurs absentes creusent un écart dans l'axe. Un éventail de noms est du parallélisme normal ; un seul nom répété des centaines de fois serait un flux mal assemblé.`;
