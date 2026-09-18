@@ -231,9 +231,7 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 <div class="grid g3">
   <div class="card hero"><div class="k">requêtes par minute</div>
     <div class="v accent" id="h-rpm">—</div><div class="sub" id="h-rpm-sub">—</div></div>
-  <div class="card hero"><div class="k">plafond observé</div>
-    <div class="v" id="h-ceil">—</div><div class="sub" id="h-ceil-sub">—</div></div>
-  <div class="card hero"><div class="k">appels simultanés</div>
+  <div class="card hero"><div class="k">appels simultanés au pic</div>
     <div class="v" id="h-conc">—</div><div class="sub" id="h-conc-sub">—</div></div>
   <div class="card hero"><div class="k">part refusée, 60 min</div>
     <div class="v" id="h-refshare">—</div><div class="sub" id="h-refshare-sub">—</div></div>
@@ -494,14 +492,11 @@ function render(d){
   $("h-rpm-sub").textContent = measured
     ? `médiane ${rpm.p50 ?? 0} · p90 ${rpm.p90 ?? 0} · pic ${rpm.max ?? 0}`
     : "en attente de lignes horodatées";
-  $("h-ceil").textContent = measured ? n(th.served_per_min_max) : "—";
-  $("h-ceil-sub").textContent =
-    "la meilleure minute jamais servie — l'amont ne dit jamais sa limite";
   const cc = th.concurrency || {};
   $("h-conc").textContent = cc.peak ? n(cc.peak) : "—";
   $("h-conc-sub").textContent = cc.peak
-    ? `pic · médiane ${cc.p50} · p90 ${cc.p90}${
-        cc.peak_at ? " · " + cc.peak_at.slice(11, 16) : ""}`
+    ? `tours ouverts en même temps · médiane ${cc.p50} · p90 ${cc.p90}${
+        cc.peak_at ? " · pic à " + cc.peak_at.slice(11, 16) : ""}`
     : "aucun tour mesuré sur la période";
   $("h-refshare").textContent = measured ? pct(r60.refusal_share || 0) : "—";
   $("h-refshare-sub").textContent =
@@ -539,7 +534,7 @@ function render(d){
              : ["aucune minute mesurée", ""];
   });
   $("rpmnote").textContent = measured
-    ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. Une minute entièrement servie est loin du plafond ; une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
+    ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. La meilleure minute jamais servie est à ${n(th.served_per_min_max)} requêtes — l'amont ne dit jamais sa limite, c'est la seule approximation honnête qu'on en ait. Une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
     : "Le journal n'a appris à écrire l'heure qu'aujourd'hui : cette série commence au premier redémarrage après ça.";
 
   const ff = d.first_frame || {};
