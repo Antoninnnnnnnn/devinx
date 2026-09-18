@@ -233,6 +233,8 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
     <div class="v accent" id="h-rpm">—</div><div class="sub" id="h-rpm-sub">—</div></div>
   <div class="card hero"><div class="k">plafond observé</div>
     <div class="v" id="h-ceil">—</div><div class="sub" id="h-ceil-sub">—</div></div>
+  <div class="card hero"><div class="k">appels simultanés</div>
+    <div class="v" id="h-conc">—</div><div class="sub" id="h-conc-sub">—</div></div>
   <div class="card hero"><div class="k">part refusée, 60 min</div>
     <div class="v" id="h-refshare">—</div><div class="sub" id="h-refshare-sub">—</div></div>
 </div>
@@ -272,6 +274,21 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
   <div class="card">
     <h3>Rafales et attentes</h3>
     <dl class="kv" id="rlkv"></dl>
+  </div>
+</div>
+
+<h2>Verdicts et échecs</h2>
+<div class="grid g2">
+  <div class="card">
+    <h3>Comment les tours se terminent</h3>
+    <div class="rows" id="stopreasons"></div>
+    <div class="note" id="stopnote"></div>
+  </div>
+  <div class="card">
+    <h3>Refus de l'amont, par cause</h3>
+    <div class="tw"><table><thead><tr><th>cause</th><th class="n">tours</th></tr></thead>
+      <tbody id="failcodes"></tbody></table></div>
+    <div class="note">Hors quota, qui a sa propre section. « prompt trop long » est un défaut de compaction : un corps qui lui a échappé et qui tue le tour.</div>
   </div>
 </div>
 
@@ -402,7 +419,10 @@ function render(d){
   $("pid").textContent = sv.pid || "—";
   $("inflight").textContent = sv.inflight ?? "—";
   $("uptime").textContent = dur(sv.uptime);
-  $("accounts").textContent = (sv.accounts || []).join(", ") || "—";
+  $("accounts").textContent = (sv.accounts || []).map(a =>
+    typeof a === "string" ? a
+      : a.blocked_for ? `${a.name} (bloqué ${dur(a.blocked_for)})` : a.name
+  ).join(", ") || "—";
 
   const total = (sw.turns_ok || 0) + (sw.turns_failed || 0) + (rl.total || 0);
   $("h-turns").textContent = n(sw.turns_ok);
@@ -449,6 +469,12 @@ function render(d){
   $("h-ceil").textContent = measured ? n(th.served_per_min_max) : "—";
   $("h-ceil-sub").textContent =
     "la meilleure minute jamais servie — l'amont ne dit jamais sa limite";
+  const cc = th.concurrency || {};
+  $("h-conc").textContent = cc.peak ? n(cc.peak) : "—";
+  $("h-conc-sub").textContent = cc.peak
+    ? `pic · médiane ${cc.p50} · p90 ${cc.p90}${
+        cc.peak_at ? " · " + cc.peak_at.slice(11, 16) : ""}`
+    : "aucun tour mesuré sur la période";
   $("h-refshare").textContent = measured ? pct(r60.refusal_share || 0) : "—";
   $("h-refshare-sub").textContent =
     `${n(r60.refusals)} refus sur ${n(r60.requests)} requêtes`;
@@ -462,7 +488,9 @@ function render(d){
     `<span><i style="background:var(${m[2]})"></i>${esc(m[0])} <b>${big(m[1])}</b></span>`).join("");
   $("meternote").textContent = `${pct(th.metered_share || 0)} des requêtes tombent sur le compteur qui s'épuise. Les tours de la racine passent par son propre abonnement : ce qu'elle fait elle-même ne coûte rien sur la contrainte qui mord.`;
 
-  const series = th.series || [];
+  // Cent vingt colonnes tiennent sur un écran large et font deux pixels sur un
+  // téléphone, où il n'y a ni survol ni patience pour viser.
+  const series = (th.series || []).slice(window.innerWidth < 700 ? -40 : -120);
   const smax = Math.max(...series.map(p => p.req), 1);
   $("rpmbars").innerHTML = series.map(p => {
     const served = Math.max(0, p.req - p.ref);
@@ -485,6 +513,25 @@ function render(d){
   $("rpmnote").textContent = measured
     ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. Une minute entièrement servie est loin du plafond ; une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
     : "Le journal n'a appris à écrire l'heure qu'aujourd'hui : cette série commence au premier redémarrage après ça.";
+
+  const sr = sw.stop_reasons || {};
+  const srTotal = Object.values(sr).reduce((a, v) => a + v, 0);
+  if (srTotal) {
+    rows($("stopreasons"), [
+      {k:"a fini son tour", v:sr.end_turn||0, t:n(sr.end_turn||0), smax:srTotal, c:"--s3"},
+      {k:"appelle un outil", v:sr.tool_use||0, t:n(sr.tool_use||0), smax:srTotal, c:"--s1"},
+      {k:"coupé (max_tokens)", v:sr.max_tokens||0, t:n(sr.max_tokens||0), smax:srTotal, c:"--s2"},
+    ]);
+    $("stopnote").textContent = `sur ${n(srTotal)} tours dont le journal note le verdict.`
+      + (sr.max_tokens ? ` ${n(sr.max_tokens)} réponses tronquées, qu'un client a pu stocker comme complètes.` : "");
+  } else {
+    $("stopnote").textContent = "Aucun verdict d'arrêt sur cette période.";
+  }
+
+  const codes = Object.entries(inc.failure_codes || {}).sort((a,b) => b[1]-a[1]);
+  $("failcodes").innerHTML = codes.length
+    ? codes.map(([k,v]) => `<tr><td>${esc(k)}</td><td class="n">${n(v)}</td></tr>`).join("")
+    : `<tr><td colspan="2" style="color:var(--ink-3)">aucun échec amont sur cette période</td></tr>`;
 
   const days = (cp.retention_by_day || []).slice(-14);
   if (days.length) {
@@ -557,7 +604,13 @@ function render(d){
     {k:"envoyé (max)", v:at.max, t:big(at.max), smax:cmax, c:"--s3"},
   ]);
   const ratio = bt.p50 ? (1 - at.p50/bt.p50) : 0;
-  $("compactnote").textContent = `${n(cp.count)} compactions, ${n(cp.summary_failures)} résumés échoués. La conversation médiane est réduite de ${pct(ratio)} avant d'être envoyée — SWE-2 n'accepte que 262 144 tokens.`;
+  const lost = (cp.no_summary || 0) + (cp.summary_failures || 0);
+  $("compactnote").textContent = `${n(cp.count)} compactions. `
+    + (cp.no_summary
+        ? `${n(cp.no_summary)} sans résumé possible, ${n(cp.blocks_lost)} blocs perdus — l'agent a repris sans le milieu de son run. `
+        : "")
+    + (cp.stale_summary ? `${n(cp.stale_summary)} avec un résumé non étendu. ` : "")
+    + `${n(cp.summary_failures)} échecs de l'ancienne forme. La conversation médiane est réduite de ${pct(ratio)} avant d'être envoyée — SWE-2 n'accepte que 262 144 tokens.`;
 
   const ua = inc.unparseable_tool_args || {};
   const items = [
@@ -580,7 +633,10 @@ function render(d){
   const atBottom = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 30;
   feed.innerHTML = (d.tail || []).map(l => {
     let c = "";
-    if (/error|failed|truncated|unparseable|Traceback/i.test(l)) c = "e";
+    // Une compaction qui renonce fait perdre à l'agent le milieu de son run.
+    // Elle était grise, comme une note de routine.
+    if (/no summary available|blocks unsummarised|uncovered turns/i.test(l)) c = "e";
+    else if (/error|failed|truncated|unparseable|Traceback/i.test(l)) c = "e";
     else if (/rate limited|holding|switching|permission_denied|WARNING/i.test(l)) c = "w";
     else if (/compaction|repaired/i.test(l)) c = "m";
     else if (/listening|credentials/i.test(l)) c = "g";

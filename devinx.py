@@ -247,6 +247,9 @@ _stats = {}
 _ISO_BOUND = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d)?$")
 
 
+_STAMPED = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d ")
+
+
 def _log_tail(n):
     """The last non-routine log lines, for the live activity panel.
 
@@ -266,8 +269,19 @@ def _log_tail(n):
     if start and lines:
         # The seek landed mid-line; only then is the first one a fragment.
         lines = lines[1:]
-    skip = ("upstream conn:", "upstream first-frame:", "route=")
-    keep = [l for l in lines if l and not l.startswith(skip)]
+    # The stamp comes off before the match. Adding it in front of every line
+    # silently disarmed this filter — every line now started with "2026-" and
+    # none of them started with "upstream conn:", so the panel meant to show
+    # what is worth seeing has been showing raw traffic since the day the log
+    # learned to write the time.
+    skip = ("upstream conn:", "upstream first-frame:", "upstream done:", "route=")
+    keep = []
+    for l in lines:
+        if not l:
+            continue
+        body = _STAMPED.sub("", l, count=1)
+        if not body.startswith(skip):
+            keep.append(l)
     return keep[-n:]
 
 
@@ -1227,7 +1241,8 @@ def summarise_turns(messages, model, system, previous=None):
         # Every credential is already blocked. Try one anyway: the block is a
         # local estimate of when a limit resets, not a fact.
         acct = accounts()[0] if accounts() else None
-    for _ in range(len(accounts()) + 1):
+    tries = 0
+    for _ in range(len(accounts()) + NETWORK_RETRIES + 1):
         texts, err = [], None
         for msg, e in chat_stream(req, acct):
             if e:
@@ -1237,7 +1252,20 @@ def summarise_turns(messages, model, system, previous=None):
                 texts.append(msg.delta_text)
         if not err:
             return "".join(texts).strip() or None
+        if any(t in err for t in _TRANSIENT) and tries < NETWORK_RETRIES:
+            # The turn path retries a dropped connection; this one did not, and
+            # gave up on the first reset. Measured live: three agents in a row
+            # lost 232 blocks apiece to "no summary available" while the log
+            # showed nothing but ConnectionResetError beside it. A summary
+            # abandoned costs the agent the middle of its run; a second attempt
+            # costs a second.
+            tries += 1
+            print(f"summary: {err[:60]}, retrying ({tries}/{NETWORK_RETRIES})",
+                  flush=True)
+            time.sleep(1.0 * tries)
+            continue
         if "resource_exhausted" not in err:
+            print(f"summary: giving up on {err[:80]}", flush=True)
             return None
         # Both limits are per account, so another credential is a switch and
         # not a wait — and this call must never wait: it is already the pause
@@ -2720,7 +2748,14 @@ class Handler(BaseHTTPRequestHandler):
         payload["service"] = {"build": BUILD, "pid": os.getpid(), "port": PORT,
                               "inflight": busy, "started": _STARTED,
                               "uptime": round(time.time() - _STARTED),
-                              "accounts": [a["name"] for a in _accounts]}
+                              "accounts": [
+                                  {"name": a["name"],
+                                   # The live answer to "is the upstream
+                                   # refusing work", which the log can only
+                                   # reconstruct after the fact.
+                                   "blocked_for": max(0, round(
+                                       a.get("blocked_until", 0) - time.time()))}
+                                  for a in _accounts]}
         payload["tail"] = _log_tail(60)
         self.send_json(200, payload)
 

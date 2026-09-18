@@ -61,6 +61,7 @@ RE_HOLD = re.compile(r"holding the turn for (\d+)s")
 RE_QUOTA = re.compile(r"Reached (.+?) rate limit")
 RE_RESET = re.compile(r"reset in (\d+) (minute|second)s?\b")
 RE_COMPACT = re.compile(STAMP + r"compaction: (\d+) -> (\d+) tokens")
+RE_DROPPED = re.compile(r"dropping (\d+) blocks unsummarised")
 RE_BIGTOOL = re.compile(STAMP + r"WARNING: (\d+) tool calls in one turn: (.*)$")
 RE_TOOLNAME = re.compile(r"'([^']+)': (\d+)")
 RE_UNPARSEABLE = re.compile(STAMP + r"tool call (\S+) has unparseable arguments")
@@ -113,7 +114,11 @@ def collect(path, since=None, until=None):
         "switches": 0, "holds": 0, "held_seconds": 0, "budget": 0,
         "bursts": [], "cur_burst": 0,
         "comp_count": 0, "comp_fail": 0, "before": [], "after": [],
+        "comp_nosummary": 0, "comp_blocks_lost": 0, "comp_stale": 0,
+        "comp_uncovered": 0,
         "relay": defaultdict(Counter),
+        "fail_codes": Counter(),
+        "done_spans": [],
         "conn_reset": 0, "chunked": 0, "net_retries": 0,
         "truncated": 0, "client_disc": 0,
         "unparseable": 0, "unparseable_by_tool": Counter(),
@@ -192,6 +197,12 @@ def collect(path, since=None, until=None):
                         i, o = int(m.group(4)), int(m.group(5))
                         cr, cw = int(m.group(6)), int(m.group(7))
                         st["turns_ok"] += 1
+                        if at:
+                            # [fin - latence, fin] : le seul intervalle que le
+                            # journal donne vraiment. Compter les conn sans les
+                            # done fuit — une conn abandonnée ne se ferme jamais.
+                            end = datetime.fromisoformat(at).timestamp()
+                            st["done_spans"].append((end - lat, end))
                         if st["cur_burst"]:
                             st["bursts"].append(st["cur_burst"])
                             st["cur_burst"] = 0
@@ -221,6 +232,16 @@ def collect(path, since=None, until=None):
                             refusal(m.group(1), m.group(3), minute)
                         else:
                             st["turns_failed"] += 1
+                            # "prompt is too long" is a compaction defect and
+                            # "unimplemented" is an upstream one; both were
+                            # landing in the same anonymous total.
+                            detail = (m.group(3) or "").strip()
+                            code = m.group(2)
+                            if "too long" in detail.lower():
+                                code += ": prompt trop long"
+                            elif detail:
+                                code += ": " + detail.split("(trace")[0].strip()[:60]
+                            st["fail_codes"][code] += 1
                 elif line.startswith("upstream rate limited"):
                     if "switching to" in line:
                         st["switches"] += 1
@@ -267,6 +288,16 @@ def collect(path, since=None, until=None):
                         st["after"].append(after)
                         if at and before:
                             st["retention_day"][at[:10]].append(100.0 * after / before)
+                    elif "no summary available" in line:
+                        # Le pire résultat : l'agent perd le milieu de son run.
+                        st["comp_nosummary"] += 1
+                        m2 = RE_DROPPED.search(line)
+                        if m2:
+                            st["comp_blocks_lost"] += int(m2.group(1))
+                    elif "could not be extended" in line:
+                        st["comp_stale"] += 1
+                    elif "uncovered turns to fit" in line:
+                        st["comp_uncovered"] += 1
                     elif "summary call failed" in line:
                         st["comp_fail"] += 1
                     # "more turns summarised" and "nothing droppable" are
@@ -304,6 +335,38 @@ def collect(path, since=None, until=None):
     return st
 
 
+def _concurrency(spans):
+    """How many upstream calls were open at once, by sweep over their intervals.
+
+    This is the figure that answers "how many agents can I run": the header's
+    in-flight count is a single instant, and the request rate says nothing
+    about how many conversations produced it.
+    """
+    if not spans:
+        return {"peak": 0, "p50": 0, "p90": 0, "peak_at": None}
+    events = []
+    for a, b in spans:
+        events.append((a, 1))
+        events.append((b, -1))
+    events.sort()
+    cur = best = 0
+    best_at = None
+    samples = []
+    for t, delta in events:
+        cur += delta
+        samples.append(cur)
+        if cur > best:
+            best, best_at = cur, t
+    samples.sort()
+    return {
+        "peak": best,
+        "peak_at": (datetime.fromtimestamp(best_at).isoformat(timespec="seconds")
+                    if best_at else None),
+        "p50": samples[len(samples) // 2],
+        "p90": samples[min(int(len(samples) * 0.9), len(samples) - 1)],
+    }
+
+
 def _throughput(st, swe_total=0):
     """What a request-metered quota actually asks: how close to the ceiling.
 
@@ -329,6 +392,7 @@ def _throughput(st, swe_total=0):
         "relayed": relayed,
         "metered_share": (round(swe_total / (swe_total + relayed), 3)
                           if swe_total + relayed else 0),
+        "concurrency": _concurrency(st["done_spans"]),
         "first": st["first_stamp"],
         "last": st["last_stamp"],
         "req_per_min": {
@@ -469,6 +533,12 @@ def main():
             "retention_by_day": _retention_days(st),
             "count": st["comp_count"],
             "summary_failures": st["comp_fail"],
+            # Trois issues distinctes, pas une. La première est une perte de
+            # contexte pour l'agent, les deux autres une dégradation.
+            "no_summary": st["comp_nosummary"],
+            "blocks_lost": st["comp_blocks_lost"],
+            "stale_summary": st["comp_stale"],
+            "uncovered_dropped": st["comp_uncovered"],
             "before_tokens": {
                 "p50": pct(st["before"], 0.5),
                 "p90": pct(st["before"], 0.9),
@@ -487,6 +557,7 @@ def main():
             "network_retries": st["net_retries"],
             "stream_truncated": st["truncated"],
             "client_disconnected": st["client_disc"],
+            "failure_codes": dict(st["fail_codes"].most_common(8)),
             "unparseable_tool_args": {
                 "total": st["unparseable"],
                 "by_tool": dict(st["unparseable_by_tool"]),
