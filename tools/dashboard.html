@@ -277,6 +277,25 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
   </div>
 </div>
 
+<h2>Coût et réparations</h2>
+<div class="grid g3">
+  <div class="card">
+    <h3>Temps jusqu'à la première trame</h3>
+    <div class="rows" id="ttfb"></div>
+    <div class="note">La file d'attente à l'amont, séparée du temps de génération. Quand les refus reviennent, c'est le capteur le plus précoce.</div>
+  </div>
+  <div class="card">
+    <h3>Ce que coûte la compaction</h3>
+    <dl class="kv" id="summarykv"></dl>
+    <div class="note" id="summarynote"></div>
+  </div>
+  <div class="card">
+    <h3>Ce que le proxy répare</h3>
+    <div class="rows" id="repairs"></div>
+    <div class="note" id="repairsnote"></div>
+  </div>
+</div>
+
 <h2>Verdicts et échecs</h2>
 <div class="grid g2">
   <div class="card">
@@ -325,6 +344,7 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
     <h3>Incidents</h3>
     <div class="tw"><table><thead><tr><th>type</th><th class="n">nombre</th><th class="n">état</th></tr></thead>
       <tbody id="incidents"></tbody></table></div>
+    <div class="note" id="incnote"></div>
   </div>
 </div>
 
@@ -426,7 +446,15 @@ function render(d){
 
   const total = (sw.turns_ok || 0) + (sw.turns_failed || 0) + (rl.total || 0);
   $("h-turns").textContent = n(sw.turns_ok);
-  $("h-turns-sub").textContent = `${n(sw.turns_failed)} échecs · ${n(total)} tentatives`;
+  const cs = inc.client_status || {};
+  const clientErr = Object.entries(cs).filter(([k]) => k !== "200")
+                          .reduce((a, [,v]) => a + v, 0);
+  const clientAll = Object.values(cs).reduce((a, v) => a + v, 0);
+  // turns_failed compte des tentatives amont, dont certaines réessayées avec
+  // succès : ce n'est pas ce que le client a vu échouer.
+  $("h-turns-sub").textContent = clientAll
+    ? `${n(total)} tentatives amont · ${n(clientErr)} tours rendus en erreur au client`
+    : `${n(sw.turns_failed)} tentatives échouées · ${n(total)} tentatives`;
   $("h-tokens").textContent = big((tk.input||0) + (tk.output||0) + (tk.cache_read||0));
   $("h-tokens-sub").textContent =
     `${big(tk.cache_read)} cache · ${big(tk.input)} entrée · ${big(tk.output)} sortie`;
@@ -449,14 +477,14 @@ function render(d){
 
   $("bymodel").innerHTML = Object.entries(sw.by_model || {})
     .sort((a,b) => b[1].turns - a[1].turns)
-    .map(([k,v]) => `<tr><td>${esc(k)}</td><td class="n">${n(v.turns)}</td>
+    .map(([k,v]) => `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td class="n">${n(v.turns)}</td>
       <td class="n">${big(v.input)}</td><td class="n">${big(v.output)}</td></tr>`).join("");
 
   $("byacct").innerHTML = Object.entries(sw.by_account || {})
     .sort((a,b) => b[1].turns - a[1].turns)
     .map(([k,v]) => { const t = v.turns + v.refusals, r = t ? v.refusals/t : 0;
       const cls = r > .15 ? "crit" : r > .02 ? "warn" : "ok";
-      return `<tr><td>${esc(k)}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
+      return `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
         <td class="n"><span class="pill ${cls}">${pct(r)}</span></td></tr>`; }).join("");
 
   // débit — la seule question qu'un quota compté en requêtes pose vraiment
@@ -486,7 +514,7 @@ function render(d){
     `<div style="width:${100*(m[1]||0)/msum}%;background:var(${m[2]})" title="${esc(m[0])} : ${n(m[1])}"></div>`).join("");
   $("meterlegend").innerHTML = meters.map(m =>
     `<span><i style="background:var(${m[2]})"></i>${esc(m[0])} <b>${big(m[1])}</b></span>`).join("");
-  $("meternote").textContent = `${pct(th.metered_share || 0)} des requêtes tombent sur le compteur qui s'épuise. Les tours de la racine passent par son propre abonnement : ce qu'elle fait elle-même ne coûte rien sur la contrainte qui mord.`;
+  $("meternote").textContent = `Environ ${Math.round(100*(th.metered_share||0))} % des requêtes tombent sur le compteur qui s'épuise — approximatif, les deux jambes ne comptent pas tout à fait la même chose : tentatives amont d'un côté, réponses rendues de l'autre. Les tours de la racine passent par son propre abonnement : ce qu'elle fait elle-même ne coûte rien sur la contrainte qui mord.`;
 
   // Cent vingt colonnes tiennent sur un écran large et font deux pixels sur un
   // téléphone, où il n'y a ni survol ni patience pour viser.
@@ -514,6 +542,36 @@ function render(d){
     ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. Une minute entièrement servie est loin du plafond ; une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
     : "Le journal n'a appris à écrire l'heure qu'aujourd'hui : cette série commence au premier redémarrage après ça.";
 
+  const ff = d.first_frame || {};
+  const ffmax = Math.max(ff.max || 1, 1);
+  const lgf = v => Math.log10(Math.max(1, v || 1));
+  rows($("ttfb"), [
+    {k:"médiane", v:ff.p50, t:dur(ff.p50), scale:lgf(ff.p50), smax:lgf(ffmax), c:"--s3"},
+    {k:"p90", v:ff.p90, t:dur(ff.p90), scale:lgf(ff.p90), smax:lgf(ffmax), c:"--s1"},
+    {k:"p99", v:ff.p99, t:dur(ff.p99), scale:lgf(ff.p99), smax:lgf(ffmax), c:"--s4"},
+    {k:"la plus lente", v:ff.max, t:dur(ff.max), scale:lgf(ffmax), smax:lgf(ffmax), c:"--s2"},
+  ]);
+
+  const sc = d.summary_calls || {}, rly = d.relay_latency || {};
+  $("summarykv").innerHTML = [
+    ["appels de résumé", n(sc.count)],
+    ["temps passé dedans", `${dur(sc.seconds)}${sc.mean_seconds ? " · " + dur(sc.mean_seconds) + " en moyenne" : ""}`],
+    ["tokens dépensés", big(sc.tokens)],
+    ["compactions", n(cp.count)],
+    ["conversations vues", n(d.conversations_seen)],
+    ["latence des tours relayés", rly.n ? `${dur(rly.p50)} · p90 ${dur(rly.p90)}` : "—"],
+  ].map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  $("summarynote").textContent = sc.count
+    ? "Des requêtes sur le compteur contraint qu'aucun agent n'a demandées : c'est la pause qu'il paie pour ne pas mourir à la limite de contexte."
+    : "Rien encore : ce marquage date du build en cours, les appels antérieurs sont comptés comme des tours d'agent.";
+
+  const rep = Object.entries(inc.repairs || {}).sort((a,b) => b[1]-a[1]);
+  const repmax = Math.max(...rep.map(([,v]) => v), 1);
+  rows($("repairs"), rep.map(([k,v],i) => ({k, v, t:n(v), smax:repmax, c:SERIES[i%4]})));
+  $("repairsnote").textContent = rep.length
+    ? "Des formes que le client envoie et que l'amont n'accepte pas. Chaque ligne est une panne évitée, pas un incident."
+    : "Rien à réparer sur cette période.";
+
   const sr = sw.stop_reasons || {};
   const srTotal = Object.values(sr).reduce((a, v) => a + v, 0);
   if (srTotal) {
@@ -532,6 +590,13 @@ function render(d){
   $("failcodes").innerHTML = codes.length
     ? codes.map(([k,v]) => `<tr><td>${esc(k)}</td><td class="n">${n(v)}</td></tr>`).join("")
     : `<tr><td colspan="2" style="color:var(--ink-3)">aucun échec amont sur cette période</td></tr>`;
+
+  const bigturns = inc.big_tool_turns || [];
+  const ubt = (inc.unparseable_tool_args || {}).by_tool || {};
+  const extra = [];
+  if (bigturns.length) extra.push(`${n(bigturns.length)} tour(s) à plus de 30 appels, le plus gros à ${bigturns[0].calls ?? bigturns[0]} — du parallélisme, pas un flux mal assemblé, tant que les noms varient.`);
+  if (Object.keys(ubt).length) extra.push(`arguments illisibles par outil : ${Object.entries(ubt).map(([k,v]) => `${esc(k)} ${v}`).join(", ")}.`);
+  $("incnote").textContent = extra.join(" ");
 
   const days = (cp.retention_by_day || []).slice(-14);
   if (days.length) {
@@ -553,13 +618,15 @@ function render(d){
   const w = rl.wait_seconds || {}, b = rl.bursts || {};
   $("rlkv").innerHTML = [
     ["bascules de compte", n(rl.switches)],
-    ["tours tenus en attente", n(rl.holds)],
+    // Des événements, pas des tours : un tour tenu deux fois compte deux fois.
+    ["mises en attente", n(rl.hold_events ?? rl.holds)],
+    ["pire tour garé", dur(rl.worst_turn_parked)],
     ["attente tenue (annoncée)", dur(rl.held_seconds_total)],
-    ["budget d'attente épuisé", n(rl.budget_exhausted)],
-    ["rafales", n(b.count)],
+    ["rendus en erreur après attente", n(rl.budget_exhausted)],
+    ["rafales", `${n(b.count)} · médiane ${n(b.median_length)}`],
     ["plus longue rafale", n(b.longest) + " refus"],
     ["attente annoncée (médiane)", dur(w.p50)],
-    ["attente annoncée (max)", dur(w.max)],
+    ["attente annoncée (p90 / max)", `${dur(w.p90)} / ${dur(w.max)}`],
   ].map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 
   const lat = sw.latency || {};
@@ -612,15 +679,22 @@ function render(d){
     + (cp.stale_summary ? `${n(cp.stale_summary)} avec un résumé non étendu. ` : "")
     + `${n(cp.summary_failures)} échecs de l'ancienne forme. La conversation médiane est réduite de ${pct(ratio)} avant d'être envoyée — SWE-2 n'accepte que 262 144 tokens.`;
 
-  const ua = inc.unparseable_tool_args || {};
+  const uaa = inc.unparseable_tool_args || {};
+  const relay = (d.relay || {}).claude || {};
   const items = [
     ["connexions coupées", inc.connection_reset, 0],
     ["flux interrompus", inc.chunked_encoding, 0],
     ["reprises réseau", inc.network_retries, -1],
     ["flux tronqués", inc.stream_truncated, 0],
     ["client déconnecté", inc.client_disconnected, 0],
-    ["arguments d'outil illisibles", ua.total, 0],
-    ["relais Claude en 429", (d.relay||{}).claude?.["429"], 0],
+    ["arguments d'outil illisibles", uaa.total, 0],
+    ["compactions sans résumé", cp.no_summary, 0],
+    // La jambe relayée n'était visible que par ses 429 ; le reste de sa santé
+    // se passait sous le radar.
+    ["relais Claude en 429", relay["429"], 0],
+    ["relais Claude épuisé (RetryError)", relay.RetryError, 0],
+    ["relais Claude abandonné par le client", relay.client_disconnected, 0],
+    ["relais Claude en 400", relay["400"], 0],
   ];
   $("incidents").innerHTML = items.map(([k,v,inv]) => {
     v = v || 0;
@@ -651,17 +725,18 @@ function render(d){
     ["Le tour le plus long", dur(sw.latency?.max),
      "un seul appel, du départ à la dernière trame"],
     ["Le tour le plus chargé", `${big(fun.busiest_single_turn?.input)} tokens`,
-     `en entrée, plus ${big(fun.busiest_single_turn?.output)} en sortie — un autre tour que le plus long`],
+     `en entrée, plus ${big(fun.busiest_single_turn?.output)} en sortie, en ${
+       dur(fun.busiest_single_turn?.latency)} — un autre tour que le plus long`],
     ["Plus grosse requête envoyée", `${n(sw.request_kb?.max)} Ko`,
-     `la médiane est à ${n(sw.request_kb?.p50)} Ko`],
+     `médiane ${n(sw.request_kb?.p50)} Ko · p90 ${n(sw.request_kb?.p90)} Ko`],
     ["Volume total transféré", `${n(sw.request_kb?.total_mb)} Mo`,
      "en corps de requêtes, compression comprise"],
     ["Conversation la plus longue", `${n(sw.messages_per_request?.max)} messages`,
-     `médiane : ${n(sw.messages_per_request?.p50)}`],
+     `médiane ${n(sw.messages_per_request?.p50)} · p90 ${n(sw.messages_per_request?.p90)}`],
     ["Tokens par heure d'appel", big(fun.tokens_per_hour_of_calls),
      "entrée, sortie et cache confondus, rapportés au temps passé en ligne"],
     ["Redémarrages du service", n(lg.restarts),
-     `${(lg.builds||[]).length} versions différentes servies`],
+     `${n(lg.clean_drains)} bascules propres · ${(lg.builds||[]).length} versions servies`],
     ["Taille du journal", `${((lg.bytes||0)/1048576).toFixed(1).replace(".",",")} Mo`,
      `${n(lg.lines)} lignes analysées à chaque rafraîchissement`],
     ["Attente annoncée cumulée", dur(rl.wait_seconds?.announced_total),

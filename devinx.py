@@ -1033,8 +1033,16 @@ def build_request(body, tool_desc_cap=None):
     return req, model
 
 
-def chat_stream(req, acct=None):
-    """Yield (GetChatMessageResponse, None) per frame or (None, error) on trailer."""
+def chat_stream(req, acct=None, purpose="turn"):
+    # Bound to the frame that logs it, so the two lines of one call agree.
+    """Yield (GetChatMessageResponse, None) per frame or (None, error) on trailer.
+
+    `purpose` separates an agent's own turn from the extra call compaction
+    makes for itself. Both are ordinary requests on the metered quota and were
+    indistinguishable in the log, so the summariser's cost was counted as agent
+    work and its latency — the pause every compacted agent pays mid-turn — was
+    invisible.
+    """
     if acct is None:
         acct = accounts()[0]
     jwt, base = get_jwt(acct)
@@ -1077,9 +1085,13 @@ def chat_stream(req, acct=None):
                   flush=True)
             yield None, f"upstream {status}: {detail}"
             return
+        # conv= is the cascade id, which is derived from the conversation and
+        # stable across its turns: the join key the log never had. Without one,
+        # nothing interleaved can be attributed to a run after the fact.
         print(f"upstream conn: {time.time() - t_start:.1f}s to headers "
               f"(acct={acct['name']} model={req.chat_model_uid} {n_msgs} msgs, "
-              f"{len(body) // 1024}KB req)", flush=True)
+              f"{len(body) // 1024}KB req, purpose={purpose} "
+              f"conv={(req.cascade_id or '?')[:12]})", flush=True)
         buf = b""
         first_frame = True
         end_of_stream = False
@@ -1242,15 +1254,18 @@ def summarise_turns(messages, model, system, previous=None):
         # local estimate of when a limit resets, not a fact.
         acct = accounts()[0] if accounts() else None
     tries = 0
+    t0 = time.time()
     for _ in range(len(accounts()) + NETWORK_RETRIES + 1):
         texts, err = [], None
-        for msg, e in chat_stream(req, acct):
+        for msg, e in chat_stream(req, acct, purpose="summary"):
             if e:
                 err = e
                 break
             if msg.delta_text:
                 texts.append(msg.delta_text)
         if not err:
+            print(f"summary done: latency={time.time() - t0:.1f}s "
+                  f"chars={sum(len(t) for t in texts)}", flush=True)
             return "".join(texts).strip() or None
         if any(t in err for t in _TRANSIENT) and tries < NETWORK_RETRIES:
             # The turn path retries a dropped connection; this one did not, and
@@ -2032,6 +2047,7 @@ def run_swe(body, wfile, make_stream=None):
                 # from the client is impossible.
                 print(f"upstream done: stop={_stop_reason(stop, bool(tool_order))}"
                       f"/{stop} calls={len(tool_order)} "
+                      f"purpose=turn conv={(req.cascade_id or '?')[:12]} "
                       f"latency={latency:.1f}s "
                       f"usage in={usage.get('input_tokens', 0)} "
                       f"out={usage.get('output_tokens', 0)} "
@@ -2992,6 +3008,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def serve_swe(self, body):
         stream = bool(body.get("stream"))
+        started = time.time()
+        # What the client actually got. Until now only the relayed route logged
+        # at this boundary, so the SWE route's own figures were upstream
+        # attempts — several of which can belong to one client turn, and some of
+        # which are retried to success. The two were being read as one number.
+        outcome = "200"
         try:
             if stream:
                 # run_swe owns the raw socket once it has written anything; it
@@ -2999,22 +3021,28 @@ class Handler(BaseHTTPRequestHandler):
                 _, err = run_swe(body, self.wfile)
                 if err:
                     kind, status, message, wait = anthropic_error(err, body)
+                    outcome = str(status)
                     self.send_error_json(status, kind, message, wait)
             else:
                 resp, err = run_swe(body, None)
                 if err:
                     kind, status, message, wait = anthropic_error(err, body)
+                    outcome = str(status)
                     self.send_error_json(status, kind, message, wait)
                 else:
                     self.send_json(200, resp)
         except (BrokenPipeError, ConnectionResetError):
+            outcome = "client_disconnected"
             print("client disconnected mid-stream", flush=True)
         except Exception as e:
+            outcome = type(e).__name__
             print(f"route=swe model={body.get('model')} status={type(e).__name__}: {e}",
                   flush=True)
             if not stream:
                 self.send_error_json(502, "api_error", str(e))
         finally:
+            print(f"route=swe model={resolve_model(body)} status={outcome} "
+                  f"in {time.time() - started:.1f}s", flush=True)
             self.close_connection = True
 
     def serve_swe_responses(self, body):
@@ -3035,6 +3063,7 @@ class Handler(BaseHTTPRequestHandler):
             run_swe(translated, self.wfile,
                     lambda w, m: ResponsesStream(w, m, custom))
         except (BrokenPipeError, ConnectionResetError):
+            outcome = "client_disconnected"
             print("client disconnected mid-stream", flush=True)
         except Exception as e:
             print(f"route=swe-responses model={body.get('model')} "
@@ -3047,6 +3076,7 @@ class Handler(BaseHTTPRequestHandler):
         caller's credential; this process adds nothing of its own."""
         response = None
         response_started = False
+        relay_started = time.time()
         try:
             headers = {name: value for name, value in self.headers.items()
                        if name.lower() not in REQUEST_EXCLUDED}
@@ -3079,13 +3109,16 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
             if tap is not None:
                 tap.close()
-            print(f"route={label} model={model} status={response.status_code}",
+            print(f"route={label} model={model} status={response.status_code} "
+                  f"in {time.time() - relay_started:.1f}s",
                   flush=True)
         except (BrokenPipeError, ConnectionResetError):
-            print(f"route={label} model={model} status=client_disconnected",
+            print(f"route={label} model={model} status=client_disconnected "
+                  f"in {time.time() - relay_started:.1f}s",
                   flush=True)
         except requests.RequestException as error:
-            print(f"route={label} model={model} status={type(error).__name__}",
+            print(f"route={label} model={model} status={type(error).__name__} "
+                  f"in {time.time() - relay_started:.1f}s",
                   flush=True)
             if not response_started:
                 self.send_error_json(502, "api_error", "Upstream unavailable")

@@ -507,7 +507,7 @@ class SummaryResilienceTests(unittest.TestCase):
     def test_a_rate_limited_summary_moves_to_the_other_credential(self):
         seen = []
 
-        def flaky(req, acct=None):
+        def flaky(req, acct=None, purpose="turn"):
             seen.append(acct and acct.get("name"))
             if len(seen) == 1:
                 yield None, "upstream trailer error: resource_exhausted: Reached"

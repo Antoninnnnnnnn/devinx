@@ -33,7 +33,7 @@ import os
 import re
 import statistics
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # DEVINX_LOG exists so the extractor can be checked against a frozen copy of
 # the live, ever-appending log; the default is the real path.
@@ -49,10 +49,12 @@ RE_STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d) ")
 STAMP_LEN = len("2026-09-17T22:00:00 ")
 
 RE_CONN = re.compile(
-    STAMP + r"upstream conn: [\d.]+s to headers "
-    r"\((?:acct=(\S+) )?(?:model=(\S+) )?(\d+) msgs, (\d+)KB req\)")
+    STAMP + r"upstream conn: ([\d.]+)s to headers "
+    r"\((?:acct=(\S+) )?(?:model=(\S+) )?(\d+) msgs, (\d+)KB req"
+    r"(?:, purpose=(\w+) conv=(\S+))?\)")
 RE_DONE = re.compile(
     STAMP + r"upstream done: (?:stop=([a-z_]+)/\d+ calls=(\d+) )?"
+    r"(?:purpose=(\w+) conv=(\S+) )?"
     r"latency=([\d.]+)s usage in=(\d+) out=(\d+) cr=(\d+) cw=(\d+)")
 RE_TRAILER = re.compile(
     STAMP + r"upstream trailer error(?: on (\S+))?: (\w+)(?:: ?(.*))?$")
@@ -65,7 +67,11 @@ RE_DROPPED = re.compile(r"dropping (\d+) blocks unsummarised")
 RE_BIGTOOL = re.compile(STAMP + r"WARNING: (\d+) tool calls in one turn: (.*)$")
 RE_TOOLNAME = re.compile(r"'([^']+)': (\d+)")
 RE_UNPARSEABLE = re.compile(STAMP + r"tool call (\S+) has unparseable arguments")
-RE_ROUTE = re.compile(STAMP + r"route=(\S+) model=\S+ status=(\S+)")
+RE_ROUTE = re.compile(STAMP + r"route=(\S+) model=\S+ status=(\S+)"
+                      r"(?: in ([\d.]+)s)?")
+RE_FIRSTFRAME = re.compile(STAMP + r"upstream first-frame: ([\d.]+)s")
+RE_HELD_SO_FAR = re.compile(r"\((\d+)s waited so far\)")
+RE_SUMMARY_DONE = re.compile(r"^summary done: latency=([\d.]+)s")
 RE_BUILD = re.compile(r"\(build ([0-9a-f]+),")
 RE_UPSTREAM_ERR = re.compile(STAMP + r"upstream ([A-Z]\w+):")
 
@@ -118,6 +124,11 @@ def collect(path, since=None, until=None):
         "comp_uncovered": 0,
         "relay": defaultdict(Counter),
         "fail_codes": Counter(),
+        "ttfb": [], "conversations": set(),
+        "summary_calls": 0, "summary_seconds": 0.0, "summary_tokens": 0,
+        "held_so_far": [], "relay_latency": [],
+        "drains": 0, "client_status": Counter(),
+        "repairs": Counter(),
         "done_spans": [],
         "conn_reset": 0, "chunked": 0, "net_retries": 0,
         "truncated": 0, "client_disc": 0,
@@ -186,16 +197,26 @@ def collect(path, since=None, until=None):
                         st["per_min_req"][minute] += 1
                     m = RE_CONN.match(line)
                     if m:
-                        st["msgs"].append(int(m.group(3)))
-                        st["kb"].append(int(m.group(4)))
-                        last_acct, last_model = m.group(1), m.group(2)
+                        st["ttfb"].append(float(m.group(1)))
+                        st["msgs"].append(int(m.group(4)))
+                        st["kb"].append(int(m.group(5)))
+                        last_acct, last_model = m.group(2), m.group(3)
+                        last_purpose = m.group(6) or "turn"
+                        if m.group(7):
+                            st["conversations"].add(m.group(7))
+                        if last_purpose == "summary":
+                            st["summary_calls"] += 1
                 elif line.startswith("upstream done:"):
                     m = RE_DONE.match(line)
                     if m:
                         stop, calls = m.group(1), m.group(2)
-                        lat = float(m.group(3))
-                        i, o = int(m.group(4)), int(m.group(5))
-                        cr, cw = int(m.group(6)), int(m.group(7))
+                        purpose = m.group(3) or "turn"
+                        lat = float(m.group(5))
+                        i, o = int(m.group(6)), int(m.group(7))
+                        cr, cw = int(m.group(8)), int(m.group(9))
+                        if purpose == "summary":
+                            st["summary_seconds"] += lat
+                            st["summary_tokens"] += i + o + cr
                         st["turns_ok"] += 1
                         if at:
                             # [fin - latence, fin] : le seul intervalle que le
@@ -252,6 +273,14 @@ def collect(path, since=None, until=None):
                         if h:
                             st["holds"] += 1
                             st["held_seconds"] += int(h.group(1))
+                            w = RE_HELD_SO_FAR.search(line)
+                            if w:
+                                # The running total a turn had already waited.
+                                # Its largest value is the real cost of the
+                                # worst parked turn; the hold count is events,
+                                # and one turn can produce several.
+                                st["held_so_far"].append(int(w.group(1))
+                                                         + int(h.group(1)))
                 elif line.startswith("upstream HTTP "):
                     m = RE_HTTP.match(line)
                     if m:
@@ -321,6 +350,26 @@ def collect(path, since=None, until=None):
                     m = RE_ROUTE.match(line)
                     if m:
                         st["relay"][m.group(1)][m.group(2).rstrip(":")] += 1
+                        if m.group(1) == "swe":
+                            # What the client actually received, as opposed to
+                            # how many upstream attempts it took to get there.
+                            st["client_status"][m.group(2).rstrip(":")] += 1
+                        elif m.group(3):
+                            st["relay_latency"].append(float(m.group(3)))
+                elif line.startswith("summary done:"):
+                    m = RE_SUMMARY_DONE.match(line)
+                    if m:
+                        st["summary_seconds"] += float(m.group(1))
+                elif line.startswith("devinx: draining complete"):
+                    st["drains"] += 1
+                elif line.startswith("unflattened:"):
+                    st["repairs"]["conversations remises à plat"] += 1
+                elif "role system sent upstream" in line:
+                    st["repairs"]["messages system transportés"] += 1
+                elif line.startswith("mid-conv-system: declining"):
+                    st["repairs"]["capacité system déclinée"] += 1
+                elif line.startswith("repaired tool ids"):
+                    st["repairs"]["identifiants d'outil réparés"] += 1
                 elif line.startswith("devinx listening"):
                     st["restarts"] += 1
                     b = RE_BUILD.search(line)
@@ -377,8 +426,16 @@ def _throughput(st, swe_total=0):
     req, ref = st["per_min_req"], st["per_min_ref"]
     minutes = sorted(req)
     counts = [req[m] for m in minutes]
-    recent = minutes[-60:]
-    rec_req = sum(req[m] for m in recent)
+    # Sixty wall-clock minutes back from the last line, not the last sixty
+    # minutes that happened to carry traffic: after an idle gap the second
+    # reading silently stretches past an hour and reports the activity of
+    # whenever the fleet was last busy as if it were now.
+    recent = []
+    if minutes:
+        end = datetime.fromisoformat(minutes[-1] + ":00")
+        for i in range(60):
+            recent.append((end - timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M"))
+    rec_req = sum(req.get(m, 0) for m in recent)
     rec_ref = sum(ref.get(m, 0) for m in recent)
     served = [req[m] - ref.get(m, 0) for m in minutes]
     relayed = sum(st["relay"][r].total() if hasattr(st["relay"][r], "total")
@@ -405,7 +462,9 @@ def _throughput(st, swe_total=0):
         "recent_60min": {
             "requests": rec_req, "refusals": rec_ref,
             "refusal_share": round(rec_ref / rec_req, 3) if rec_req else 0,
-            "req_per_min": round(rec_req / len(recent), 1) if recent else 0,
+            # Divided by sixty, always: idle minutes are part of the hour.
+            "req_per_min": round(rec_req / 60.0, 1) if recent else 0,
+            "idle_minutes": sum(1 for m in recent if not req.get(m)),
         },
         "series": [{"at": m, "req": req[m], "ref": ref.get(m, 0)}
                    for m in minutes[-120:]],
@@ -470,6 +529,7 @@ def main():
             "lines": st["lines"],
             "bytes": st["bytes"],
             "restarts": st["restarts"],
+            "clean_drains": st["drains"],
             "builds": st["builds"],
         },
         "swe": {
@@ -510,6 +570,29 @@ def main():
         },
         "throughput": _throughput(st, st["turns_ok"] + st["turns_failed"]
                                    + st["rl_total"]),
+        "summary_calls": {
+            # The extra request compaction makes for itself: on the metered
+            # quota, in the request rate and in the token totals, asked for by
+            # no agent. Only counted for lines that carry purpose=.
+            "count": st["summary_calls"],
+            "seconds": round(st["summary_seconds"], 1),
+            "tokens": st["summary_tokens"],
+            "mean_seconds": round(st["summary_seconds"] / st["summary_calls"], 1)
+                if st["summary_calls"] else 0,
+        },
+        "conversations_seen": len(st["conversations"]),
+        "first_frame": {
+            "p50": round(pct(st["ttfb"], 0.5), 1),
+            "p90": round(pct(st["ttfb"], 0.9), 1),
+            "p99": round(pct(st["ttfb"], 0.99), 1),
+            "max": round(max(st["ttfb"]), 1) if st["ttfb"] else 0,
+        },
+        "relay_latency": {
+            "p50": round(pct(st["relay_latency"], 0.5), 1),
+            "p90": round(pct(st["relay_latency"], 0.9), 1),
+            "max": round(max(st["relay_latency"]), 1) if st["relay_latency"] else 0,
+            "n": len(st["relay_latency"]),
+        },
         "rate_limits": {
             "total": st["rl_total"],
             "by_quota": dict(st["by_quota"]),
@@ -520,7 +603,9 @@ def main():
                 "announced_total": sum(st["waits"]),
             },
             "switches": st["switches"],
+            "hold_events": st["holds"],
             "holds": st["holds"],
+            "worst_turn_parked": max(st["held_so_far"], default=0),
             "held_seconds_total": st["held_seconds"],
             "budget_exhausted": st["budget"],
             "bursts": {
@@ -558,6 +643,8 @@ def main():
             "stream_truncated": st["truncated"],
             "client_disconnected": st["client_disc"],
             "failure_codes": dict(st["fail_codes"].most_common(8)),
+            "repairs": dict(st["repairs"]),
+            "client_status": dict(st["client_status"]),
             "unparseable_tool_args": {
                 "total": st["unparseable"],
                 "by_tool": dict(st["unparseable_by_tool"]),
