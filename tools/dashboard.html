@@ -27,10 +27,11 @@
   --ink:#f1f3f6; --ink-2:#aab2bd; --ink-3:#727c88;
   --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
 }
-*{box-sizing:border-box}
-html,body{margin:0}
+*{box-sizing:border-box;min-width:0}
+html,body{margin:0;overflow-x:hidden;width:100%}
 body{background:var(--ground);color:var(--ink);font-family:var(--sans);
-  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
+  overflow-wrap:anywhere}
 .wrap{max-width:1260px;margin:0 auto;padding:0 20px 64px}
 a{color:var(--s1)}
 
@@ -64,14 +65,7 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-
   min-height:2px;background:none}
 .bars .col > div{border-radius:2px 2px 0 0;min-height:0}
 .bars .col:hover{opacity:.75}
-@media (max-width:900px){.g4,.g3,.g2{grid-template-columns:repeat(2,1fr)}
-.g1{grid-template-columns:1fr}
-/* Une colonne empilée par minute : refusé au-dessus de servi, même échelle. */
-.bars.tall{height:130px;gap:1px}
-.bars .col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;
-  min-height:2px;background:none}
-.bars .col > div{border-radius:2px 2px 0 0;min-height:0}
-.bars .col:hover{opacity:.75}}
+@media (max-width:900px){.g4,.g3,.g2{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:560px){.g4,.g3,.g2{grid-template-columns:1fr}}
 
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
@@ -438,13 +432,17 @@ function render(d){
   const keys = Object.keys(hist).map(Number).sort((a,b)=>a-b).slice(0, 21);
   const hmax = Math.max(...keys.map(k => hist[k]), 1);
   const hsum = keys.reduce((a,k) => a + hist[k], 0);
+  // A gap in the keys is marked with a hairline on the left edge instead of a
+  // margin: a margin is not flexible and does not shrink with its neighbours,
+  // so on a narrow screen the fixed extra width it adds can push the row
+  // past the viewport. box-shadow paints inside the box's own width.
+  const gapmark = "box-shadow:-6px 0 0 -5px var(--ink-3)";
   $("toolbars").innerHTML = keys.map((k,i) =>
     `<div style="height:${Math.max(2, 100*hist[k]/hmax)}%${
-      i && k > keys[i-1] + 1 ? ";margin-left:10px" : ""}"
+      i && k > keys[i-1] + 1 ? ";" + gapmark : ""}"
       title="${hist[k]} tours à ${k} appel(s)"></div>`).join("");
   $("toolaxis").innerHTML = keys.map((k,i) =>
-    `<div style="${i && k > keys[i-1] + 1 ? "margin-left:10px" : ""}">${
-      (i===0||i===keys.length-1||k%5===0)?k:""}</div>`).join("");
+    `<div>${(i===0||i===keys.length-1||k%5===0)?k:""}</div>`).join("");
   $("toolnote").textContent = `Médiane ${h.p50 ?? 0} appel(s), maximum observé ${h.max ?? 0}, sur ${n(hsum)} tours — les seuls dont le journal note le nombre d'appels, sur ${n(sw.turns_ok)} réussis. Les valeurs absentes creusent un écart dans l'axe. Un éventail de noms est du parallélisme normal ; un seul nom répété des centaines de fois serait un flux mal assemblé.`;
 
   const bt = cp.before_tokens || {}, at = cp.after_tokens || {};
