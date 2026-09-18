@@ -146,6 +146,26 @@ td.n,th.n{text-align:right;font-family:var(--mono)}
 .kv dd{margin:0;font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
 footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);
   font-size:12px;color:var(--ink-3);display:flex;gap:16px;flex-wrap:wrap}
+.ranges{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:18px}
+.ranges .seg{display:flex;flex-wrap:wrap;gap:0;border:1px solid var(--line);
+  border-radius:8px;overflow:hidden;background:var(--surface)}
+.ranges .seg button{background:none;border:0;border-right:1px solid var(--line);
+  color:var(--ink-2);font:inherit;font-size:12px;padding:6px 12px;cursor:pointer}
+.ranges .seg button:last-child{border-right:0}
+.ranges .seg button:hover{background:var(--surface-2)}
+.ranges .seg button[aria-pressed="true"]{background:var(--s1);color:#fff;font-weight:600}
+.ranges .seg button:focus-visible{outline:2px solid var(--s1);outline-offset:-2px}
+.ranges .custom{display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+  font-size:12px;color:var(--ink-3)}
+.ranges input[type="datetime-local"]{font:inherit;font-size:12px;
+  font-family:var(--mono);color:var(--ink);background:var(--surface);
+  border:1px solid var(--line);border-radius:6px;padding:5px 8px;max-width:100%}
+.ranges .win{flex-basis:100%;font-size:12px;color:var(--ink-3);
+  font-family:var(--mono)}
+.ranges .win.warn{color:var(--warn)}
+@media (max-width:560px){.ranges .seg{width:100%}
+  .ranges .seg button{flex:1;padding:8px 6px}}
+
 button.t{background:none;border:1px solid var(--line);color:var(--ink-2);
   border-radius:6px;padding:4px 9px;font:inherit;font-size:11.5px;cursor:pointer}
 button.t:hover{background:var(--surface-2)}
@@ -167,6 +187,18 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 </div></header>
 
 <div class="wrap">
+
+<div class="ranges">
+  <div class="seg" id="rangeseg" role="group" aria-label="Période"></div>
+  <div class="custom">
+    <label for="from">du</label>
+    <input type="datetime-local" id="from">
+    <label for="to">au</label>
+    <input type="datetime-local" id="to">
+    <button class="t" type="button" id="applyrange">appliquer</button>
+  </div>
+  <div class="win" id="windownote"></div>
+</div>
 
 <div class="grid g4">
   <div class="card hero"><div class="k">tours SWE-2 aboutis</div>
@@ -581,9 +613,82 @@ function render(d){
   ].map(([k,v,s]) => `<div class="card hero"><div class="k">${k}</div>
       <div class="v" style="font-size:22px">${v}</div><div class="sub">${s}</div></div>`).join("");
 
+  const win = d.window || {};
+  const note = $("windownote");
+  const span = (win.dated_from && win.dated_to)
+    ? `${win.dated_from.replace("T", " ")} → ${win.dated_to.replace("T", " ")}`
+    : "aucune ligne datée dans cette période";
+  if (win.bounded && win.undated_skipped) {
+    note.className = "win warn";
+    note.textContent = `${span} · ${n(win.undated_skipped)} lignes plus anciennes `
+      + `écartées : elles sont antérieures au 17 septembre et ne portent pas `
+      + `d'heure, donc aucune période bornée ne peut les compter.`;
+  } else {
+    note.className = "win";
+    note.textContent = win.bounded ? span
+      : `${span} pour les lignes datées, plus tout l'historique antérieur, qui `
+        + `n'a pas d'heure et n'est comptable qu'en « tout ».`;
+  }
+
   $("f-gen").textContent = "données : " + (d.generated_at || "—").replace("T", " ").slice(0, 19);
   $("f-log").textContent = lg.path || "";
 }
+
+// --- période ---------------------------------------------------------------
+// Les bornes partent telles quelles à l'extracteur, qui ne lit que des lignes
+// datées. Le journal n'écrit l'heure que depuis le 17 septembre : une période
+// bornée ne peut donc pas contenir l'historique d'avant, et la page le dit au
+// lieu de laisser croire que « 30 jours » couvre trente jours.
+const PRESETS = [
+  {id:"1h",   label:"1 h",       hours:1},
+  {id:"24h",  label:"24 h",      hours:24},
+  {id:"7d",   label:"7 jours",   hours:24*7},
+  {id:"30d",  label:"30 jours",  hours:24*30},
+  {id:"all",  label:"tout",      hours:null},
+];
+let range = {id:"all"};
+try{
+  const saved = JSON.parse(localStorage.getItem("devinx-range") || "null");
+  if (saved && (saved.id === "custom" ? (saved.since || saved.until)
+                                      : PRESETS.some(p => p.id === saved.id))) range = saved;
+}catch(e){}
+
+const pad = v => String(v).padStart(2, "0");
+const iso = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`
+  + `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+function rangeParams(){
+  if (range.id === "custom") {
+    const p = {};
+    if (range.since) p.since = range.since;
+    if (range.until) p.until = range.until;
+    return p;
+  }
+  const preset = PRESETS.find(p => p.id === range.id);
+  if (!preset || preset.hours == null) return {};
+  return {since: iso(new Date(Date.now() - preset.hours*3600*1000))};
+}
+
+function drawRanges(){
+  $("rangeseg").innerHTML = PRESETS.map(p =>
+    `<button type="button" data-id="${p.id}" aria-pressed="${
+      range.id === p.id}">${p.label}</button>`).join("");
+}
+drawRanges();
+$("rangeseg").addEventListener("click", e => {
+  const b = e.target.closest("button[data-id]");
+  if (!b) return;
+  range = {id: b.dataset.id};
+  $("from").value = ""; $("to").value = "";
+  save(); drawRanges(); tick();
+});
+$("applyrange").addEventListener("click", () => {
+  const a = $("from").value, b = $("to").value;
+  if (!a && !b) return;
+  range = {id:"custom", since: a || undefined, until: b || undefined};
+  save(); drawRanges(); tick();
+});
+function save(){ try{ localStorage.setItem("devinx-range", JSON.stringify(range)); }catch(e){} }
 
 let fails = 0, inFlight = false;
 async function tick(){
@@ -593,6 +698,7 @@ async function tick(){
     // Relative to the page, so the dashboard works both at :8316/dashboard and
     // behind a path mount such as https://<host>/devinx/dashboard.
     const url = new URL("api/stats", location.href.replace(/\/dashboard\/?$/, "/"));
+    for (const [k, v] of Object.entries(rangeParams())) url.searchParams.set(k, v);
     const r = await fetch(url, {cache:"no-store", signal: AbortSignal.timeout(20000)});
     if(!r.ok) throw new Error(r.status);
     const d = await r.json();

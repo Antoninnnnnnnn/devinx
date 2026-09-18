@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from http.cookiejar import DefaultCookiePolicy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -241,7 +242,9 @@ _capability_lock = threading.Lock()
 _capability_refusals = {}
 
 _stats_lock = threading.Lock()
-_stats = {"at": 0.0, "data": None, "error": None, "running": False}
+# One snapshot per requested window, keyed by the extractor arguments.
+_stats = {}
+_ISO_BOUND = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d)?$")
 
 
 def _log_tail(n):
@@ -2634,6 +2637,32 @@ class Handler(BaseHTTPRequestHandler):
                 entry["multi_agent_version"] = MULTI_AGENT_SURFACE
         return rows + upstream
 
+    @staticmethod
+    def stats_window(query):
+        """The requested window, validated before it can reach a command line.
+
+        These two values become argv entries of a subprocess. They are checked
+        against the exact shape of the log's own timestamps and nothing else
+        gets through — a range picker is not a reason to widen what this
+        process will execute on someone's behalf.
+        """
+        out = []
+        for name in ("since", "until"):
+            raw = (parse_qs(query).get(name) or [""])[0].strip()
+            if not raw:
+                continue
+            if not _ISO_BOUND.match(raw):
+                return None
+            try:
+                # The shape gate is what keeps this out of a command line; this
+                # second one only spares the user a window that silently
+                # matches nothing, like the 99th of month 13.
+                datetime.fromisoformat(raw)
+            except ValueError:
+                return None
+            out += [f"--{name}", raw]
+        return out
+
     def serve_stats(self):
         """Live figures for the dashboard.
 
@@ -2641,19 +2670,29 @@ class Handler(BaseHTTPRequestHandler):
         own shape and this stays decoupled from it. A short cache means ten open
         tabs cost one pass over the log, not ten.
         """
+        window = self.stats_window(urlsplit(self.path).query)
+        if window is None:
+            self.send_error_json(400, "invalid_request_error",
+                                 "since/until must look like 2026-09-18T18:00")
+            return
+        key = " ".join(window)
         now = time.time()
         with _stats_lock:
-            fresh = _stats["at"] > now - STATS_TTL
-            mine = not fresh and not _stats["running"]
+            slot = _stats.setdefault(key, {"at": 0.0, "data": None,
+                                           "error": None, "running": False})
+            fresh = slot["at"] > now - STATS_TTL
+            mine = not fresh and not slot["running"]
             if mine:
-                _stats["running"] = True
+                slot["running"] = True
         if mine:
-            # One pass at a time. Ten tabs, or one tab whose fetch outlives the
-            # poll interval, must not each spawn their own extractor.
+            # One pass at a time per window. Ten tabs on the same range cost
+            # one pass over the log, not ten; two different ranges are two
+            # different questions and cost one each.
             data, err = None, None
             try:
                 r = subprocess.run(
-                    [sys.executable, os.path.join(HERE, "tools", "log_stats.py")],
+                    [sys.executable, os.path.join(HERE, "tools", "log_stats.py")]
+                    + window,
                     capture_output=True, text=True, timeout=60)
                 data = json.loads(r.stdout) if r.returncode == 0 else None
                 if data is None:
@@ -2661,15 +2700,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 data, err = None, f"{type(e).__name__}: {e}"
             with _stats_lock:
-                _stats["at"], _stats["error"], _stats["running"] = time.time(), err, False
+                slot["at"], slot["error"], slot["running"] = time.time(), err, False
                 # A failed pass keeps the last good figures rather than
                 # replacing them with zeros that read as a healthy idle service.
                 if data is not None:
-                    _stats["data"] = data
+                    slot["data"] = data
+                if len(_stats) > 16:
+                    # Windows are user-chosen; a page that asked for a hundred
+                    # of them must not leave a hundred snapshots behind.
+                    for k in sorted(_stats, key=lambda k: _stats[k]["at"])[:8]:
+                        if k != key:
+                            _stats.pop(k, None)
         with _stats_lock:
-            payload = dict(_stats["data"] or {})
-            payload["error"] = _stats["error"]
-            payload["cached_age"] = round(time.time() - _stats["at"], 1)
+            payload = dict(slot["data"] or {})
+            payload["error"] = slot["error"]
+            payload["cached_age"] = round(time.time() - slot["at"], 1)
         with _inflight_lock:
             busy = _inflight["n"]
         payload["service"] = {"build": BUILD, "pid": os.getpid(), "port": PORT,

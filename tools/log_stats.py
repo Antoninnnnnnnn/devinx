@@ -27,6 +27,7 @@ Definitions:
     are tracked in their own sections instead.
 """
 
+import argparse
 import json
 import os
 import re
@@ -79,7 +80,27 @@ def pct(values, p):
     return s[min(int(len(s) * p), len(s) - 1)]
 
 
-def collect(path):
+def in_window(at, since, until):
+    """Is this line inside the requested window.
+
+    Only dated lines can answer. The log learned to write the time on
+    2026-09-17, so everything before that is undated and no bounded window can
+    honestly claim to contain or exclude it — asked for one, this drops it and
+    the payload says how many it dropped, rather than quietly counting twenty
+    days of history as if it had happened inside the last hour.
+    """
+    if since is None and until is None:
+        return True
+    if at is None:
+        return False
+    if since is not None and at < since:
+        return False
+    if until is not None and at > until:
+        return False
+    return True
+
+
+def collect(path, since=None, until=None):
     st = {
         "lines": 0, "bytes": 0, "restarts": 0, "builds": [],
         "turns_ok": 0, "turns_failed": 0,
@@ -105,6 +126,7 @@ def collect(path):
         "per_min_req": Counter(), "per_min_ref": Counter(),
         "retention_day": defaultdict(list),
         "first_stamp": None, "last_stamp": None,
+        "undated_skipped": 0,
     }
     seen_builds = set()
     last_acct = None
@@ -112,13 +134,7 @@ def collect(path):
 
     def stamp_of(line):
         m = RE_STAMP.match(line)
-        if not m:
-            return None
-        at = m.group(1)
-        if st["first_stamp"] is None:
-            st["first_stamp"] = at
-        st["last_stamp"] = at
-        return at
+        return m.group(1) if m else None
 
     def refusal(acct, msg, minute=None):
         if minute:
@@ -147,6 +163,16 @@ def collect(path):
             # The timestamp comes off here, once, rather than being tolerated
             # by every pattern and every startswith below it.
             at = stamp_of(raw)
+            if not in_window(at, since, until):
+                if at is None:
+                    st["undated_skipped"] += 1
+                continue
+            if at:
+                # Recorded after the window test, so the reported coverage is
+                # the coverage of what was counted and not of the whole file.
+                if st["first_stamp"] is None:
+                    st["first_stamp"] = at
+                st["last_stamp"] = at
             line = raw[STAMP_LEN:] if at else raw
             minute = at[:16] if at else None
             try:
@@ -332,8 +358,28 @@ def _retention_days(st):
     return out
 
 
+ISO = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d)?$")
+
+
+def bound(value, name):
+    """A window bound, or a refusal. Compared as a string against the log's own
+    ISO stamps, so it has to be shaped exactly like one."""
+    if value in (None, "", "all"):
+        return None
+    value = value.strip()
+    if not ISO.match(value):
+        raise SystemExit(f"{name}: expected YYYY-MM-DDTHH:MM[:SS], got {value!r}")
+    return value if len(value) > 16 else value + ":00"
+
+
 def main():
-    st = collect(LOG_PATH)
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--since", help="ISO instant; only dated lines at or after it")
+    ap.add_argument("--until", help="ISO instant; only dated lines at or before it")
+    args = ap.parse_args()
+    since = bound(args.since, "--since")
+    until = bound(args.until, "--until")
+    st = collect(LOG_PATH, since, until)
 
     lat = st["lat"]
     lat_total = sum(lat)
@@ -344,6 +390,17 @@ def main():
 
     out = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "window": {
+            "since": since,
+            "until": until,
+            # What was actually counted, which is not what was asked for: a
+            # bounded window can only contain dated lines, and the log has
+            # twenty days of undated history behind it.
+            "dated_from": st["first_stamp"],
+            "dated_to": st["last_stamp"],
+            "undated_skipped": st["undated_skipped"],
+            "bounded": bool(since or until),
+        },
         "log": {
             "path": LOG_PATH,
             "lines": st["lines"],
