@@ -59,12 +59,16 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-
 .g3{grid-template-columns:repeat(3,1fr)}
 .g2{grid-template-columns:repeat(2,1fr)}
 .g1{grid-template-columns:1fr}
-/* Une colonne empilée par minute : refusé au-dessus de servi, même échelle. */
+/* Une colonne empilée par minute : refusé au-dessus de servi, même échelle.
+   align-self:stretch est ce qui fait tenir le graphique : .bars aligne ses
+   enfants en flex-end, ce qui laisse la colonne sans hauteur définie, et une
+   hauteur en pourcentage sur ses enfants se résout alors contre rien — les
+   barres valaient zéro et le cadre restait vide. */
 .bars.tall{height:130px;gap:1px}
-.bars .col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;
-  min-height:2px;background:none}
-.bars .col > div{border-radius:2px 2px 0 0;min-height:0}
-.bars .col:hover{opacity:.75}
+.bars .col{flex:1;align-self:stretch;display:flex;flex-direction:column;
+  justify-content:flex-end;background:none}
+.bars .col > div{width:100%;border-radius:2px 2px 0 0;min-height:0}
+.bars .col:hover{opacity:.75;background:none}
 @media (max-width:900px){.g4,.g3,.g2{grid-template-columns:repeat(2,1fr)}}
 @media (max-width:560px){.g4,.g3,.g2{grid-template-columns:1fr}}
 
