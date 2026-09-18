@@ -747,18 +747,34 @@ function render(d){
   const win = d.window || {};
   const note = $("windownote");
   const span = (win.dated_from && win.dated_to)
-    ? `${win.dated_from.replace("T", " ")} → ${win.dated_to.replace("T", " ")}`
+    ? `${win.dated_from.replace("T", " ").slice(0, 16)} → ${
+        win.dated_to.replace("T", " ").slice(0, 16)}`
     : "aucune ligne datée dans cette période";
+  // Combien de temps la période couvre vraiment, contre ce qui a été demandé.
+  // Sans ça, « 30 jours » qui rend moins que « tout » sur un proxy vieux de
+  // deux semaines n'a aucun sens de l'extérieur — et c'est exactement la
+  // question qu'on m'a posée.
+  const covered = (win.dated_from && win.dated_to)
+    ? (new Date(win.dated_to) - new Date(win.dated_from)) / 1000 : 0;
+  const asked = range.id === "custom" ? null
+    : (PRESETS.find(p => p.id === range.id) || {}).hours;
   if (win.bounded && win.undated_skipped) {
     note.className = "win warn";
-    note.textContent = `${span} · ${n(win.undated_skipped)} lignes plus anciennes `
-      + `écartées : elles sont antérieures au 17 septembre et ne portent pas `
-      + `d'heure, donc aucune période bornée ne peut les compter.`;
+    note.textContent =
+      (asked ? `Période demandée : ${dur(asked*3600)}. ` : "")
+      + `Réellement couverte : ${dur(covered)} — ${span}. `
+      + `Le journal ne date ses lignes que depuis le ${
+          (win.dated_from||"").replace("T", " ").slice(0, 16)} ; les ${
+          n(win.undated_skipped)} lignes antérieures n'ont pas d'heure, donc `
+      + `aucune période bornée ne peut savoir si elles tombent dedans. Elles ne `
+      + `sont comptées qu'en « tout » — c'est tout l'écart entre les deux.`;
   } else {
     note.className = "win";
-    note.textContent = win.bounded ? span
-      : `${span} pour les lignes datées, plus tout l'historique antérieur, qui `
-        + `n'a pas d'heure et n'est comptable qu'en « tout ».`;
+    note.textContent = win.bounded
+      ? `Période couverte : ${dur(covered)} — ${span}.`
+      : `${span} pour les lignes datées, plus ${n(d.log?.lines ? d.log.lines : 0)} `
+        + `lignes d'historique antérieur sans heure. « Tout » est la seule `
+        + `période qui les compte.`;
   }
 
   $("f-gen").textContent = "données : " + (d.generated_at || "—").replace("T", " ").slice(0, 19);
