@@ -1237,7 +1237,13 @@ def summarise_turns(messages, model, system, previous=None):
     """
     body = {
         "model": model,
-        "max_tokens": 4096,
+        # Room for the model to think *and* answer. At 4096 it was spending the
+        # whole budget reasoning and emitting no text at all: 12 of the first
+        # 21 summary calls came back with zero characters, each one costing an
+        # agent the middle of its run, and the successful ones produced between
+        # 333 and 8167 characters. The failure was invisible until the call
+        # started logging what it returned.
+        "max_tokens": int(os.environ.get("DEVINX_SUMMARY_TOKENS", "16384")),
         "system": "You are summarising a coding agent's conversation so it can "
                   "continue working after its context was compacted.",
         "messages": [{"role": "user", "content": [{"type": "text", "text":
@@ -1256,17 +1262,36 @@ def summarise_turns(messages, model, system, previous=None):
     tries = 0
     t0 = time.time()
     for _ in range(len(accounts()) + NETWORK_RETRIES + 1):
-        texts, err = [], None
+        texts, thinks, err = [], [], None
         for msg, e in chat_stream(req, acct, purpose="summary"):
             if e:
                 err = e
                 break
             if msg.delta_text:
                 texts.append(msg.delta_text)
+            elif msg.delta_thinking:
+                thinks.append(msg.delta_thinking)
         if not err:
             print(f"summary done: latency={time.time() - t0:.1f}s "
-                  f"chars={sum(len(t) for t in texts)}", flush=True)
-            return "".join(texts).strip() or None
+                  f"chars={sum(len(t) for t in texts)} "
+                  f"thinking={sum(len(t) for t in thinks)}", flush=True)
+            got = "".join(texts).strip()
+            if got:
+                return got
+            if tries < NETWORK_RETRIES:
+                tries += 1
+                print(f"summary: came back empty, retrying "
+                      f"({tries}/{NETWORK_RETRIES})", flush=True)
+                continue
+            # Still nothing. The reasoning is not the summary the prompt asked
+            # for, but it is an account of the same turns — and the choice here
+            # is against losing them entirely.
+            fallback = "".join(thinks).strip()
+            if fallback:
+                print(f"summary: falling back to the reasoning "
+                      f"({len(fallback)} chars)", flush=True)
+                return fallback
+            return None
         if any(t in err for t in _TRANSIENT) and tries < NETWORK_RETRIES:
             # The turn path retries a dropped connection; this one did not, and
             # gave up on the first reset. Measured live: three agents in a row
