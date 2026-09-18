@@ -799,6 +799,13 @@ TOOL_DESC_CAPS = (None, 6000, 2500)
 # notified of anything. Bounded, because the client has its own timeout and an
 # answer that never comes is worse than one that says to try later.
 RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "600"))
+# Seconds of silence on a streaming response before a keepalive goes out. The
+# client abandons a stream that has sent nothing for five minutes — read out of
+# its own binary: max(CLAUDE_STREAM_IDLE_TIMEOUT_MS, 300000) — and reports it as
+# "The response stopped arriving". Measured here: 158 turns ended that way, at a
+# median latency of 343s. Anthropic's own API keeps a stream alive with `ping`
+# events; nothing here did. 0 disables it.
+KEEPALIVE_EVERY = int(os.environ.get("DEVINX_KEEPALIVE", "25"))
 # How many turns may be in flight on a credential that has refused something
 # recently, and for how long after that refusal the cap applies. 0 disables it.
 PACE_CONCURRENCY = int(os.environ.get("DEVINX_PACE", "4"))
@@ -1716,24 +1723,75 @@ class AnthropicStream:
         self.pending_signature = None
         self.started = False
         self.tools = {}
+        # One writer at a time: the keepalive runs on its own thread and an
+        # interleaved write would split an event in half on the wire.
+        self._wlock = threading.RLock()
+        self._last_write = time.time()
+        self._done = threading.Event()
+        self._alive = None
+
+    def arm(self):
+        """Hold the connection open while the upstream thinks.
+
+        A turn that spends four minutes reasoning before its first token sends
+        no bytes at all, and the client gives up on a stream that has been
+        silent for five. Emitting `ping` the way Anthropic's own API does costs
+        nothing and makes that silence impossible.
+
+        The first keepalive is also the point of no return: writing it commits
+        to a 200, so an upstream refusal after that is an SSE error event
+        rather than an HTTP status. That is the same trade the real API makes,
+        and it only applies to turns already slower than any retry would be.
+        """
+        if KEEPALIVE_EVERY <= 0 or self._alive is not None:
+            return
+
+        def loop():
+            while not self._done.wait(1.0):
+                if time.time() - self._last_write < KEEPALIVE_EVERY:
+                    continue
+                try:
+                    with self._wlock:
+                        if self._done.is_set():
+                            return
+                        if not self.started:
+                            self.start()
+                        else:
+                            self._send("ping", {"type": "ping"})
+                except Exception:
+                    # The client is gone, or the socket is. Either way there is
+                    # nothing left to keep alive.
+                    return
+
+        self._alive = threading.Thread(target=loop, daemon=True)
+        self._alive.start()
+
+    def release(self):
+        self._done.set()
 
     def _send(self, event, data):
-        self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
-        self.w.flush()
+        with self._wlock:
+            self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+            self.w.flush()
+            self._last_write = time.time()
 
     def start(self, usage=None):
-        if self.started:
-            return
-        self.started = True
-        self.w.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
-                     b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
-        self.w.flush()
-        self._send("message_start", {
-            "type": "message_start",
-            "message": {"id": new_message_id(), "type": "message", "role": "assistant",
-                        "model": self.model, "content": [], "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": usage or {"input_tokens": 0, "output_tokens": 0}}})
+        with self._wlock:
+            if self.started:
+                return
+            self.started = True
+            self.w.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                         b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
+            self.w.flush()
+            self._last_write = time.time()
+            self._send("message_start", {
+                "type": "message_start",
+                "message": {"id": new_message_id(), "type": "message",
+                            "role": "assistant", "model": self.model,
+                            "content": [], "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": usage or {"input_tokens": 0,
+                                               "output_tokens": 0}}})
 
     def close_block(self):
         if self.open_kind is None:
@@ -1801,6 +1859,7 @@ class AnthropicStream:
         self.tools = {}
 
     def finish(self, stop_reason, usage):
+        self.release()
         self.flush_tools()
         self.close_block()
         self._send("message_delta", {
@@ -1817,6 +1876,7 @@ class AnthropicStream:
         """End a failed stream. Deliberately no message_delta: there is no
         stop_reason that honestly describes an aborted turn, and emitting
         end_turn would tell the client the answer is complete."""
+        self.release()
         self.close_block()
         self._send("message_stop", {"type": "message_stop"})
 
@@ -1846,6 +1906,18 @@ def run_swe(body, wfile, make_stream=None):
     # Report the resolved tier, not the alias, so the tier that actually ran is
     # visible in the client.
     out = make_stream(wfile, resolve_model(body)) if stream else None
+    if out is not None:
+        out.arm()
+
+    def committed():
+        """Has anything reached the client yet.
+
+        Not the same question as "has content been emitted": the keepalive can
+        open the stream on its own while the upstream is still thinking, and
+        once a message_start is on the wire a retry would put a second one
+        there and an HTTP status is no longer expressible.
+        """
+        return emitted or (out is not None and out.started)
 
     # Cognition's input classifier denies borderline payloads nondeterministically
     # (the same body has been observed to pass and to fail). Retry while nothing
@@ -1862,6 +1934,8 @@ def run_swe(body, wfile, make_stream=None):
             # Nothing has been written yet either way, so this goes back as a
             # status the client can act on rather than as a 200 stream whose
             # only content is an error — and never as a finished turn.
+            if out is not None:
+                out.release()
             return None, f"request build: {e}"
 
         thinking, signature, texts = [], None, []
@@ -1941,7 +2015,7 @@ def run_swe(body, wfile, make_stream=None):
             err = f"upstream {type(e).__name__}: {e}"
             print(err, flush=True)
 
-        if (err and not emitted and retries < NETWORK_RETRIES
+        if (err and not committed() and retries < NETWORK_RETRIES
                 and any(t in err for t in _TRANSIENT)):
             retries += 1
             delay = 1.5 * retries
@@ -1949,7 +2023,7 @@ def run_swe(body, wfile, make_stream=None):
                   f"{delay:.0f}s ({retries}/{NETWORK_RETRIES})", flush=True)
             time.sleep(delay)
             continue
-        if err and not emitted and "resource_exhausted" in err:
+        if err and not committed() and "resource_exhausted" in err:
             # Both of Cognition's limits are per account, so another credential
             # is a switch rather than a wait. Only when every one of them is
             # spent does the turn actually have to be held.
@@ -1976,7 +2050,7 @@ def run_swe(body, wfile, make_stream=None):
             print(f"upstream rate limited and {RATE_WAIT_BUDGET}s of waiting is "
                   f"spent; handing it back", flush=True)
             break
-        if err and not emitted and attempt < 2 and "permission_denied" in err:
+        if err and not committed() and attempt < 2 and "permission_denied" in err:
             nxt = TOOL_DESC_CAPS[attempt + 1]
             print(f"upstream permission_denied, retrying (attempt "
                   f"{attempt + 2}/3, tool descriptions capped at {nxt})",
@@ -2002,11 +2076,14 @@ def run_swe(body, wfile, make_stream=None):
     usage = usage or {"input_tokens": 0, "output_tokens": 0}
 
     if out:
-        if err and not emitted:
+        if err and not committed():
             # Nothing has reached the client yet, so the failure can still be
             # what it actually is: an HTTP status the client knows how to act
             # on. Opening a 200 stream and putting the error inside it turns a
             # rate limit the client would have waited out into a dead turn.
+            # The keepalive stops first: the caller is about to put that status
+            # on this socket and a ping landing inside it would corrupt it.
+            out.release()
             return None, err
         out.start()
         if err:
@@ -2214,10 +2291,22 @@ def responses_to_messages(body):
 class ResponsesStream:
     """Emits the Codex flavour of the Responses SSE stream onto a raw socket.
 
+    No keepalive here yet, deliberately rather than by omission: the Responses
+    dialect has no `ping` event, and inventing one for a parser whose
+    tolerances are unknown risks more than the silence does. The Codex route
+    therefore keeps the exposure the Messages route just lost, and the two
+    no-ops below exist so run_swe can drive either without asking which.
+
     Event order and field names are taken from a recorded upstream stream rather
     than from the public API docs: this dialect carries output_index,
     sequence_number and item_id on every event, and Codex reads them.
     """
+
+    def arm(self):
+        pass
+
+    def release(self):
+        pass
 
     def __init__(self, wfile, model, custom_names=()):
         self.w = wfile

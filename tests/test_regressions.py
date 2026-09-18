@@ -16,6 +16,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import tempfile
 import tomllib
 import unittest
@@ -782,6 +784,71 @@ class EstimateTests(unittest.TestCase):
                        "input": {"command": self.BIG}}):
             raw, est = self._one(block)
             self.assertGreater(est, raw * 0.9, block.get("type"))
+
+
+class KeepaliveTests(unittest.TestCase):
+    """A turn that thinks for five minutes used to lose its connection.
+
+    The client abandons a stream that has sent nothing for five minutes —
+    max(CLAUDE_STREAM_IDLE_TIMEOUT_MS, 300000) in its own binary — and reports
+    "The response stopped arriving". 158 turns ended that way, at a median
+    latency of 343s. Anthropic's own API holds the line with `ping` events.
+    """
+
+    class Sock(io.RawIOBase):
+        def __init__(self):
+            self.buf = b""
+            self.lock = threading.Lock()
+
+        def write(self, b):
+            with self.lock:
+                self.buf += b
+            return len(b)
+
+        def flush(self):
+            pass
+
+    def setUp(self):
+        self._every = devinx.KEEPALIVE_EVERY
+        devinx.KEEPALIVE_EVERY = 1      # compress the clock
+        self.addCleanup(setattr, devinx, "KEEPALIVE_EVERY", self._every)
+
+    def test_a_silent_turn_holds_its_connection_open(self):
+        w = self.Sock()
+        out = devinx.AnthropicStream(w, "swe-2-max")
+        out.arm()
+        time.sleep(3.5)
+        out.release()
+        text = w.buf.decode()
+        self.assertTrue(text.startswith("HTTP/1.1 200 OK"))
+        self.assertEqual(text.count("event: message_start"), 1,
+                         "message_start was sent more than once")
+        self.assertGreaterEqual(text.count("event: ping"), 2)
+
+    def test_nothing_is_written_after_release(self):
+        w = self.Sock()
+        out = devinx.AnthropicStream(w, "swe-2-max")
+        out.arm()
+        time.sleep(1.5)
+        out.release()
+        before = len(w.buf)
+        time.sleep(2)
+        # The caller puts an HTTP status on this same socket when a turn is
+        # handed back as an error; a late ping would corrupt it.
+        self.assertEqual(len(w.buf), before)
+
+    def test_a_fast_turn_is_untouched(self):
+        w = self.Sock()
+        out = devinx.AnthropicStream(w, "swe-2-max")
+        out.arm()
+        out.start()
+        out.text("bonjour")
+        out.finish("end_turn", {"input_tokens": 1, "output_tokens": 1})
+        time.sleep(2)
+        text = w.buf.decode()
+        self.assertNotIn("event: ping", text)
+        self.assertEqual(text.count("event: message_start"), 1)
+        self.assertIn("message_stop", text)
 
 
 class MessageIdTests(unittest.TestCase):
