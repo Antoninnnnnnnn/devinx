@@ -231,8 +231,8 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 <div class="grid g3">
   <div class="card hero"><div class="k">requêtes par minute</div>
     <div class="v accent" id="h-rpm">—</div><div class="sub" id="h-rpm-sub">—</div></div>
-  <div class="card hero"><div class="k">appels simultanés au pic</div>
-    <div class="v" id="h-conc">—</div><div class="sub" id="h-conc-sub">—</div></div>
+  <div class="card hero"><div class="k">attente avant réponse</div>
+    <div class="v" id="h-wait">—</div><div class="sub" id="h-wait-sub">—</div></div>
   <div class="card hero"><div class="k">part refusée, 60 min</div>
     <div class="v" id="h-refshare">—</div><div class="sub" id="h-refshare-sub">—</div></div>
 </div>
@@ -493,11 +493,20 @@ function render(d){
     ? `médiane ${rpm.p50 ?? 0} · p90 ${rpm.p90 ?? 0} · pic ${rpm.max ?? 0}`
     : "en attente de lignes horodatées";
   const cc = th.concurrency || {};
-  $("h-conc").textContent = cc.peak ? n(cc.peak) : "—";
-  $("h-conc-sub").textContent = cc.peak
-    ? `tours ouverts en même temps · médiane ${cc.p50} · p90 ${cc.p90}${
-        cc.peak_at ? " · pic à " + cc.peak_at.slice(11, 16) : ""}`
-    : "aucun tour mesuré sur la période";
+  const rw = d.recent_wait || {};
+  // Le délai de maintenant, pas celui de la période : c'est le chiffre qu'on
+  // regarde pour savoir si ça coince à l'instant où on ouvre la page. Compté
+  // sur les vingt dernières requêtes plutôt que sur une fenêtre de secondes,
+  // qui serait vide dès que la flotte ralentit.
+  $("h-wait").textContent = rw.n ? dur(rw.median) : "—";
+  $("h-wait-sub").textContent = rw.n
+    ? `sur les ${rw.n} dernières requêtes · ${dur(rw.span_seconds)} · p90 ${
+        dur(rw.p90)}`
+    : "aucune requête récente";
+  // Vert sous 5 s, ambre jusqu'à 20, rouge au-delà : à 0,8 s l'amont répond
+  // tout de suite, à 45 il ne refuse toujours rien mais plus rien n'avance.
+  $("h-wait").style.color = !rw.n ? "" : rw.median < 5 ? "var(--good)"
+    : rw.median < 20 ? "var(--warn)" : "var(--crit)";
   $("h-refshare").textContent = measured ? pct(r60.refusal_share || 0) : "—";
   $("h-refshare-sub").textContent =
     `${n(r60.refusals)} refus sur ${n(r60.requests)} requêtes`;
@@ -534,7 +543,7 @@ function render(d){
              : ["aucune minute mesurée", ""];
   });
   $("rpmnote").textContent = measured
-    ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. La meilleure minute jamais servie est à ${n(th.served_per_min_max)} requêtes — l'amont ne dit jamais sa limite, c'est la seule approximation honnête qu'on en ait. Une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
+    ? `${n(measured)} minutes mesurées, de ${(th.first||"").replace("T"," ")} à ${(th.last||"").replace("T"," ")}. Jusqu'à ${n(cc.peak)} appels ouverts en même temps sur la période (médiane ${cc.p50}). La meilleure minute jamais servie est à ${n(th.served_per_min_max)} requêtes — l'amont ne dit jamais sa limite, c'est la seule approximation honnête qu'on en ait. Une minute où la part orange monte est une minute où des requêtes ont été payées pour rien.`
     : "Le journal n'a appris à écrire l'heure qu'aujourd'hui : cette série commence au premier redémarrage après ça.";
 
   const ff = d.first_frame || {};

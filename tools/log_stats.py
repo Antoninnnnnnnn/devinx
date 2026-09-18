@@ -147,7 +147,7 @@ def collect(path, since=None, until=None, undated=False):
         "comp_uncovered": 0,
         "relay": defaultdict(Counter),
         "fail_codes": Counter(),
-        "ttfb": [], "conversations": set(),
+        "ttfb": [], "ttfb_recent": [], "conversations": set(),
         "summary_calls": 0, "summary_seconds": 0.0, "summary_tokens": 0,
         "held_so_far": [], "relay_latency": [],
         "drains": 0, "client_status": Counter(),
@@ -226,6 +226,10 @@ def collect(path, since=None, until=None, undated=False):
                     m = RE_CONN.match(line)
                     if m:
                         st["ttfb"].append(float(m.group(1)))
+                        if at:
+                            st["ttfb_recent"].append((at, float(m.group(1))))
+                            if len(st["ttfb_recent"]) > 40:
+                                del st["ttfb_recent"][:20]
                         st["msgs"].append(int(m.group(4)))
                         st["kb"].append(int(m.group(5)))
                         last_acct, last_model = m.group(2), m.group(3)
@@ -410,6 +414,21 @@ def collect(path, since=None, until=None, undated=False):
     if st["cur_burst"]:
         st["bursts"].append(st["cur_burst"])
     return st
+
+
+def _recent_wait(rows):
+    if not rows:
+        return {"median": 0, "p90": 0, "n": 0, "span_seconds": 0, "last": None}
+    v = sorted(x[1] for x in rows)
+    span = (datetime.fromisoformat(rows[-1][0])
+            - datetime.fromisoformat(rows[0][0])).total_seconds()
+    return {
+        "median": round(statistics.median(v), 1),
+        "p90": round(v[min(int(len(v) * 0.9), len(v) - 1)], 1),
+        "n": len(v),
+        "span_seconds": round(span),
+        "last": rows[-1][0],
+    }
 
 
 def _concurrency(spans):
@@ -621,6 +640,10 @@ def main():
                 if st["summary_calls"] else 0,
         },
         "conversations_seen": len(st["conversations"]),
+        # L'attente de maintenant. Comptée en requêtes et non en secondes : à
+        # une requête par minute, une fenêtre de dix secondes est vide la
+        # plupart du temps et le chiffre clignoterait à zéro.
+        "recent_wait": _recent_wait(st["ttfb_recent"][-20:]),
         "first_frame": {
             "p50": round(pct(st["ttfb"], 0.5), 1),
             "p90": round(pct(st["ttfb"], 0.9), 1),
