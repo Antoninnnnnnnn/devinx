@@ -753,23 +753,30 @@ function render(d){
     ? (new Date(win.dated_to) - new Date(win.dated_from)) / 1000 : 0;
   const asked = range.id === "custom" ? null
     : (PRESETS.find(p => p.id === range.id) || {}).hours;
-  if (win.bounded && win.undated_skipped) {
+  const born = (win.undated_from || "").replace("T", " ").slice(0, 16);
+  const dating = (win.dated_from || "").replace("T", " ").slice(0, 16);
+  if (win.undated_included && win.undated_counted) {
+    // La période demandée englobe entièrement l'ère non datée, donc ces lignes
+    // y appartiennent : elles ont bien eu lieu entre la création du journal et
+    // le jour où il s'est mis à écrire l'heure.
+    note.className = "win";
+    note.textContent = `${span} · ${n(win.undated_counted)} lignes antérieures `
+      + `incluses : elles ne portent pas d'heure, mais elles se situent `
+      + `forcément entre la création du journal le ${born} et son premier `
+      + `horodatage le ${dating}, et la période demandée couvre tout cet `
+      + `intervalle.`;
+  } else if (win.bounded && win.undated_skipped) {
     note.className = "win warn";
     note.textContent =
       (asked ? `Période demandée : ${dur(asked*3600)}. ` : "")
-      + `Réellement couverte : ${dur(covered)} — ${span}. `
-      + `Le journal ne date ses lignes que depuis le ${
-          (win.dated_from||"").replace("T", " ").slice(0, 16)} ; les ${
-          n(win.undated_skipped)} lignes antérieures n'ont pas d'heure, donc `
-      + `aucune période bornée ne peut savoir si elles tombent dedans. Elles ne `
-      + `sont comptées qu'en « tout » — c'est tout l'écart entre les deux.`;
+      + `Couverte : ${dur(covered)} — ${span}. `
+      + `${n(win.undated_skipped)} lignes écartées : elles datent d'entre le ${
+          born} et le ${dating}, avant que le journal n'écrive l'heure, et `
+      + `cette période commence après le ${born} — elle couperait donc au `
+      + `milieu d'un bloc que rien ne permet de découper.`;
   } else {
     note.className = "win";
-    note.textContent = win.bounded
-      ? `Période couverte : ${dur(covered)} — ${span}.`
-      : `${span} pour les lignes datées, plus ${n(d.log?.lines ? d.log.lines : 0)} `
-        + `lignes d'historique antérieur sans heure. « Tout » est la seule `
-        + `période qui les compte.`;
+    note.textContent = `Période couverte : ${dur(covered)} — ${span}.`;
   }
 
   $("f-gen").textContent = "données : " + (d.generated_at || "—").replace("T", " ").slice(0, 19);

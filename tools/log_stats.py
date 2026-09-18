@@ -32,6 +32,7 @@ import json
 import os
 import re
 import statistics
+import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
@@ -87,6 +88,28 @@ def pct(values, p):
     return s[min(int(len(s) * p), len(s) - 1)]
 
 
+def log_born(path):
+    """When the log file was created, from the filesystem's birth time.
+
+    The lines written before 2026-09-17 carry no timestamp, but they are not
+    undatable: they sit between the file's creation and the first dated line,
+    and the file remembers the first of those. os.stat does not expose btime on
+    Linux, so this asks stat(1), which does.
+    """
+    try:
+        out = subprocess.run(["stat", "-c", "%w", path], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+    except Exception:
+        return None
+    if not out or out == "-":
+        return None
+    try:
+        return datetime.fromisoformat(out.split(".")[0]).isoformat(
+            timespec="seconds")
+    except ValueError:
+        return None
+
+
 def in_window(at, since, until):
     """Is this line inside the requested window.
 
@@ -107,7 +130,7 @@ def in_window(at, since, until):
     return True
 
 
-def collect(path, since=None, until=None):
+def collect(path, since=None, until=None, undated=False):
     st = {
         "lines": 0, "bytes": 0, "restarts": 0, "builds": [],
         "turns_ok": 0, "turns_failed": 0,
@@ -142,7 +165,7 @@ def collect(path, since=None, until=None):
         "per_min_req": Counter(), "per_min_ref": Counter(),
         "retention_day": defaultdict(list),
         "first_stamp": None, "last_stamp": None,
-        "undated_skipped": 0,
+        "undated_skipped": 0, "undated_counted": 0,
     }
     seen_builds = set()
     last_acct = None
@@ -179,7 +202,12 @@ def collect(path, since=None, until=None):
             # The timestamp comes off here, once, rather than being tolerated
             # by every pattern and every startswith below it.
             at = stamp_of(raw)
-            if not in_window(at, since, until):
+            if at is None and undated:
+                # The whole undated era falls inside the window, so these lines
+                # belong in it. They cannot be placed on a minute, so only the
+                # per-minute series leaves them out.
+                st["undated_counted"] += 1
+            elif not in_window(at, since, until):
                 if at is None:
                     st["undated_skipped"] += 1
                 continue
@@ -502,7 +530,15 @@ def main():
     args = ap.parse_args()
     since = bound(args.since, "--since")
     until = bound(args.until, "--until")
-    st = collect(LOG_PATH, since, until)
+    born = log_born(LOG_PATH)
+    # The undated block is a prefix of the file, running from its creation to
+    # the first dated line. A window contains it only if it starts at or before
+    # that creation and has no upper bound cutting through it — otherwise the
+    # block would have to be split, and nothing in it says where.
+    undated = bool(born and since and until is None and since <= born)
+    if since is None and until is None:
+        undated = True
+    st = collect(LOG_PATH, since, until, undated)
 
     lat = st["lat"]
     lat_total = sum(lat)
@@ -522,6 +558,10 @@ def main():
             "dated_from": st["first_stamp"],
             "dated_to": st["last_stamp"],
             "undated_skipped": st["undated_skipped"],
+            "undated_counted": st["undated_counted"],
+            "undated_included": undated,
+            "undated_from": born,
+            "undated_to": st["first_stamp"] if undated else None,
             "bounded": bool(since or until),
         },
         "log": {
