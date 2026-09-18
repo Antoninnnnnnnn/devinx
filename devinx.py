@@ -3143,7 +3143,19 @@ def drain_and_exit(srv):
     accepting, not a request to stop.
     """
     def handler(signum, frame):
-        threading.Thread(target=srv.shutdown, daemon=True).start()
+        def close_the_door():
+            # shutdown() only stops the accept loop. The listening socket stays
+            # open, and with SO_REUSEPORT the kernel keeps handing it new
+            # connections — which nobody accepts, so they sit in the backlog
+            # until the client times out. Measured in production: a draining
+            # process blackholed /api/hello for as long as it lived. The socket
+            # has to be closed for the kernel to stop choosing this listener;
+            # connections already accepted are on their own sockets and finish
+            # normally.
+            srv.shutdown()
+            srv.server_close()
+
+        threading.Thread(target=close_the_door, daemon=True).start()
         deadline = time.time() + DRAIN_SECONDS
         while time.time() < deadline:
             with _inflight_lock:
