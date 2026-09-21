@@ -19,7 +19,10 @@ import sys
 import threading
 import time
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python 3.10, tests only
+    import tomli as tomllib
 import unittest
 from unittest import mock
 
@@ -330,6 +333,12 @@ class FlattenedConversationTests(unittest.TestCase):
         patcher = mock.patch.object(devinx, "summarise_turns", fake)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Real uncovered blocks are now tracked by content; the old counter
+        # accidentally carried old results twice. Use a budget that actually
+        # fills with the new blocks in this fixture, keeping the same assertions.
+        budget = mock.patch.object(devinx, "COMPACT_AT", 100000)
+        budget.start()
+        self.addCleanup(budget.stop)
 
     @staticmethod
     def _body(pairs):
@@ -514,7 +523,13 @@ class SummaryResilienceTests(unittest.TestCase):
                 return
             yield self._Msg(), None
 
-        with mock.patch.object(devinx, "chat_stream", flaky), \
+        fake_accounts = [
+            {"name": "test-a", "blocked_until": 0},
+            {"name": "test-b", "blocked_until": 0},
+        ]
+        with mock.patch.object(devinx, "_accounts", fake_accounts), \
+             mock.patch.object(devinx, "_turn", {"n": 0}), \
+             mock.patch.object(devinx, "chat_stream", flaky), \
              mock.patch.object(devinx, "build_request", lambda b, **k: (None, None)):
             out = devinx.summarise_turns(
                 [{"role": "user", "content": [{"type": "text", "text": "x"}]}],
@@ -598,7 +613,8 @@ class UnknownRoleTests(unittest.TestCase):
             {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
             {"role": "system", "content": [{"type": "text", "text": "MARKER-B"}]},
         ]}
-        req, _ = devinx.build_request(body)
+        with mock.patch.object(devinx, "api_key", return_value="test-only"):
+            req, _ = devinx.build_request(body)
         wire = str(req)
         self.assertIn("MARKER-A", wire)
         self.assertIn("MARKER-B", wire)

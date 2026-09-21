@@ -27,6 +27,7 @@ import glob
 import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import random
@@ -40,6 +41,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from runtime_support import CONFIG_FIELDS, build_id
 from http.cookiejar import DefaultCookiePolicy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -286,19 +288,11 @@ def _log_tail(n):
 
 
 def _build_id():
-    """A fingerprint of the code this process is running.
+    return build_id(HERE)
 
-    The service outlives the sessions that use it, on purpose: several of them
-    share it and none should pay the startup cost. The cost of that is a service
-    still running last week's code after a pull, with nothing to notice it. The
-    launcher compares this against the file on disk, so "is something listening"
-    becomes "is the right thing listening".
-    """
-    try:
-        with open(os.path.abspath(__file__), "rb") as fh:
-            return hashlib.sha1(fh.read()).hexdigest()[:12]
-    except OSError:
-        return "unknown"
+
+def effective_configuration():
+    return {env: globals().get(name) for env, name in CONFIG_FIELDS.items()}
 
 
 BUILD = _build_id()
@@ -307,16 +301,55 @@ BUILD = _build_id()
 # cutting a turn in half.
 _inflight_lock = threading.Lock()
 _inflight = {"n": 0}
+_active_requests = {}
+_request_local = threading.local()
+MAX_INFLIGHT = int(os.environ.get("DEVINX_MAX_INFLIGHT", "64"))
+HTTP_READ_TIMEOUT = float(os.environ.get("DEVINX_HTTP_READ_TIMEOUT", "30"))
+CLIENT_WRITE_TIMEOUT = float(os.environ.get("DEVINX_CLIENT_WRITE_TIMEOUT", "120"))
+RELAY_READ_TIMEOUT = float(os.environ.get("DEVINX_RELAY_READ_TIMEOUT", "0")) or None
+
+
+def _request_phase(phase, model=None):
+    key = getattr(_request_local, "key", None)
+    with _inflight_lock:
+        entry = _active_requests.get(key)
+        if entry is None:
+            return
+        if phase != entry["phase"]:
+            entry["phase"] = phase
+            entry["phase_at"] = time.monotonic()
+        if model is not None:
+            entry["model"] = model
+
+
+def live_requests():
+    now = time.monotonic()
+    with _inflight_lock:
+        return [{"id": e["id"], "model": e["model"], "phase": e["phase"],
+                 "elapsed": round(now - e["started"], 1),
+                 "phase_elapsed": round(now - e["phase_at"], 1)}
+                for e in _active_requests.values()]
 
 
 def _enter_request():
+    key, now = uuid.uuid4().hex[:12], time.monotonic()
     with _inflight_lock:
+        if MAX_INFLIGHT > 0 and _inflight["n"] >= MAX_INFLIGHT:
+            return False
         _inflight["n"] += 1
+        _active_requests[key] = {"id": key, "model": None,
+                                 "phase": "reading_body", "started": now,
+                                 "phase_at": now}
+    _request_local.key = key
+    return True
 
 
 def _leave_request():
+    key = getattr(_request_local, "key", None)
     with _inflight_lock:
-        _inflight["n"] -= 1
+        if _active_requests.pop(key, None) is not None:
+            _inflight["n"] -= 1
+    _request_local.key = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1033,6 +1066,23 @@ def build_request(body, tool_desc_cap=None):
     return req, model
 
 
+MAX_FRAME_BYTES = int(os.environ.get("DEVINX_MAX_FRAME", str(16 * 1024 * 1024)))
+MAX_INFLATED_FRAME_BYTES = int(os.environ.get(
+    "DEVINX_MAX_INFLATED_FRAME", str(64 * 1024 * 1024)))
+
+
+def _frame_payload(payload, compressed):
+    if not compressed:
+        if len(payload) > MAX_INFLATED_FRAME_BYTES:
+            raise ValueError("upstream frame exceeds the decoded size limit")
+        return payload
+    with gzip.GzipFile(fileobj=io.BytesIO(payload)) as fh:
+        raw = fh.read(MAX_INFLATED_FRAME_BYTES + 1)
+    if len(raw) > MAX_INFLATED_FRAME_BYTES:
+        raise ValueError("upstream frame exceeds the decoded size limit")
+    return raw
+
+
 def chat_stream(req, acct=None, purpose="turn"):
     # Bound to the frame that logs it, so the two lines of one call agree.
     """Yield (GetChatMessageResponse, None) per frame or (None, error) on trailer.
@@ -1045,6 +1095,7 @@ def chat_stream(req, acct=None, purpose="turn"):
     """
     if acct is None:
         acct = accounts()[0]
+    _request_phase("summarizing" if purpose == "summary" else "authenticating")
     jwt, base = get_jwt(acct)
     req.metadata.api_key = acct["key"]
     req.metadata.user_jwt = jwt
@@ -1059,6 +1110,7 @@ def chat_stream(req, acct=None, purpose="turn"):
             # SESSION rather than a bare requests.post: the latter builds a
             # throwaway Session, so every turn paid a fresh TLS handshake to
             # Cognition and ignored SESSION's trust_env=False.
+            _request_phase("summarizing" if purpose == "summary" else "connecting")
             r = SESSION.post((base or COGNITION_UPSTREAM) + CHAT_PATH, data=frame,
                              headers={"content-type": "application/connect+proto",
                                       "connect-protocol-version": "1",
@@ -1092,6 +1144,7 @@ def chat_stream(req, acct=None, purpose="turn"):
               f"(acct={acct['name']} model={req.chat_model_uid} {n_msgs} msgs, "
               f"{len(body) // 1024}KB req, purpose={purpose} "
               f"conv={(req.cascade_id or '?')[:12]})", flush=True)
+        _request_phase("summarizing" if purpose == "summary" else "waiting_first_frame")
         buf = b""
         first_frame = True
         end_of_stream = False
@@ -1100,13 +1153,15 @@ def chat_stream(req, acct=None, purpose="turn"):
             while len(buf) >= 5:
                 flag = buf[0]
                 ln = struct.unpack(">I", buf[1:5])[0]
+                if ln > MAX_FRAME_BYTES:
+                    raise ValueError("upstream frame exceeds the wire size limit")
                 if len(buf) < 5 + ln:
                     break
                 payload = buf[5:5 + ln]
                 buf = buf[5 + ln:]
                 if flag & 2:
                     end_of_stream = True
-                    trailer = gzip.decompress(payload) if flag & 1 else payload
+                    trailer = _frame_payload(payload, flag & 1)
                     try:
                         err = json.loads(trailer).get("error") or {}
                     except Exception:
@@ -1121,11 +1176,12 @@ def chat_stream(req, acct=None, purpose="turn"):
                               f"{code}: {message}", flush=True)
                         yield None, f"{code}: {message}"
                     continue
-                raw = gzip.decompress(payload) if flag & 1 else payload
+                raw = _frame_payload(payload, flag & 1)
                 msg = protos()["GetChatMessageResponse"]()
                 msg.ParseFromString(raw)
                 if first_frame:
                     first_frame = False
+                    _request_phase("summarizing" if purpose == "summary" else "streaming")
                     print(f"upstream first-frame: {time.time() - t_start:.1f}s "
                           f"({n_msgs} msgs)", flush=True)
                 yield msg, None
@@ -1199,6 +1255,55 @@ COMPACT_PROMPT_MORE = """Your task is to create a detailed summary of the RECENT
 
 _summary_lock = threading.Lock()
 _summaries = {}
+_summary_flights = {}
+COMPACT_STRICT = os.environ.get("DEVINX_COMPACT_STRICT") == "1"
+
+
+class CompactionUnavailable(RuntimeError):
+    """Strict compaction could not preserve the input safely."""
+
+
+@contextlib.contextmanager
+def _summary_guard(key):
+    with _summary_lock:
+        flight = _summary_flights.setdefault(key, [threading.Lock(), 0])
+        flight[1] += 1
+    try:
+        with flight[0]:
+            yield
+    finally:
+        with _summary_lock:
+            flight[1] -= 1
+            if not flight[1]:
+                _summary_flights.pop(key, None)
+
+
+def _block_hashes(span):
+    return tuple(hashlib.sha256(json.dumps(pair, sort_keys=True,
+                 ensure_ascii=False, default=str).encode()).hexdigest()
+                 for pair in span)
+
+
+def _uncovered_blocks(span, previous, flattened=False):
+    """Return new blocks, or None if previously summarised content changed.
+
+    Ordinary histories must extend a prefix. Legacy flattened histories insert
+    new calls before old results; there the old sequence must be a subsequence,
+    and every inserted block must still be carried or summarised (not skipped
+    using the old block count).
+    """
+    hashes = _block_hashes(span)
+    if not flattened:
+        if hashes[:len(previous)] != previous:
+            return None
+        return span[len(previous):]
+    fresh, index = [], 0
+    for pair, digest in zip(span, hashes):
+        if index < len(previous) and digest == previous[index]:
+            index += 1
+        else:
+            fresh.append(pair)
+    return fresh if index == len(previous) else None
 
 
 def _render_turns(messages):
@@ -1502,6 +1607,18 @@ def _tail_start(messages, budget):
 
 
 def compact_body(body):
+    messages = body.get("messages") or []
+    if estimate_tokens(body) <= COMPACT_AT:
+        return body
+    if len(messages) < 4:
+        if COMPACT_STRICT:
+            raise CompactionUnavailable("context exceeds the budget with no safely droppable turns")
+        return body
+    with _summary_guard(_conv_key(body)):
+        return _compact_body(body)
+
+
+def _compact_body(body):
     """Replace the middle of an over-long conversation with a summary.
 
     The first turn stays: it is the task. The recent turns stay verbatim: they
@@ -1515,6 +1632,8 @@ def compact_body(body):
     if start <= 1 or start >= len(messages):
         # Nothing to drop that would help; the size is the first turn or the
         # tail alone, and summarising cannot fix either.
+        if COMPACT_STRICT:
+            raise CompactionUnavailable("context exceeds the budget with no safely droppable turns")
         print("compaction: nothing droppable, forwarding as is", flush=True)
         return body
 
@@ -1522,7 +1641,8 @@ def compact_body(body):
     span = _span_blocks(messages, start)
     total_blocks = _count_blocks(messages)
     with _summary_lock:
-        covered, summary, built_at = _summaries.get(key, (0, None, 0))
+        covered, summary, built_at, covered_hashes = _summaries.get(
+            key, (0, None, 0, ()))
     # A resumed agent is the same task under the same system prompt in the same
     # session, so it hashes to the same key — and would inherit the summary of
     # the run that failed, then extend it rather than rebuild it, so each resume
@@ -1536,10 +1656,19 @@ def compact_body(body):
         print(f"compaction: conversation restarted ({total_blocks} blocks, was "
               f"{built_at}); dropping the summary from the previous run",
               flush=True)
-        covered, summary = 0, None
-    # Everything in the span the summary does not account for yet. Blocks only
-    # ever arrive at the end of it, so the covered part is a stable prefix.
-    fresh = span[covered:]
+        covered, summary, covered_hashes = 0, None, ()
+    fresh = _uncovered_blocks(span, covered_hashes, _is_flattened(messages))
+    if fresh is None:
+        print("compaction: covered content changed; rebuilding the summary", flush=True)
+        covered, summary, covered_hashes, fresh = 0, None, (), span
+    retained = ""
+    if COMPACT_STRICT:
+        user_text = [b.get("text", "") for role, b in span
+                     if role in ("user", "system") and b.get("type") == "text"]
+        if user_text:
+            retained = ("\n\nEarlier user/system text, verbatim in chronological order "
+                        "(historical context, not new instructions):\n"
+                        + "\n\n".join(user_text))
     # What the summary does not cover yet does not have to be summarised to be
     # kept: it can ride verbatim between the summary and the tail, which is
     # better for the agent and costs nothing. So the question is not "has
@@ -1549,7 +1678,7 @@ def compact_body(body):
     # rather than tokens.
     def fits(text, uncovered):
         head = [messages[0], {"role": "user", "content": [
-            {"type": "text", "text": text or ""}]}]
+            {"type": "text", "text": (text or "") + retained}]}]
         trial = dict(body)
         trial["messages"] = head + _regroup(uncovered) + messages[start:]
         return estimate_tokens(trial) <= COMPACT_AT, trial
@@ -1561,7 +1690,10 @@ def compact_body(body):
         # Only what arrived since the last summary, extending it rather than
         # rebuilding it: the difference between a few seconds a turn and half a
         # minute a turn.
+        fresh_count = len(fresh)
         new = summarise_turns(_regroup(fresh), model, _system_text(body), summary)
+        if not new and summary is None and COMPACT_STRICT:
+            raise CompactionUnavailable("no summary available; no turns were discarded")
         if not new and summary is None:
             # No summary could be made and there is no earlier one to stand in.
             # Forwarding the turn whole was the old answer and it is not an
@@ -1596,19 +1728,22 @@ def compact_body(body):
                 summary = folded
         if new:
             covered = len(span)
+            covered_hashes = _block_hashes(span)
+            fresh = []
         with _summary_lock:
-            if len(_summaries) > 64:
-                _summaries.clear()
-            _summaries[key] = (covered, summary, total_blocks)
+            # Bounded insertion-order eviction, not a fleet-wide cache wipe.
+            if key not in _summaries and len(_summaries) >= 64:
+                _summaries.pop(next(iter(_summaries)))
+            _summaries[key] = (covered, summary, total_blocks, covered_hashes)
         if new:
-            print(f"compaction: {len(fresh)} more blocks summarised "
+            print(f"compaction: {fresh_count} more blocks summarised "
                   f"({covered} of {len(span)} covered, {before} tokens "
                   f"estimated, over {COMPACT_AT})", flush=True)
 
     # Uncovered turns ride verbatim only when there is a summary in front of
     # them. With none — the summariser could not be reached — they are what had
     # to go, and carrying them is exactly the oversized body this must not send.
-    carried = _regroup(span[covered:]) if summary else []
+    carried = _regroup(fresh) if summary else []
     if summary:
         bridge = ("This conversation was compacted to fit the context window. "
                   "The summary below replaces the turns between the task above "
@@ -1621,6 +1756,7 @@ def compact_body(body):
                   "are gone. Re-establish what you need from the working tree "
                   "rather than assuming it, and say so if the task no longer "
                   "makes sense without them.")
+    bridge += retained
     def assemble(keep):
         out = dict(body)
         out["messages"] = ([messages[0], {"role": "user", "content": [
@@ -1628,6 +1764,8 @@ def compact_body(body):
         return out
 
     compacted = assemble(carried)
+    if COMPACT_STRICT and estimate_tokens(compacted) > COMPACT_AT:
+        raise CompactionUnavailable("preserved context still exceeds the compaction budget")
     if carried and estimate_tokens(compacted) > COMPACT_AT:
         # The summary could not be extended far enough to make room. Whatever
         # it does not cover goes, because a body over the limit comes back
@@ -1646,10 +1784,7 @@ def compact_body(body):
             kind = b.get("type")
             size = len(json.dumps(b, default=str)) // 4
             name = b.get("name") or ""
-            sample = (b.get("text") or b.get("thinking")
-                      or _tool_result_text(b) or json.dumps(b.get("input") or {}))
-            parts.append(f"{kind}{'/' + name if name else ''}={size}t"
-                         f"[{sample[:60]!r}]")
+            parts.append(f"{kind}{'/' + name if name else ''}={size}t")
         return raw, est, m.get("role"), len(_blocks(m.get("content"))), parts[:3]
 
     worst = max(messages, key=lambda m: len(json.dumps(m, default=str)))
@@ -1718,7 +1853,7 @@ def anthropic_error(err, body=None):
     if status == 429:
         found = _RESET_AFTER.search(err)
         if found:
-            retry_after = int(found.group(1)) * 60
+            retry_after = reset_delay(err)
     elif status == 400 and "too long" in err.lower() and body is not None:
         message = (f"prompt is too long: {estimate_tokens(body)} tokens > "
                    f"{SWE_CONTEXT_TOKENS} maximum")
@@ -1838,7 +1973,10 @@ class AnthropicStream:
         self._alive.start()
 
     def release(self):
-        self._done.set()
+        # Synchronise with a keepalive that may be about to commit HTTP 200.
+        # Once this returns the caller can decide safely between HTTP and SSE.
+        with self._wlock:
+            self._done.set()
 
     def _send(self, event, data):
         with self._wlock:
@@ -1940,6 +2078,7 @@ class AnthropicStream:
         self._send("message_stop", {"type": "message_stop"})
 
     def error(self, message, kind="api_error"):
+        self.failure = kind
         self._send("error", {"type": "error",
                              "error": {"type": kind, "message": message}})
 
@@ -1952,7 +2091,39 @@ class AnthropicStream:
         self._send("message_stop", {"type": "message_stop"})
 
 
-def run_swe(body, wfile, make_stream=None):
+def _swe_early_error(out, err):
+    if out is not None:
+        out.release()
+        if out.started:
+            out.error(err, anthropic_error(err)[0])
+            out.stop()
+            return None, None
+    return None, err
+
+
+def run_swe(body, wfile, make_stream=None, outcome=None):
+    """Run a turn, keeping the streaming lifecycle and error contract shared.
+
+    `outcome` is an optional local diagnostic dict, never response content.
+    A 200 stream that later fails must not be logged as a successful turn.
+    """
+    emitter = make_stream or AnthropicStream
+    out = emitter(wfile, resolve_model(body)) if body.get("stream") else None
+    try:
+        if out is not None:
+            out.arm()
+        response, err = _run_swe(body, out)
+        if outcome is not None:
+            outcome["status"] = (str(anthropic_error(err)[1]) if err else
+                                 "stream_error" if getattr(out, "failure", None)
+                                 else "200")
+        return response, err
+    finally:
+        if out is not None:
+            out.release()
+
+
+def _run_swe(body, out):
     """Run one SWE-2 turn. Returns (response_dict, error) for the non-stream path;
     streams and returns (None, None) when the client asked for SSE.
 
@@ -1960,33 +2131,34 @@ def run_swe(body, wfile, make_stream=None):
     the Codex flavour of Responses when the request came in on that route. Only
     the emitter differs — everything upstream of it is shared.
     """
-    stream = bool(body.get("stream"))
-    make_stream = make_stream or AnthropicStream
     # Before anything is sent: if this turn would not fit, reduce it here rather
     # than let the upstream refuse it and the client end the agent.
     try:
         # Order first, then size: compaction decides what to keep verbatim by
         # walking back over turns, and on a collapsed body there is only ever
         # one turn to walk back over.
+        _request_phase("compacting")
         body = unflatten_body(body)
         body = compact_body(body)
+    except CompactionUnavailable as e:
+        return _swe_early_error(out, f"unavailable: strict compaction: {e}")
     except Exception as e:
+        if COMPACT_STRICT:
+            # Strict mode must not silently become lossy on an unexpected
+            # summariser/parser failure. Do not include prompt-bearing details.
+            return _swe_early_error(out, "unavailable: strict compaction failed")
         # Compaction is a rescue, never a new way to fail. A turn that would
         # have gone out uncompacted still goes out.
         print(f"compaction failed, forwarding as is: {e}", flush=True)
     # Report the resolved tier, not the alias, so the tier that actually ran is
     # visible in the client.
-    out = make_stream(wfile, resolve_model(body)) if stream else None
-    if out is not None:
-        out.arm()
-
     def committed():
         """Has anything reached the client yet.
 
         Not the same question as "has content been emitted": the keepalive can
         open the stream on its own while the upstream is still thinking, and
-        once a message_start is on the wire a retry would put a second one
-        there and an HTTP status is no longer expressible.
+        once a message_start is on the wire an HTTP status is no longer
+        expressible. A retry before content can reuse that same emitter.
         """
         return emitted or (out is not None and out.started)
 
@@ -1997,6 +2169,7 @@ def run_swe(body, wfile, make_stream=None):
     acct = None
     while attempt < 3:
         try:
+            _request_phase("preparing")
             req, model = build_request(body, TOOL_DESC_CAPS[attempt])
         except Exception as e:
             # Typically a missing or expired Devin credential, surfaced here
@@ -2005,9 +2178,7 @@ def run_swe(body, wfile, make_stream=None):
             # Nothing has been written yet either way, so this goes back as a
             # status the client can act on rather than as a 200 stream whose
             # only content is an error — and never as a finished turn.
-            if out is not None:
-                out.release()
-            return None, f"request build: {e}"
+            return _swe_early_error(out, f"request build: {e}")
 
         thinking, signature, texts = [], None, []
         tool_order, tool_blocks = [], {}
@@ -2019,6 +2190,7 @@ def run_swe(body, wfile, make_stream=None):
             if acct is None:
                 acct = accounts()[0]
         try:
+          _request_phase("waiting_capacity")
           with paced(acct):
             for msg, e in chat_stream(req, acct):
                 if e:
@@ -2087,7 +2259,7 @@ def run_swe(body, wfile, make_stream=None):
             err = f"upstream {type(e).__name__}: {e}"
             print(err, flush=True)
 
-        if (err and not committed() and retries < NETWORK_RETRIES
+        if (err and not emitted and retries < NETWORK_RETRIES
                 and any(t in err for t in _TRANSIENT)):
             retries += 1
             delay = 1.5 * retries
@@ -2095,7 +2267,7 @@ def run_swe(body, wfile, make_stream=None):
                   f"{delay:.0f}s ({retries}/{NETWORK_RETRIES})", flush=True)
             time.sleep(delay)
             continue
-        if err and not committed() and "resource_exhausted" in err:
+        if err and not emitted and "resource_exhausted" in err:
             # Both of Cognition's limits are per account, so another credential
             # is a switch rather than a wait. Only when every one of them is
             # spent does the turn actually have to be held.
@@ -2115,6 +2287,7 @@ def run_swe(body, wfile, make_stream=None):
                 print(f"upstream rate limited on every credential, holding "
                       f"the turn for {wait:.0f}s ({waited:.0f}s waited so far)",
                       flush=True)
+                _request_phase("waiting_rate_limit")
                 time.sleep(wait)
                 waited += wait
                 acct, _ = claim_account()
@@ -2122,7 +2295,7 @@ def run_swe(body, wfile, make_stream=None):
             print(f"upstream rate limited and {RATE_WAIT_BUDGET}s of waiting is "
                   f"spent; handing it back", flush=True)
             break
-        if err and not committed() and attempt < 2 and "permission_denied" in err:
+        if err and not emitted and attempt < 2 and "permission_denied" in err:
             nxt = TOOL_DESC_CAPS[attempt + 1]
             print(f"upstream permission_denied, retrying (attempt "
                   f"{attempt + 2}/3, tool descriptions capped at {nxt})",
@@ -2148,6 +2321,9 @@ def run_swe(body, wfile, make_stream=None):
     usage = usage or {"input_tokens": 0, "output_tokens": 0}
 
     if out:
+        if err:
+            # Freeze the heartbeat before deciding which response is legal.
+            out.release()
         if err and not committed():
             # Nothing has reached the client yet, so the failure can still be
             # what it actually is: an HTTP status the client knows how to act
@@ -2534,12 +2710,19 @@ class ResponsesStream:
     def finish(self, stop_reason, usage):
         self.flush_tools()
         self._close_text()
-        self._send("response.completed", {
-            "type": "response.completed",
-            "response": self._response("completed", usage)})
+        if stop_reason == "max_tokens":
+            response = self._response("incomplete", usage)
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+            self._send("response.incomplete", {
+                "type": "response.incomplete", "response": response})
+        else:
+            self._send("response.completed", {
+                "type": "response.completed",
+                "response": self._response("completed", usage)})
 
-    def error(self, message):
-        self._send("error", {"type": "error", "code": "api_error",
+    def error(self, message, kind="api_error"):
+        self.failure = kind
+        self._send("error", {"type": "error", "code": kind,
                              "message": message})
 
     def stop(self):
@@ -2566,12 +2749,13 @@ SESSION.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
 #
 # `read` has to be non-zero for that to work: urllib3 raises ProtocolError on a
 # reset keep-alive socket and _is_read_error() routes it to the read budget,
-# while `connect` only covers DNS/TCP/TLS establishment. read=0 therefore left
-# the one case this exists for uncovered. Replaying after the upstream began
-# answering is still impossible: with stream=True the retry window closes once
-# the response headers are read, and body-phase failures surface to the caller.
+# while `connect` only covers DNS/TCP/TLS establishment. Restrict read retries
+# to safe methods: a POST can have been processed even when its response headers
+# never reached us. Application-level SWE recovery remains explicit and bounded;
+# this adapter must not silently multiply it, or replay a relayed generation.
 _RETRY = Retry(total=3, connect=3, read=3, status=0, redirect=0,
-               allowed_methods=None, backoff_factor=0.2)
+               allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+               backoff_factor=0.2)
 for _scheme in ("http://", "https://"):
     SESSION.mount(_scheme, requests.adapters.HTTPAdapter(
         pool_connections=8, pool_maxsize=32, max_retries=_RETRY))
@@ -2579,6 +2763,7 @@ for _scheme in ("http://", "https://"):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = HTTP_READ_TIMEOUT  # header/body inactivity, not model latency
 
     def log_message(self, fmt, *args):
         return
@@ -2762,7 +2947,9 @@ class Handler(BaseHTTPRequestHandler):
                 r = subprocess.run(
                     [sys.executable, os.path.join(HERE, "tools", "log_stats.py")]
                     + window,
-                    capture_output=True, text=True, timeout=60)
+                    capture_output=True, text=True, timeout=60,
+                    env=dict(os.environ, DEVINX_LOG=os.environ.get(
+                        "DEVINX_LOG", os.path.join(DATA_DIR, "devinx.log"))))
                 data = json.loads(r.stdout) if r.returncode == 0 else None
                 if data is None:
                     err = (r.stderr or "stats failed").strip()[:200]
@@ -2797,6 +2984,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "blocked_for": max(0, round(
                                        a.get("blocked_until", 0) - time.time()))}
                                   for a in _accounts]}
+        payload["active_requests"] = live_requests()
         payload["tail"] = _log_tail(60)
         self.send_json(200, payload)
 
@@ -2912,7 +3100,8 @@ class Handler(BaseHTTPRequestHandler):
                 busy = _inflight["n"]
             self.send_json(200, {"service": "devinx", "build": BUILD,
                                  "pid": os.getpid(), "port": PORT,
-                                 "inflight": busy})
+                                 "inflight": busy,
+                                 "configuration": effective_configuration()})
             return
         if urlsplit(self.path).path != "/v1/models":
             self.send_error_json(404, "not_found_error", "Not found")
@@ -2939,7 +3128,10 @@ class Handler(BaseHTTPRequestHandler):
                              "last_id": models[-1]["id"]})
 
     def do_POST(self):
-        _enter_request()
+        if not _enter_request():
+            self.send_error_json(503, "overloaded_error",
+                                 "Local request capacity reached; retry later", 1)
+            return
         try:
             self._do_POST()
         finally:
@@ -2952,13 +3144,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(404, "not_found_error", "Not found")
             return
         try:
-            length = int(self.headers.get("content-length", "0"))
+            lengths = self.headers.get_all("content-length", [])
+            if (self.headers.get("transfer-encoding") is not None
+                    or len(lengths) != 1
+                    or re.fullmatch(r"[0-9]+", lengths[0].strip()) is None):
+                self.send_error_json(400, "invalid_request_error",
+                                     "One non-negative Content-Length is required")
+                return
+            length = int(lengths[0])
             if length > MAX_BODY_BYTES:
                 self.send_error_json(413, "invalid_request_error",
                                      f"Body exceeds {MAX_BODY_BYTES} bytes")
                 return
             raw = self.rfile.read(length)
+            if len(raw) != length:
+                self.send_error_json(400, "invalid_request_error", "Incomplete body")
+                return
             body = json.loads(raw)
+            self.connection.settimeout(CLIENT_WRITE_TIMEOUT)
         except Exception:
             self.send_error_json(400, "invalid_request_error", "Invalid body")
             return
@@ -2985,6 +3188,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(400, "invalid_request_error", "Missing model")
             return
 
+        _request_phase("accepted", model=model)
         if model in SWE_MODEL_IDS and self.browser_origin():
             self.send_error_json(
                 403, "permission_error",
@@ -3043,7 +3247,9 @@ class Handler(BaseHTTPRequestHandler):
             if stream:
                 # run_swe owns the raw socket once it has written anything; it
                 # hands an error back instead while the socket is still clean.
-                _, err = run_swe(body, self.wfile)
+                result = {}
+                _, err = run_swe(body, self.wfile, outcome=result)
+                outcome = result.get("status", "200")
                 if err:
                     kind, status, message, wait = anthropic_error(err, body)
                     outcome = str(status)
@@ -3061,8 +3267,7 @@ class Handler(BaseHTTPRequestHandler):
             print("client disconnected mid-stream", flush=True)
         except Exception as e:
             outcome = type(e).__name__
-            print(f"route=swe model={body.get('model')} status={type(e).__name__}: {e}",
-                  flush=True)
+            print(f"swe handler error: {type(e).__name__}", flush=True)
             if not stream:
                 self.send_error_json(502, "api_error", str(e))
         finally:
@@ -3071,7 +3276,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def serve_swe_responses(self, body):
-        """SWE-2 over the Responses wire, for Codex."""
+        """SWE-2 over the Responses wire, with the same errors as Messages."""
         try:
             translated, custom = responses_to_messages(body)
         except Exception as e:
@@ -3079,21 +3284,30 @@ class Handler(BaseHTTPRequestHandler):
                                  f"could not read the Responses body: {e}")
             return
         if not translated.get("stream"):
-            # Codex always streams; a non-streaming caller would need a second
-            # response assembler for no one.
             self.send_error_json(400, "invalid_request_error",
                                  "the SWE-2 Responses route is streaming only")
             return
+        started, result, outcome = time.monotonic(), {}, "200"
         try:
-            run_swe(translated, self.wfile,
-                    lambda w, m: ResponsesStream(w, m, custom))
+            _, err = run_swe(translated, self.wfile,
+                            lambda w, m: ResponsesStream(w, m, custom),
+                            outcome=result)
+            outcome = result.get("status", "200")
+            if err:
+                kind, status, message, wait = anthropic_error(err, translated)
+                outcome = str(status)
+                self.send_error_json(status, kind, message, wait)
         except (BrokenPipeError, ConnectionResetError):
             outcome = "client_disconnected"
             print("client disconnected mid-stream", flush=True)
         except Exception as e:
-            print(f"route=swe-responses model={body.get('model')} "
-                  f"status={type(e).__name__}: {e}", flush=True)
+            outcome = type(e).__name__
+            print(f"swe responses handler error: {outcome}", flush=True)
         finally:
+            print(f"route=swe model={resolve_model(translated)} "
+                  f"status={outcome} in {time.monotonic() - started:.1f}s "
+                  f"protocol=responses",
+                  flush=True)
             self.close_connection = True
 
     def relay(self, raw, model, url, label):
@@ -3105,9 +3319,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             headers = {name: value for name, value in self.headers.items()
                        if name.lower() not in REQUEST_EXCLUDED}
+            _request_phase("connecting")
             response = SESSION.request(self.command, url, data=raw,
                                        headers=headers, stream=True,
-                                       allow_redirects=False, timeout=(15, None))
+                                       allow_redirects=False,
+                                       timeout=(15, RELAY_READ_TIMEOUT))
+            _request_phase("relaying")
             response_started = True
             self.send_response(response.status_code)
             for name, value in response.headers.items():
@@ -3272,41 +3489,43 @@ class Server(ThreadingHTTPServer):
         return ThreadingHTTPServer.server_bind(self)
 
 
-def drain_and_exit(srv):
-    """Stop taking work, finish what is in hand, then go.
+def drain_and_exit(srv, extra_servers=()):
+    """Close listeners, then drain accepted turns without blocking signals.
 
-    A turn cut in half reaches the agent as a closed socket mid-stream, and an
-    agent does not always survive that — one was lost to exactly this earlier
-    today. So the signal that ends this process is a request to stop
-    accepting, not a request to stop.
+    The signal handler runs on the serve_forever thread. It must return so that
+    shutdown(), running on another thread, can finish. The coordinator is NOT
+    a daemon: once serve_forever returns it keeps Python alive for accepted work.
+    Repeated SIGTERM/SIGINT requests do not start competing shutdown workers.
     """
-    def handler(signum, frame):
-        def close_the_door():
-            # shutdown() only stops the accept loop. The listening socket stays
-            # open, and with SO_REUSEPORT the kernel keeps handing it new
-            # connections — which nobody accepts, so they sit in the backlog
-            # until the client times out. Measured in production: a draining
-            # process blackholed /api/hello for as long as it lived. The socket
-            # has to be closed for the kernel to stop choosing this listener;
-            # connections already accepted are on their own sockets and finish
-            # normally.
-            srv.shutdown()
-            srv.server_close()
+    requested = False
+    servers = (srv,) + tuple(s for s in extra_servers if s is not None)
 
-        threading.Thread(target=close_the_door, daemon=True).start()
-        deadline = time.time() + DRAIN_SECONDS
-        while time.time() < deadline:
+    def drain():
+        deadline = time.monotonic() + DRAIN_SECONDS
+        for server in servers:
+            try:
+                server.shutdown()
+            finally:
+                server.server_close()
+        while time.monotonic() < deadline:
             with _inflight_lock:
                 busy = _inflight["n"]
             if not busy:
                 break
-            time.sleep(0.5)
+            time.sleep(0.05)
         with _inflight_lock:
             busy = _inflight["n"]
-        print(f"devinx: draining complete, exiting"
+        print("devinx: draining complete, exiting"
               + (f" with {busy} turn(s) still in flight after "
                  f"{DRAIN_SECONDS}s" if busy else ""), flush=True)
         os._exit(0)
+
+    def handler(signum, frame):
+        nonlocal requested
+        if requested:
+            return
+        requested = True
+        threading.Thread(target=drain, name="devinx-drain", daemon=False).start()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -3360,6 +3579,7 @@ def serve_dashboard_port(port):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"dashboard also on http://{HOST}:{port}/dashboard (token required, "
           f"no API routes)", flush=True)
+    return srv
 
 
 if __name__ == "__main__":
@@ -3367,10 +3587,9 @@ if __name__ == "__main__":
     sys.stderr = _Stamped(sys.stderr)
     print(f"devinx listening on http://{HOST}:{PORT}  "
           f"(build {BUILD}, pid {os.getpid()}, data: {DATA_DIR})", flush=True)
-    if DASHBOARD_PORT:
-        serve_dashboard_port(DASHBOARD_PORT)
     _srv = Server((HOST, PORT), Handler)
-    drain_and_exit(_srv)
+    _dashboard_srv = serve_dashboard_port(DASHBOARD_PORT) if DASHBOARD_PORT else None
+    drain_and_exit(_srv, (_dashboard_srv,))
     if os.environ.get("DEVINX_DUMP"):
         print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
               f"conversation and any credentials the client sends, is being "

@@ -348,6 +348,13 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 
 <h2>Activité en direct</h2>
 <div class="card"><div class="feed" id="feed"></div></div>
+<h2>Requêtes actives maintenant</h2>
+<div class="card">
+  <div class="tw"><table><thead><tr><th>Requête</th><th>Modèle</th><th>État</th>
+    <th class="n">Durée totale</th><th class="n">Dans cet état</th></tr></thead>
+    <tbody id="active-requests"></tbody></table></div>
+  <div class="note" id="active-note">État actuel, indépendant de la période sélectionnée. Les identifiants sont ceux des requêtes, pas des agents.</div>
+</div>
 
 <h2>À savoir, sans être utile</h2>
 <div class="grid g3" id="trivia"></div>
@@ -428,7 +435,37 @@ function rows(el, items, color){
     <div class="val">${esc(i.t)}</div></div>`).join("");
 }
 
+function renderActiveRequests(items){
+  const target = $("active-requests");
+  target.replaceChildren();
+  const labels = {reading_body:"Lecture de la requête", accepted:"Acceptée",
+    compacting:"Préparation du contexte", summarizing:"Résumé du contexte",
+    preparing:"Préparation", waiting_capacity:"Attente de capacité",
+    authenticating:"Authentification", connecting:"Connexion au fournisseur",
+    waiting_first_frame:"Attente du fournisseur", streaming:"Réception",
+    waiting_rate_limit:"Attente après limitation", relaying:"Relais en cours"};
+  if (!Array.isArray(items) || items.length === 0){
+    const tr = document.createElement("tr"), td = document.createElement("td");
+    td.colSpan = 5;
+    td.textContent = Array.isArray(items) ? "Aucune requête active." : "Non disponible sur cette version du service.";
+    tr.appendChild(td); target.appendChild(tr); return;
+  }
+  for (const item of items){
+    if (!item || typeof item !== "object") continue;
+    const tr = document.createElement("tr");
+    const values = [item.id || "—", item.model || "—", labels[item.phase] || "État inconnu",
+                    dur(item.elapsed), dur(item.phase_elapsed)];
+    values.forEach((value, index) => {
+      const td = document.createElement("td");
+      td.textContent = String(value);
+      if (index >= 3) td.className = "n";
+      tr.appendChild(td);
+    });
+    target.appendChild(tr);
+  }
+}
 function render(d){
+  renderActiveRequests(d.active_requests);
   const sv = d.service || {}, sw = d.swe || {}, tk = sw.tokens || {},
         rl = d.rate_limits || {}, cp = d.compaction || {}, inc = d.incidents || {},
         fun = d.fun || {}, lg = d.log || {};
