@@ -397,6 +397,14 @@ last non-routine log lines streaming underneath. `GET /api/stats` returns the
 same figures as JSON. The log is re-read on demand and cached for a few seconds,
 so several open tabs cost one pass.
 
+## Local diagnostics and stability controls
+
+`devinx --status`, `devinx --doctor --json`, and `devinx --explain --cx --or`
+inspect the running service without starting it or spending inference quota.
+The dashboard also shows current requests and their phase. See
+[stability controls and validation](docs/stability.md) for the new resource
+bounds, opt-in strict compaction, shutdown behaviour, test coverage and limits.
+
 ## Troubleshooting
 
 Logs are in `devinx.log`, in the data directory printed by the installer

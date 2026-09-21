@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from runtime_support import build_id, startup_lock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("DEVINX_PORT", "8316"))
@@ -342,12 +343,8 @@ def plugin_args(enabled):
 
 
 def local_build():
-    """The fingerprint of the devinx.py sitting next to this launcher."""
-    try:
-        with open(os.path.join(HERE, "devinx.py"), "rb") as fh:
-            return hashlib.sha1(fh.read()).hexdigest()[:12]
-    except OSError:
-        return None
+    value = build_id(HERE)
+    return None if value == "unknown" else value
 
 
 def service_state():
@@ -459,7 +456,57 @@ def start_service():
     subprocess.Popen([sys.executable, os.path.join(HERE, "devinx.py")], **kwargs)
 
 
+def ensure_service():
+    """Perform the readiness/start sequence once across concurrent launchers."""
+    try:
+        with startup_lock(data_dir(), PORT, START_TIMEOUT):
+            state, info = service_state()
+            if state == "foreign":
+                sys.stderr.write(f"devinx: another service owns {HOST}:{PORT}; not starting or stopping it\n")
+                return False
+            if state == "stale":
+                # Restarting under a turn that is mid-flight would cut it in half, so a
+                # busy service is reported rather than replaced.
+                if info.get("inflight"):
+                    sys.stderr.write(
+                        f"devinx: the service on {PORT} is running older code and is "
+                        f"busy ({info['inflight']} request(s) in flight).\n"
+                        f"        Continuing with it. Restart when it is idle: "
+                        f"kill {info.get('pid', '<pid>')}\n")
+                    state = "fresh"
+                elif stop_service(info):
+                    print("devinx: replacing a service running older code", flush=True)
+                    state = "absent"
+                else:
+                    sys.stderr.write(
+                        "devinx: the service on this port is running older code and "
+                        "could not be stopped automatically.\n"
+                        "        Stop it by hand and run again"
+                        + (f": kill {info['pid']}\n" if info.get("pid") else ".\n"))
+                    state = "fresh"
+
+            if state != "fresh":
+                start_service()
+                deadline = time.time() + START_TIMEOUT
+                while time.time() < deadline:
+                    if listening():
+                        break
+                    time.sleep(0.5)
+                else:
+                    sys.stderr.write(
+                        f"devinx failed to start on {HOST}:{PORT}\n"
+                        f"check {os.path.join(data_dir(), 'devinx.log')}\n")
+                    return False
+            return True
+    except (OSError, TimeoutError) as error:
+        sys.stderr.write(f"devinx: could not coordinate service startup: {error}\n")
+        return False
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--doctor", "--status", "--explain"):
+        import diagnostics
+        return diagnostics.main(sys.argv[1], sys.argv[2:], sys.modules[__name__])
     use_devin, use_orch, use_codex, passthrough = split_args(sys.argv[1:])
 
     client = "codex" if use_codex else "claude"
@@ -484,40 +531,8 @@ def main():
             return subprocess.call(args, env=env)
         os.execvpe(claude, args, env)
 
-    state, info = service_state()
-    if state == "stale":
-        # Restarting under a turn that is mid-flight would cut it in half, so a
-        # busy service is reported rather than replaced.
-        if info.get("inflight"):
-            sys.stderr.write(
-                f"devinx: the service on {PORT} is running older code and is "
-                f"busy ({info['inflight']} request(s) in flight).\n"
-                f"        Continuing with it. Restart when it is idle: "
-                f"kill {info.get('pid', '<pid>')}\n")
-            state = "fresh"
-        elif stop_service(info):
-            print("devinx: replacing a service running older code", flush=True)
-            state = "absent"
-        else:
-            sys.stderr.write(
-                "devinx: the service on this port is running older code and "
-                "could not be stopped automatically.\n"
-                "        Stop it by hand and run again"
-                + (f": kill {info['pid']}\n" if info.get("pid") else ".\n"))
-            state = "fresh"
-
-    if state != "fresh":
-        start_service()
-        deadline = time.time() + START_TIMEOUT
-        while time.time() < deadline:
-            if listening():
-                break
-            time.sleep(0.5)
-        else:
-            sys.stderr.write(
-                f"devinx failed to start on {HOST}:{PORT}\n"
-                f"check {os.path.join(data_dir(), 'devinx.log')}\n")
-            return 1
+    if not ensure_service():
+        return 1
 
     if use_codex:
         # Codex is configured entirely through -c overrides, so none of the
