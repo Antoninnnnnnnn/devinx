@@ -376,5 +376,42 @@ srv.serve_forever(poll_interval=0.02)
                 proc.stdout.close()
 
 
+class OutcomeLoggingTests(unittest.TestCase):
+    def _capture(self, responses, fail=False):
+        handler = object.__new__(devinx.Handler)
+        handler.wfile = io.BytesIO()
+        def execute(*args, outcome=None):
+            if fail:
+                raise ValueError('unexpected test error')
+            outcome['status'] = 'stream_error'
+            return None, None
+        log = io.StringIO()
+        with mock.patch.object(devinx, 'run_swe', side_effect=execute), \
+             contextlib.redirect_stdout(log):
+            method = handler.serve_swe_responses if responses else handler.serve_swe
+            method({'model': 'swe-2-max', 'stream': True})
+        return log.getvalue()
+
+    def test_both_wires_count_as_swe_client_errors_not_relay_latency(self):
+        from tools import log_stats
+        for responses in (False, True):
+            with self.subTest(responses=responses), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'test.log'
+                path.write_text(self._capture(responses), encoding='utf-8')
+                stats = log_stats.collect(str(path))
+                self.assertEqual(stats['client_status'], {'stream_error': 1})
+                self.assertEqual(stats['relay_latency'], [])
+
+    def test_unexpected_failure_is_counted_once_on_each_wire(self):
+        from tools import log_stats
+        for responses in (False, True):
+            with self.subTest(responses=responses), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'test.log'
+                path.write_text(self._capture(responses, fail=True), encoding='utf-8')
+                stats = log_stats.collect(str(path))
+                self.assertEqual(stats['client_status'], {'ValueError': 1})
+                self.assertEqual(stats['relay_latency'], [])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

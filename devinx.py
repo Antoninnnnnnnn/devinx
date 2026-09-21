@@ -3267,8 +3267,7 @@ class Handler(BaseHTTPRequestHandler):
             print("client disconnected mid-stream", flush=True)
         except Exception as e:
             outcome = type(e).__name__
-            print(f"route=swe model={body.get('model')} status={type(e).__name__}: {e}",
-                  flush=True)
+            print(f"swe handler error: {type(e).__name__}", flush=True)
             if not stream:
                 self.send_error_json(502, "api_error", str(e))
         finally:
@@ -3303,11 +3302,11 @@ class Handler(BaseHTTPRequestHandler):
             print("client disconnected mid-stream", flush=True)
         except Exception as e:
             outcome = type(e).__name__
-            print(f"route=swe-responses model={body.get('model')} "
-                  f"status={outcome}", flush=True)
+            print(f"swe responses handler error: {outcome}", flush=True)
         finally:
-            print(f"route=swe-responses model={resolve_model(translated)} "
-                  f"status={outcome} in {time.monotonic() - started:.1f}s",
+            print(f"route=swe model={resolve_model(translated)} "
+                  f"status={outcome} in {time.monotonic() - started:.1f}s "
+                  f"protocol=responses",
                   flush=True)
             self.close_connection = True
 
