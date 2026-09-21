@@ -22,12 +22,15 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Existing offline regressions
         run: python tests/test_regressions.py
-      - name: Package tracked source for isolated validation
+      - name: Package tracked source and pinned runtime wheels
         if: always()
-        run: git archive --format=zip HEAD -o "$RUNNER_TEMP/devinx-source.zip"
+        run: |
+          mkdir -p "$RUNNER_TEMP/stability-export/wheels"
+          git archive --format=zip HEAD -o "$RUNNER_TEMP/stability-export/devinx-source.zip"
+          python -m pip download --only-binary=:all: --no-deps -r requirements.txt -d "$RUNNER_TEMP/stability-export/wheels"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: stability-source
-          path: ${{ runner.temp }}/devinx-source.zip
+          path: ${{ runner.temp }}/stability-export/
           retention-days: 3
