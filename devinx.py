@@ -485,7 +485,7 @@ def _load_accounts():
     worth far more than the averages suggest when the work is parallel by
     design.
     """
-    keys, names = [], []
+    keys, names, paths = [], [], []
     env = os.environ.get("DEVINX_API_KEYS") or os.environ.get("DEVINX_API_KEY")
     if env:
         for i, raw in enumerate(re.split(r"[,\n]", env)):
@@ -493,12 +493,14 @@ def _load_accounts():
             if raw:
                 keys.append(raw)
                 names.append(f"env[{i}]")
+                paths.append(None)
     else:
         for path in _credential_files():
             key = _read_key(path)
             if key and key not in keys:
                 keys.append(key)
                 names.append(_credential_name(path))
+                paths.append(path)
     if not keys:
         raise RuntimeError(
             "no Devin credential found — run:  XDG_DATA_HOME=%s devin auth login"
@@ -511,12 +513,67 @@ def _load_accounts():
         if names.count(name) > 1:
             names[i] = f"{name}{seen[name]}"
     out = []
-    for key, name in zip(keys, names):
+    for key, name, path in zip(keys, names, paths):
         if not key.startswith(SESSION_PREFIX):
             key = SESSION_PREFIX + key
         out.append({"key": key, "name": name, "jwt": None, "exp": 0.0,
-                    "base": None, "blocked_until": 0.0})
+                    "base": None, "blocked_until": 0.0, "path": path})
     return out
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path) if path else None
+    except OSError:
+        return None
+
+
+def _jwt_claims(jwt):
+    try:
+        part = jwt.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return {}
+
+
+def _check_plan(acct, jwt):
+    """Take a credential out of rotation the moment it is no longer paid for.
+
+    The plan is in the JWT this proxy already fetches for every account —
+    `pro` and `teams_tier` — so knowing it costs no request. A refusal's text
+    cannot tell: since mid-September every refusal, paid account or not, reads
+    "Reached free model rate limit. Upgrade to Max for higher limits", and the
+    one credential that really was on a free plan got that same sentence.
+
+    Only an explicit pro=false excludes. A claim that is missing or a token
+    that does not decode proves nothing, and excluding a paid account on a
+    parsing failure would cost more than one request to a free one.
+
+    An excluded credential is never claimed again, so it is never retried and
+    its plan is never re-read. It comes back only when it is logged in again,
+    which rewrites its credentials file: the rescan sees that and clears it.
+    """
+    claims = _jwt_claims(jwt)
+    tier = claims.get("teams_tier") or "?"
+    acct["tier"] = tier
+    if "pro" in claims:
+        acct["pro"] = bool(claims["pro"])
+    if claims.get("pro") is False and not acct.get("excluded"):
+        acct["excluded"] = f"plan gratuit ({tier})"
+        acct["excluded_mtime"] = _mtime(acct.get("path"))
+        print(f"devinx: credential {acct['name']} is on a free plan "
+              f"(pro=false, {tier}); excluded until it is logged in again",
+              flush=True)
+
+
+def _first_usable():
+    """The first credential still in rotation, for callers that pick none."""
+    live = [a for a in accounts() if not a.get("excluded")]
+    if not live:
+        raise RuntimeError("every Devin credential is excluded (free plan); "
+                           "log one in again with `devin auth login`")
+    return live[0]
 
 
 _acct_lock = threading.Lock()
@@ -568,6 +625,7 @@ def _maybe_rescan():
         print(f"devinx: credential rescan failed, keeping the current ones: {e}",
               flush=True)
         return
+    back = []
     with _acct_lock:
         known = {a["key"] for a in _accounts}
         keep = {f["key"] for f in fresh}
@@ -576,7 +634,17 @@ def _maybe_rescan():
         for a in removed:
             _accounts.remove(a)
         _accounts.extend(added)
+        for a in _accounts:
+            # Logged in again: the file was rewritten since the exclusion. The
+            # plan is read afresh from the next JWT rather than assumed.
+            if a.get("excluded") and _mtime(a.get("path")) != a.get("excluded_mtime"):
+                a.pop("excluded", None)
+                a["jwt"], a["exp"] = None, 0.0
+                back.append(a)
         names = ", ".join(a["name"] for a in _accounts)
+    for a in back:
+        print(f"devinx: credential {a['name']} logged in again; back in "
+              f"rotation, plan re-read on next use", flush=True)
     for a in added:
         print(f"devinx: new Devin credential {a['name']} ({names})", flush=True)
     for a in removed:
@@ -603,7 +671,7 @@ def accounts():
 
 def api_key():
     """The first credential. Only for callers that do not pick an account."""
-    return accounts()[0]["key"]
+    return _first_usable()["key"]
 
 
 def reset_key():
@@ -633,12 +701,16 @@ def claim_account(avoid=None):
     _maybe_rescan()
     now = time.time()
     with _acct_lock:
-        usable = [a for a in _accounts
+        live = [a for a in _accounts if not a.get("excluded")]
+        if not live:
+            # Nothing will ever come back on its own: waiting is pointless.
+            return None, None
+        usable = [a for a in live
                   if a["blocked_until"] <= now and a is not avoid]
         if usable:
             _turn["n"] += 1
             return usable[_turn["n"] % len(usable)], 0.0
-        soonest = min((a["blocked_until"] for a in _accounts
+        soonest = min((a["blocked_until"] for a in live
                        if a is not avoid), default=now)
         return None, max(0.0, soonest - now)
 
@@ -708,7 +780,7 @@ def _jwt_expiry(token):
 def get_jwt(acct=None, force=False):
     """A JWT for one account, cached on that account rather than globally."""
     if acct is None:
-        acct = accounts()[0]
+        acct = _first_usable()
     with _jwt_lock:
         now = time.time()
         if not force and acct["jwt"] and acct["exp"] - 60 > now:
@@ -729,6 +801,7 @@ def get_jwt(acct=None, force=False):
         acct["jwt"] = resp.user_jwt
         acct["exp"] = _jwt_expiry(resp.user_jwt) or now + 3300
         acct["base"] = resp.custom_api_server_url.strip() or None
+        _check_plan(acct, resp.user_jwt)
         return acct["jwt"], acct["base"]
 
 
@@ -1173,7 +1246,7 @@ def chat_stream(req, acct=None, purpose="turn"):
     invisible.
     """
     if acct is None:
-        acct = accounts()[0]
+        acct = _first_usable()
     _request_phase("summarizing" if purpose == "summary" else "authenticating")
     jwt, base = get_jwt(acct)
     req.metadata.api_key = acct["key"]
@@ -1459,8 +1532,14 @@ def _summarise_once(messages, model, system, previous, deadline):
             print(f"summary: {time.time() - t0:.0f}s of waiting spent without "
                   f"an answer", flush=True)
             return None
+        if acct is not None and acct.get("excluded"):
+            acct = None
         if acct is None:
             acct, until = claim_account()
+            if acct is None and until is None:
+                print("summary: every credential is excluded (free plan)",
+                      flush=True)
+                return None
             if acct is None:
                 wait = min(max(until or 5.0, 1.0), left)
                 wait += random.uniform(0, min(5.0, wait * 0.1))
@@ -2374,10 +2453,12 @@ def _run_swe(body, out):
         usage, stop, err, emitted = {}, 0, None, False
         latency = 0.0
 
+        if acct is not None and acct.get("excluded"):
+            acct = None          # excluded mid-turn: never retried on it
         if acct is None:
             acct, _ = claim_account()
             if acct is None:
-                acct = accounts()[0]
+                acct = _first_usable()
         try:
           _request_phase("waiting_capacity")
           with paced(acct):
@@ -3185,6 +3266,9 @@ class Handler(BaseHTTPRequestHandler):
                               "uptime": round(time.time() - _STARTED),
                               "accounts": [
                                   {"name": a["name"],
+                                   "excluded": a.get("excluded"),
+                                   "tier": a.get("tier"),
+                                   "pro": a.get("pro"),
                                    # The live answer to "is the upstream
                                    # refusing work", which the log can only
                                    # reconstruct after the fact.

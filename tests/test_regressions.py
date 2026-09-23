@@ -1096,6 +1096,69 @@ class CredentialRescanTests(unittest.TestCase):
                          "a failed read left the service with no account")
 
 
+class FreePlanExclusionTests(unittest.TestCase):
+    """A credential downgraded to a free plan leaves rotation until re-login."""
+
+    @staticmethod
+    def _jwt(claims):
+        import base64
+        body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"h.{body}.s"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.dir, True)
+        self.paid = {"name": "paid", "key": "k1", "blocked_until": 0.0, "path": None}
+        self.free = {"name": "free", "key": "k2", "blocked_until": 0.0,
+                     "path": os.path.join(self.dir, "credentials.toml")}
+        open(self.free["path"], "w").write('windsurf_api_key = "k2"\n')
+        for patcher in (mock.patch.object(devinx, "_accounts", [self.paid, self.free]),
+                        mock.patch.object(devinx, "_maybe_rescan", lambda: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_pro_false_excludes_and_it_is_never_claimed(self):
+        devinx._check_plan(self.free, self._jwt({"pro": False,
+                                                 "teams_tier": "TEAMS_TIER_FREE"}))
+        self.assertIn("gratuit", self.free["excluded"])
+        for _ in range(6):
+            acct, _ = devinx.claim_account()
+            self.assertIs(acct, self.paid, "an excluded credential was picked")
+
+    def test_a_paid_or_unreadable_token_excludes_nothing(self):
+        devinx._check_plan(self.free, self._jwt({"pro": True,
+                                                 "teams_tier": "TEAMS_TIER_DEVIN_PRO"}))
+        devinx._check_plan(self.free, "not-a-jwt")
+        devinx._check_plan(self.free, self._jwt({"teams_tier": "X"}))
+        self.assertNotIn("excluded", self.free)
+
+    def test_every_credential_excluded_means_no_wait(self):
+        for a in (self.paid, self.free):
+            devinx._check_plan(a, self._jwt({"pro": False}))
+        self.assertEqual(devinx.claim_account(), (None, None))
+        with self.assertRaises(RuntimeError):
+            devinx._first_usable()
+
+    def test_logging_in_again_brings_it_back(self):
+        devinx._check_plan(self.free, self._jwt({"pro": False}))
+        # A new `devin auth login` rewrites the file.
+        time.sleep(0.01)
+        with open(self.free["path"], "w") as fh:
+            fh.write('windsurf_api_key = "k2"\n')
+        os.utime(self.free["path"], (time.time() + 5, time.time() + 5))
+        # _maybe_rescan is stubbed in setUp; call the real one directly.
+        real = type(self).real_rescan
+        with mock.patch.object(devinx, "_scan", {"at": 0.0, "sig": None}), \
+             mock.patch.object(devinx, "_load_accounts",
+                               lambda: [dict(self.paid), dict(self.free)]), \
+             mock.patch.object(devinx, "_credential_signature", lambda: ("new",)):
+            real()
+        self.assertNotIn("excluded", self.free, "re-login did not restore it")
+
+
+FreePlanExclusionTests.real_rescan = staticmethod(devinx._maybe_rescan)
+
+
 class MessageIdTests(unittest.TestCase):
     """The constant that collapsed every run into three messages.
 

@@ -260,7 +260,7 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 <div class="grid g3">
   <div class="card">
     <h3>Par credential</h3>
-    <div class="tw"><table><thead><tr><th>compte</th><th class="n">tours</th>
+    <div class="tw"><table><thead><tr><th>compte</th><th>plan</th><th class="n">tours</th>
       <th class="n">refus de quota</th><th class="n">taux</th></tr></thead>
       <tbody id="byacct"></tbody></table></div>
   </div>
@@ -477,6 +477,7 @@ function render(d){
   $("uptime").textContent = dur(sv.uptime);
   $("accounts").textContent = (sv.accounts || []).map(a =>
     typeof a === "string" ? a
+      : a.excluded ? `${a.name} (exclu : ${a.excluded})`
       : a.blocked_for ? `${a.name} (bloqué ${dur(a.blocked_for)})` : a.name
   ).join(", ") || "—";
 
@@ -520,7 +521,15 @@ function render(d){
     .sort((a,b) => b[1].turns - a[1].turns)
     .map(([k,v]) => { const t = v.turns + v.refusals, r = t ? v.refusals/t : 0;
       const cls = r > .15 ? "crit" : r > .02 ? "warn" : "ok";
-      return `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
+      // Le plan vient du service (lu dans le jeton de chaque compte), pas du
+      // journal : c'est l'état de maintenant, pas un historique.
+      const live = (sv.accounts || []).find(a => typeof a === "object" && a.name === k);
+      const plan = !live ? `<span style="color:var(--ink-3)">—</span>`
+        : live.excluded ? `<span class="pill crit">Free · exclu</span>`
+        : live.pro === true ? `<span class="pill ok">Pro</span>`
+        : live.pro === false ? `<span class="pill crit">Free</span>`
+        : `<span style="color:var(--ink-3)" title="lu au prochain jeton">?</span>`;
+      return `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td>${plan}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
         <td class="n"><span class="pill ${cls}">${pct(r)}</span></td></tr>`; }).join("");
 
   // débit — la seule question qu'un quota compté en requêtes pose vraiment
