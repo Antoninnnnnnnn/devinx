@@ -892,9 +892,20 @@ def ensure_service():
                 sys.stderr.write(f"devinx: another service owns {HOST}:{PORT}; not starting or stopping it\n")
                 return False
             if state == "stale":
-                # Restarting under a turn that is mid-flight would cut it in half, so a
-                # busy service is reported rather than replaced.
-                if info.get("inflight"):
+                # Restarting under a turn that is mid-flight must not cut it in
+                # half: a busy service is replaced only if it drains.
+                config = info.get("configuration") if isinstance(info, dict) else None
+                config = config if isinstance(config, dict) else {}
+                drain, budget = config.get("DEVINX_DRAIN"), config.get("DEVINX_RATE_WAIT")
+                # A busy service is replaced only when it says it will finish
+                # what it holds: its drain covers its own wait budget. Older
+                # builds drained for 300s against a 1800s budget and would cut
+                # a held turn in half, so those are still left running.
+                # On Windows the stop can end in taskkill /F, which drains nothing.
+                drains_fully = (sys.platform != "win32"
+                                and isinstance(drain, (int, float)) and isinstance(budget, (int, float))
+                                and drain >= budget)
+                if info.get("inflight") and not drains_fully:
                     sys.stderr.write(
                         f"devinx: the service on {PORT} is running older code and is "
                         f"busy ({info['inflight']} request(s) in flight).\n"
@@ -902,7 +913,10 @@ def ensure_service():
                         f"{_kill_hint(info.get('pid'))}\n")
                     state = "fresh"
                 elif stop_service(info):
-                    sys.stderr.write("devinx: replacing a service running older code\n")
+                    sys.stderr.write(
+                        "devinx: replacing a service running older code"
+                        + (f"; its {info['inflight']} request(s) in flight finish "
+                           f"in the old process\n" if info.get("inflight") else "\n"))
                     state = "absent"
                 else:
                     sys.stderr.write(

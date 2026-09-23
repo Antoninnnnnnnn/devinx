@@ -61,8 +61,10 @@ output as a substitute for the allowlisted diagnostics.
   drain deadline can still terminate long-running requests when it expires.
 - Concurrent launchers with the same data directory and port use an OS file
   lock. A foreign service is never started over or killed. An older busy devinx
-  is still left running, with the existing warning. This is not automatic
-  blue/green deployment.
+  is replaced only if it reports a drain at least as long as its wait budget
+  (the default from now on), so its turns finish in the old process while the
+  new one takes new connections; older builds are still left running, with
+  the existing warning.
 - One service per port: the service holds a per-user port lock (under
   `/run/user/<uid>/devinx`, or `~/.cache/devinx/run`) for as long as it
   listens, whatever its data directory, and no longer sets `SO_REUSEPORT`; a
@@ -95,7 +97,7 @@ Settings are read when the **service starts**:
 | `DEVINX_LEAD_CAP` | 8000 | Token threshold above which the blocks leading into a flattened (collapsed) run of tool calls give way to text instead of replayed thinking, when unflattening a legacy history shape. |
 | `DEVINX_SUMMARY_TOKENS` | 16384 | `max_tokens` budget for the compaction summary call itself. |
 | `DEVINX_MID_CONV_REFUSALS` | 3 | How many times one conversation is told a mid-conversation system turn is not accepted before the proxy gives up and carries it through anyway. |
-| `DEVINX_DRAIN` | 300 | Seconds a shutting-down process gives the turns it is already carrying before cutting them short. |
+| `DEVINX_DRAIN` | 2400 | Seconds a shutting-down process gives the turns it is already carrying before cutting them short. It no longer listens by then, so a long drain only means a lingering process; when it covers `DEVINX_RATE_WAIT`, the launcher replaces a busy older service instead of leaving it running (POSIX only). |
 | `DEVINX_MAX_SWE_INFLIGHT` | 64 | Maximum SWE-2 turns handled at once, counted apart from `DEVINX_MAX_INFLIGHT`, so held subagent turns never take capacity from the main session. Excess receives 503 `overloaded_error` with Retry-After 1. |
 | `DEVINX_RATE_FLOOR` | 3 | Minimum seconds a credential leaves rotation after a rate-limit refusal, even when the upstream says "reset in 0 seconds". |
 

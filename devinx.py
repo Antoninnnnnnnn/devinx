@@ -219,7 +219,12 @@ _STARTED = time.time()
 # lines costs about a second, so a short cache keeps several open tabs from
 # each paying for it.
 # How long a process leaving gives the turns it is already carrying.
-DRAIN_SECONDS = int(os.environ.get("DEVINX_DRAIN", "300"))
+# Long enough for a turn held through a whole rate-limit budget (1800s) to
+# finish its answer. The draining process is no longer listening — the port
+# and its lock are already the successor's — so a long drain costs a
+# lingering process and nothing else, and it is what lets a launcher replace
+# a busy service instead of leaving old code running until a quiet moment.
+DRAIN_SECONDS = int(os.environ.get("DEVINX_DRAIN", "2400"))
 STATS_TTL = float(os.environ.get("DEVINX_STATS_TTL", "5"))
 # Reading the dashboard from anywhere but loopback costs this secret. Empty
 # means loopback only, which is the safe default for a service that never

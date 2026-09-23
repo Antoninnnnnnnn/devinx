@@ -164,5 +164,37 @@ class HelloProofTests(unittest.TestCase):
             self.assertEqual(launcher.service_state()[0], "foreign")
 
 
+class BusyStaleReplacementTests(unittest.TestCase):
+    def decide(self, drain, budget, inflight=3):
+        import contextlib
+        from unittest import mock
+        import launcher
+        info = {"service": "devinx", "build": "old", "pid": 4242, "inflight": inflight,
+                "configuration": {"DEVINX_DRAIN": drain, "DEVINX_RATE_WAIT": budget}}
+        stopped = []
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        with mock.patch.object(launcher, "startup_lock", lambda *a, **k: contextlib.nullcontext()), \
+             mock.patch.object(launcher, "service_state", return_value=("stale", info)), \
+             mock.patch.object(launcher, "stop_service", side_effect=lambda i: stopped.append(i) or True), \
+             mock.patch.object(launcher, "start_service", return_value=proc), \
+             mock.patch.object(launcher, "listening", return_value=True), \
+             mock.patch.object(launcher, "_validate_devinx_env", return_value=True), \
+             mock.patch.object(launcher.sys, "platform", "linux"), \
+             mock.patch.object(launcher.sys, "stderr"):
+            self.assertTrue(launcher.ensure_service())
+        return bool(stopped)
+
+    def test_a_service_that_drains_its_budget_is_replaced_while_busy(self):
+        self.assertTrue(self.decide(2400, 1800))
+
+    def test_an_older_build_that_would_cut_turns_is_left_running(self):
+        self.assertFalse(self.decide(300, 1800))
+        self.assertFalse(self.decide(None, None))
+
+    def test_an_idle_service_is_always_replaced(self):
+        self.assertTrue(self.decide(300, 1800, inflight=0))
+
+
 if __name__ == "__main__":
     unittest.main()
