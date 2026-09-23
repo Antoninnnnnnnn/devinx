@@ -19,8 +19,12 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import venv
+
+import diagnostics
+import launcher
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MIN_PYTHON = (3, 10)
@@ -146,11 +150,33 @@ def deps_satisfied(py):
         capture_output=True).returncode == 0
 
 
-def make_venv(force):
+def _running_service(port):
+    """The /api/hello payload of a devinx already listening on port, or None.
+
+    --force clears this exact virtualenv (venv.EnvBuilder(clear=True)); the
+    daemon a launcher generated from this install starts is exec'd with this
+    venv's own python, so a service still up on the configured port is almost
+    certainly running from the directory --force is about to empty out from
+    under it.
+    """
+    state, info = diagnostics.read_service("127.0.0.1", port)
+    return info if state == "running" else None
+
+
+def make_venv(force, port=None):
     py = venv_python(HERE)
     root = os.path.join(HERE, ".venv")
     req = os.path.join(HERE, "requirements.txt")
     uv = shutil.which("uv")
+
+    if force and port is not None:
+        running = _running_service(port)
+        if running:
+            pid = running.get("pid")
+            hint = f" ({launcher._kill_hint(pid)})" if isinstance(pid, int) else ""
+            die(f"a devinx service is already running on port {port}{hint} - "
+                f"--force would delete the virtualenv it is running from.\n"
+                f"       Stop it first, then run install.py --force again.")
 
     if os.path.exists(py) and not force:
         say(OK, "virtualenv already present")
@@ -234,7 +260,8 @@ def warn_shadowed(path):
     Python cannot see the live shell's functions, but the rc files that define
     them are readable."""
     name = os.path.basename(path).split(".")[0]
-    pattern = re.compile(rf"^\s*(?:function\s+)?{name}\s*\(\s*\)|^\s*alias\s+{name}=",
+    escaped = re.escape(name)
+    pattern = re.compile(rf"^\s*(?:function\s+)?{escaped}\s*\(\s*\)|^\s*alias\s+{escaped}=",
                          re.M)
     for rc in ("~/.bashrc", "~/.bash_profile", "~/.bash_aliases", "~/.zshrc",
                "~/.profile"):
@@ -247,7 +274,13 @@ def warn_shadowed(path):
         m = pattern.search(text)
         if m:
             line = text[:m.start()].count("\n") + 1
-            if "devinx" in text:
+            # Checking for the literal name (`devinx`) here is tautological:
+            # the match that got us into this branch already requires that
+            # exact string, so it is always present and this check could
+            # never fire the warning below. Looking for the actual launcher
+            # script instead — the thing the README's wiring snippet delegates
+            # to — tells shadowing-but-wired-through apart from shadowing.
+            if "launcher.py" in text:
                 # Already wired to delegate; shadowing the PATH launcher is then
                 # intentional rather than a problem.
                 say(OK, f"{rc}:{line} defines `{name}` and already handles devinx")
@@ -416,22 +449,28 @@ def install_codex(force):
     if os.path.exists(profile) and not force:
         say(WARN, f"{profile} exists - keeping it (use --force to overwrite)")
     else:
+        # market is a filesystem path, pasted verbatim into a config file
+        # Codex will parse as TOML: an unescaped quote, backslash (every
+        # Windows path) or non-BMP character (an emoji anywhere in the
+        # install path) produced a broken profile. _toml_string() is the
+        # same escaping launcher.py already uses for its own -c overrides.
         with open(profile, "w", encoding="utf-8") as fh:
             fh.write("# Written by devinx install.py. Inert unless selected with\n"
                      "# `-p devinx`, which the devinx launcher passes only for\n"
                      "# --codex --or sessions.\n"
                      "[marketplaces.devinx]\n"
                      'source_type = "local"\n'
-                     f'source = "{market}"\n\n'
+                     f'source = {launcher._toml_string(market)}\n\n'
                      '[plugins."swe-orchestrator@devinx"]\n'
                      "enabled = true\n")
         say(OK, f"codex profile written: {profile}")
 
     # The plugin has to be materialised into the cache; a profile alone leaves
-    # it "not installed" and the skill never loads.
+    # it "not installed" and the skill never loads. Same escaping concern as
+    # the profile file above, this time for a -c override on the command line.
     r = subprocess.run(
         ["codex", "-c", 'marketplaces.devinx.source_type="local"',
-         "-c", f'marketplaces.devinx.source="{market}"',
+         "-c", f'marketplaces.devinx.source={launcher._toml_string(market)}',
          "plugin", "add", "swe-orchestrator@devinx"],
         capture_output=True, text=True)
     if r.returncode:
@@ -464,7 +503,11 @@ def check_credential():
 
 def smoke(py, have_credential):
     port = free_port()
-    env = dict(os.environ, DEVINX_PORT=str(port))
+    # DEVINX_DASHBOARD_PORT=0: the smoke instance is transient and on a port
+    # nothing else knows about, so its dashboard listener has no business
+    # binding a real port (8317 by default) that a concurrent real service
+    # would want.
+    env = dict(os.environ, DEVINX_PORT=str(port), DEVINX_DASHBOARD_PORT="0")
     log = open(os.path.join(data_dir(), "install-smoke.log"), "wb")
     os.makedirs(data_dir(), exist_ok=True)
     proc = subprocess.Popen([py, os.path.join(HERE, "devinx.py")],
@@ -485,8 +528,14 @@ def smoke(py, have_credential):
         else:
             die("devinx did not start within 30s")
 
-        with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
-            models = [m["id"] for m in json.loads(r.read())["data"]]
+        try:
+            with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
+                models = [m["id"] for m in json.loads(r.read())["data"]]
+        except urllib.error.HTTPError as error:
+            die(f"smoke test: /v1/models returned HTTP {error.code} - "
+                f"{error.read()[:300]!r}")
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            die(f"smoke test: could not reach /v1/models - {error}")
         say(OK, f"service responds: {', '.join(models)}")
 
         if not have_credential:
@@ -500,8 +549,14 @@ def smoke(py, have_credential):
         req = urllib.request.Request(base + "/v1/messages", body,
                                      {"content-type": "application/json",
                                       "anthropic-version": "2023-06-01"})
-        with urllib.request.urlopen(req, timeout=180) as r:
-            d = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                d = json.loads(r.read())
+        except urllib.error.HTTPError as error:
+            die(f"smoke test: the live SWE-2 call returned HTTP {error.code} - "
+                f"{error.read()[:300]!r}")
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            die(f"smoke test: the live SWE-2 call failed - {error}")
         text = "".join(b.get("text", "") for b in d.get("content", [])
                        if b.get("type") == "text")
         usage = d.get("usage", {})
@@ -539,7 +594,7 @@ def main():
     check_python()
     check_claude()
     check_descriptors()
-    py = make_venv(args.force)
+    py = make_venv(args.force, args.port)
     os.makedirs(data_dir(), exist_ok=True)
     say(OK, f"data directory: {data_dir()}")
     if args.global_agents:
