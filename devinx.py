@@ -411,12 +411,20 @@ def _peer_open(sock):
 
     A closed peer reads as readable-with-nothing-to-read; a client that sent
     more (a pipelined request) reads as readable-with-data and is still there.
-    Nothing is consumed either way.
+    Nothing is consumed either way. A check that cannot be made answers
+    "still there": abandoning a live turn is the worse mistake of the two.
+    poll() where it exists, because select() refuses any descriptor past
+    FD_SETSIZE (1024) with a ValueError on a busy service.
     """
     try:
-        readable, _, _ = select.select([sock], [], [], 0)
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(sock, select.POLLIN)
+            readable = poller.poll(0)
+        else:
+            readable, _, _ = select.select([sock], [], [], 0)
     except (OSError, ValueError):
-        return False
+        return True
     if not readable:
         return True
     try:
@@ -2842,8 +2850,9 @@ def _run_swe(body, out):
             if wait > 0:
                 wait += random.uniform(0, min(5.0, wait * 0.1))
                 print(f"upstream rate limited on every credential, holding "
-                      f"the turn for {wait:.0f}s ({turn.spent():.0f}s of "
-                      f"{turn.budget}s spent so far)", flush=True)
+                      f"the turn for {wait:.0f}s "
+                      f"({turn.spent():.0f}s waited so far)",
+                      flush=True)
                 _request_phase("waiting_rate_limit")
                 turn.sleep(wait)
                 acct, _ = claim_account()
@@ -2860,8 +2869,9 @@ def _run_swe(body, out):
             wait = min(15 * 2 ** (outages - 1), 120, turn.left())
             if wait > 0:
                 print(f"upstream unavailable (provider outage), holding the "
-                      f"turn for {wait:.0f}s ({turn.spent():.0f}s of "
-                      f"{turn.budget}s spent so far)", flush=True)
+                      f"turn for {wait:.0f}s "
+                      f"({turn.spent():.0f}s waited so far)",
+                      flush=True)
                 _request_phase("waiting_outage")
                 turn.sleep(wait)
                 continue
@@ -3489,11 +3499,15 @@ class Handler(BaseHTTPRequestHandler):
             r = SESSION.get(CODEX_UPSTREAM + "/models"
                             + (f"?{query}" if query else ""),
                             headers=headers, timeout=(10, 20))
-            upstream = r.json().get("models") if r.status_code == 200 else None
-        except (requests.RequestException, ValueError):
-            upstream = None
+            status = r.status_code
+            upstream = r.json().get("models") if status == 200 else None
+        except (requests.RequestException, ValueError) as e:
+            status, upstream = type(e).__name__, None
         if not isinstance(upstream, list):
-            print("codex catalog: upstream unavailable, serving swe-2 only",
+            # The status is the only clue when the forwarded headers turn out
+            # to be missing one the upstream wants.
+            print(f"codex catalog: upstream unavailable ({status}), serving "
+                  f"swe-2 only",
                   flush=True)
             return rows
         for entry in upstream:

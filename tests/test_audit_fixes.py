@@ -942,5 +942,31 @@ class BuildIdTests(unittest.TestCase):
             self.assertNotEqual(runtime_support.build_id(self.root), base)
 
 
+class PeerOpenTests(unittest.TestCase):
+    """The liveness check: closed means gone, unknown means still there."""
+
+    def test_open_closed_and_uncheckable(self):
+        import socket
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.assertTrue(devinx._peer_open(a))
+        b.sendall(b'pipelined')
+        self.assertTrue(devinx._peer_open(a), 'pending data read as gone')
+        self.assertEqual(a.recv(64), b'pipelined', 'the peek consumed data')
+        with mock.patch.object(devinx.select, 'poll', side_effect=ValueError('fd')), \
+             mock.patch.object(devinx.select, 'select', side_effect=ValueError('fd')):
+            self.assertTrue(devinx._peer_open(a))
+        b.close()
+        self.assertFalse(devinx._peer_open(a))
+
+    def test_hold_lines_still_read_by_the_log_extractor(self):
+        from tools import log_stats
+        line = 'upstream rate limited on every credential, holding the turn for 4s (12s waited so far)'
+        self.assertEqual(log_stats.RE_HOLD.search(line).group(1), '4')
+        self.assertEqual(log_stats.RE_HELD_SO_FAR.search(line).group(1), '12')
+        src = (ROOT / 'devinx.py').read_text(encoding='utf-8')
+        self.assertEqual(src.count('waited so far)"'), 2)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
