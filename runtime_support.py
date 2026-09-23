@@ -27,24 +27,57 @@ CONFIG_FIELDS = {
 }
 
 
+# The libraries the service's behaviour depends on. A dependency upgrade is a
+# new service as much as a code change is, and must read as one.
+DEPENDENCIES = ('protobuf', 'requests', 'urllib3')
+
+
+def _dependency_versions():
+    try:
+        from importlib import metadata
+    except ImportError:
+        return []
+    out = []
+    for name in DEPENDENCIES:
+        try:
+            out.append(f'{name}={metadata.version(name)}')
+        except Exception:
+            out.append(f'{name}=absent')
+    return out
+
+
 def build_id(directory):
-    """Fingerprint shipped runtime code/descriptors, not local state or secrets."""
+    """Fingerprint shipped runtime code/descriptors, not local state or secrets.
+
+    A file that cannot be read is fingerprinted by its absence rather than
+    turning the whole id into 'unknown': 'unknown' switches stale-service
+    detection off altogether, so one missing dashboard file used to leave
+    last week's service serving today's launcher without a word. Launcher and
+    service both call this, from the same interpreter, so they agree.
+    """
     root = Path(directory)
     files = [root / name for name in (
         'devinx.py', 'runtime_support.py', 'diagnostics.py',
         'tools/log_stats.py', 'tools/dashboard.html')]
-    files.extend(sorted((root / 'descriptors').glob('*.fdp')))
-    digest = hashlib.sha256()
     try:
-        for path in files:
-            data = path.read_bytes()
-            digest.update(str(path.relative_to(root)).replace('\\', '/').encode())
-            digest.update(b'\0')
-            digest.update(len(data).to_bytes(8, 'big'))
-            digest.update(data)
-        return digest.hexdigest()[:12]
+        files.extend(sorted((root / 'descriptors').glob('*.fdp')))
     except OSError:
-        return 'unknown'
+        pass
+    digest = hashlib.sha256()
+    for path in files:
+        name = str(path.relative_to(root)).replace('\\', '/').encode()
+        try:
+            data = path.read_bytes()
+        except OSError:
+            digest.update(b'missing\0' + name + b'\0')
+            continue
+        digest.update(name)
+        digest.update(b'\0')
+        digest.update(len(data).to_bytes(8, 'big'))
+        digest.update(data)
+    for version in _dependency_versions():
+        digest.update(b'dep\0' + version.encode() + b'\0')
+    return digest.hexdigest()[:12]
 
 
 @contextlib.contextmanager

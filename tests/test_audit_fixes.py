@@ -907,5 +907,40 @@ class CompactionCostTests(unittest.TestCase):
         self.assertIn('<conversation>', json.dumps(body))
 
 
+class BuildIdTests(unittest.TestCase):
+    """L8: a missing file or a new dependency still yields a usable build id."""
+
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        for name in ('devinx.py', 'runtime_support.py', 'diagnostics.py',
+                     'tools/log_stats.py', 'tools/dashboard.html', 'descriptors/a.fdp'):
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(name)
+
+    def test_a_missing_file_changes_the_id_instead_of_disabling_it(self):
+        import runtime_support
+        full = runtime_support.build_id(self.root)
+        (self.root / 'tools/dashboard.html').unlink()
+        partial = runtime_support.build_id(self.root)
+        self.assertNotEqual(partial, 'unknown')
+        self.assertNotEqual(partial, full)
+        (self.root / 'tools/dashboard.html').write_text('tools/dashboard.html')
+        (self.root / 'diagnostics.py').unlink()
+        self.assertNotEqual(runtime_support.build_id(self.root), partial)
+
+    def test_dependency_versions_are_part_of_the_id(self):
+        import runtime_support
+        base = runtime_support.build_id(self.root)
+        self.assertTrue(any(v.startswith('protobuf=')
+                            for v in runtime_support._dependency_versions()))
+        with mock.patch.object(runtime_support, '_dependency_versions',
+                               return_value=['protobuf=0.0', 'requests=1', 'urllib3=2']):
+            self.assertNotEqual(runtime_support.build_id(self.root), base)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
