@@ -301,10 +301,20 @@ BUILD = _build_id()
 # In-flight requests, so a restart can wait for an idle moment rather than
 # cutting a turn in half.
 _inflight_lock = threading.Lock()
-_inflight = {"n": 0}
+# "n" is everything in flight, which is what a drain waits for; "swe" is the
+# part of it that is SWE-2 turns, which have a cap of their own.
+_inflight = {"n": 0, "swe": 0}
 _active_requests = {}
 _request_local = threading.local()
+# Two caps, because the two kinds of work do not wait alike. A SWE-2 turn can
+# be held for up to the whole rate-limit budget; a relayed claude-*/gpt-* turn
+# or a count_tokens call is the main session and is never held. Under one
+# shared cap a fleet of held subagents filled every slot and the session that
+# launched them was answered 503. MAX_INFLIGHT covers everything that is not a
+# SWE-2 turn — relays, count_tokens, bodies still being read — and
+# MAX_SWE_INFLIGHT the SWE-2 turns. 0 disables either.
 MAX_INFLIGHT = int(os.environ.get("DEVINX_MAX_INFLIGHT", "64"))
+MAX_SWE_INFLIGHT = int(os.environ.get("DEVINX_MAX_SWE_INFLIGHT", "64"))
 HTTP_READ_TIMEOUT = float(os.environ.get("DEVINX_HTTP_READ_TIMEOUT", "30"))
 CLIENT_WRITE_TIMEOUT = float(os.environ.get("DEVINX_CLIENT_WRITE_TIMEOUT", "120"))
 RELAY_READ_TIMEOUT = float(os.environ.get("DEVINX_RELAY_READ_TIMEOUT", "0")) or None
@@ -335,7 +345,8 @@ def live_requests():
 def _enter_request():
     key, now = uuid.uuid4().hex[:12], time.monotonic()
     with _inflight_lock:
-        if MAX_INFLIGHT > 0 and _inflight["n"] >= MAX_INFLIGHT:
+        general = _inflight["n"] - _inflight.get("swe", 0)
+        if MAX_INFLIGHT > 0 and general >= MAX_INFLIGHT:
             return False
         _inflight["n"] += 1
         _active_requests[key] = {"id": key, "model": None,
@@ -345,11 +356,32 @@ def _enter_request():
     return True
 
 
+def _enter_swe():
+    """Move this request from the general slots to a SWE-2 one.
+
+    Called once the body says it is a SWE-2 turn. The request stays counted
+    in "n" throughout, so a drain never loses sight of it.
+    """
+    key = getattr(_request_local, "key", None)
+    with _inflight_lock:
+        entry = _active_requests.get(key)
+        if entry is None or entry.get("swe"):
+            return True
+        if MAX_SWE_INFLIGHT > 0 and _inflight.get("swe", 0) >= MAX_SWE_INFLIGHT:
+            return False
+        entry["swe"] = True
+        _inflight["swe"] = _inflight.get("swe", 0) + 1
+        return True
+
+
 def _leave_request():
     key = getattr(_request_local, "key", None)
     with _inflight_lock:
-        if _active_requests.pop(key, None) is not None:
+        entry = _active_requests.pop(key, None)
+        if entry is not None:
             _inflight["n"] -= 1
+            if entry.get("swe"):
+                _inflight["swe"] = _inflight.get("swe", 0) - 1
     _request_local.key = None
 
 
@@ -3573,6 +3605,10 @@ class Handler(BaseHTTPRequestHandler):
         if model in SWE_MODEL_IDS:
             if path.endswith("count_tokens"):
                 self.send_json(200, {"input_tokens": estimate_tokens(body)})
+                return
+            if not _enter_swe():
+                self.send_error_json(503, "overloaded_error",
+                                     "Local SWE-2 capacity reached; retry later", 1)
                 return
             if path == "/v1/responses":
                 self.serve_swe_responses(body)

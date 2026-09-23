@@ -476,5 +476,100 @@ class ClientGoneTests(unittest.TestCase):
                          'the turn went upstream after its client left')
 
 
+class SweCapacityTests(unittest.TestCase):
+    """P2: held SWE-2 turns must not starve the main session's relays."""
+
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.release = threading.Event()
+        self.entered = threading.Semaphore(0)
+
+        def chat(req, acct=None, purpose='turn'):
+            self.entered.release()
+            self.release.wait(10)
+            yield frame('done', stop=1), None
+
+        relayed = mock.Mock(status_code=200, headers={'content-type': 'application/json'})
+        relayed.raw.stream.return_value = iter([b'{"relayed": true}'])
+        self.stack.enter_context(isolated_accounts(fake_accounts('a')))
+        for name, value in {'MAX_INFLIGHT': 2, 'MAX_SWE_INFLIGHT': 2,
+                            'KEEPALIVE_EVERY': 0, 'chat_stream': chat,
+                            '_inflight': {'n': 0, 'swe': 0},
+                            '_active_requests': {}}.items():
+            self.stack.enter_context(mock.patch.object(devinx, name, value))
+        self.stack.enter_context(mock.patch.object(devinx, 'compact_body', side_effect=lambda b: b))
+        self.stack.enter_context(mock.patch.object(devinx, 'build_request', return_value=(
+            SimpleNamespace(cascade_id='test'), 'swe-2-max')))
+        self.stack.enter_context(mock.patch.object(
+            devinx, 'paced', return_value=contextlib.nullcontext()))
+        self.relay = self.stack.enter_context(
+            mock.patch.object(devinx.SESSION, 'request', return_value=relayed))
+        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.live = LiveServer()
+        self.stack.callback(self.live.close)
+        self.stack.callback(self.release.set)
+
+    def post(self, body, headers=None, path='/v1/messages'):
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', self.live.port, timeout=10)
+        try:
+            conn.request('POST', path, body=json.dumps(body),
+                         headers=dict({'content-type': 'application/json'}, **(headers or {})))
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+    def test_relays_and_count_tokens_are_served_while_swe_turns_are_held(self):
+        swe = {'model': 'swe-2-max', 'max_tokens': 8,
+               'messages': [{'role': 'user', 'content': 'hi'}]}
+        results = []
+        held = [threading.Thread(target=lambda: results.append(self.post(swe)))
+                for _ in range(2)]
+        for t in held:
+            t.start()
+        for _ in held:
+            self.assertTrue(self.entered.acquire(timeout=5))
+        # Every SWE-2 slot is taken: a third SWE-2 turn is refused ...
+        self.assertEqual(self.post(swe)[0], 503)
+        # ... and the main session is not.
+        claude = {'model': 'claude-opus-5', 'max_tokens': 8,
+                  'messages': [{'role': 'user', 'content': 'hi'}]}
+        for _ in range(3):
+            status, raw = self.post(claude, {'Authorization': 'Bearer test'})
+            self.assertEqual(status, 200, raw)
+        self.assertEqual(self.post(swe, path='/v1/messages/count_tokens')[0], 200)
+        # The last reply can reach the client a moment before its handler
+        # gives its slot back.
+        deadline = time.time() + 2
+        while devinx._inflight['n'] > 2 and time.time() < deadline:
+            time.sleep(0.02)
+        with devinx._inflight_lock:
+            self.assertEqual(devinx._inflight, {'n': 2, 'swe': 2},
+                             'a drain would not see the held turns')
+        self.release.set()
+        for t in held:
+            t.join(5)
+        self.assertEqual([s for s, _ in results], [200, 200])
+        deadline = time.time() + 2
+        while devinx._inflight['n'] and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(devinx._inflight, {'n': 0, 'swe': 0})
+
+    def test_the_general_cap_still_bounds_everything_else(self):
+        with mock.patch.object(devinx, '_request_local', threading.local()):
+            self.assertTrue(devinx._enter_request())
+            self.assertTrue(devinx._enter_swe())
+            first = devinx._request_local.key
+            devinx._request_local.key = None
+            self.assertTrue(devinx._enter_request())
+            self.assertTrue(devinx._enter_request())
+            self.assertFalse(devinx._enter_request(), 'general cap not applied')
+            devinx._request_local.key = first
+            devinx._leave_request()
+        self.assertEqual(devinx._inflight['swe'], 0)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
