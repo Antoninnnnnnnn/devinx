@@ -753,5 +753,53 @@ class ReloadTests(unittest.TestCase):
             slow.join(5)
 
 
+class DocumentBlockTests(unittest.TestCase):
+    """P11: a document is carried as text when it is text, and never lost silently."""
+
+    PDF = {'type': 'document', 'title': 'spec.pdf', 'source': {
+        'type': 'base64', 'media_type': 'application/pdf', 'data': 'JVBERi0x'}}
+    TXT = {'type': 'document', 'source': {
+        'type': 'text', 'media_type': 'text/plain', 'data': 'PLAIN-DOC-TEXT'}}
+
+    def build(self, messages):
+        log = io.StringIO()
+        with mock.patch.object(devinx, 'api_key', return_value='test-only'), \
+             contextlib.redirect_stdout(log):
+            req, _ = devinx.build_request({'model': 'swe-2-max', 'messages': messages})
+        return req, log.getvalue()
+
+    def test_documents_inside_a_tool_result(self):
+        req, log = self.build([
+            {'role': 'user', 'content': 'read it'},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 't1', 'name': 'Read', 'input': {}}]},
+            {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 't1',
+                                          'content': [{'type': 'text', 'text': 'head'},
+                                                      self.PDF, self.TXT]}]}])
+        tool = [p for p in req.chat_message_prompts if p.tool_call_id == 't1'][0]
+        self.assertIn('head', tool.prompt)
+        self.assertIn('PLAIN-DOC-TEXT', tool.prompt)
+        self.assertIn("[document 'spec.pdf' (application/pdf) omitted", tool.prompt)
+        self.assertNotIn('JVBERi0x', str(req))
+        self.assertIn('dropped unsupported content blocks: document/base64', log)
+
+    def test_top_level_text_document_is_carried(self):
+        req, log = self.build([{'role': 'user', 'content': [
+            {'type': 'text', 'text': 'see attached '}, self.TXT, self.PDF]}])
+        self.assertIn('PLAIN-DOC-TEXT', req.chat_message_prompts[0].prompt)
+        self.assertIn('omitted', req.chat_message_prompts[0].prompt)
+        self.assertIn('document/base64', log)
+
+    def test_text_only_results_are_unchanged(self):
+        block = {'type': 'tool_result', 'tool_use_id': 't',
+                 'content': [{'type': 'text', 'text': 'a'}, {'type': 'text', 'text': 'b'}]}
+        self.assertEqual(devinx._tool_result_text(block), 'ab')
+
+    def test_a_text_document_counts_toward_the_estimate(self):
+        body = {'messages': [{'role': 'user', 'content': [
+            {'type': 'document', 'source': {'type': 'text', 'data': 'x' * 40000}}]}]}
+        self.assertGreater(devinx.estimate_tokens(body), 9000)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

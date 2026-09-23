@@ -1006,12 +1006,54 @@ def _image_of(block):
             "mime_type": src.get("media_type") or "image/png"}
 
 
-def _tool_result_text(block):
-    """tool_result content is a string or a list of blocks (text and/or image)."""
+def _document_text(block):
+    """(text, None) for a document the upstream can be given as text, or
+    (placeholder, label) for one it cannot.
+
+    Cognition takes text and images and nothing else, so a PDF has nowhere to
+    go. It used to vanish without a word when it sat inside a tool_result —
+    the Read tool returns PDFs that way — and the model answered as if it had
+    read a file it never saw. A document whose source is plain text loses
+    nothing by being sent as text; any other kind is replaced by a line
+    saying it was left out, so the model knows to say so.
+    """
+    src = block.get("source") or {}
+    title = block.get("title") or ""
+    head = f"[document: {title}]\n" if title else ""
+    if src.get("type") == "text" and isinstance(src.get("data"), str):
+        return head + src["data"], None
+    if src.get("type") == "content":
+        text = _text_of(src.get("content"))
+        if text:
+            return head + text, None
+    kind = src.get("media_type") or src.get("type") or "unknown"
+    name = f" {title!r}" if title else ""
+    return (f"[document{name} ({kind}) omitted: this model cannot read it]",
+            f"document/{src.get('type')}")
+
+
+def _tool_result_text(block, dropped=None):
+    """tool_result content is a string or a list of blocks (text, images,
+    documents). Images travel separately; anything else is named in
+    `dropped` when the caller keeps that list."""
     content = block.get("content")
     if isinstance(content, str):
         return content
-    return _text_of(content)
+    text, documents = [], False
+    for b in _blocks(content):
+        kind = b.get("type")
+        if kind == "text":
+            text.append(b.get("text", ""))
+        elif kind == "document":
+            doc, lost = _document_text(b)
+            text.append(doc)
+            documents = True
+            if lost and dropped is not None:
+                dropped.append(lost)
+        elif kind != "image" and dropped is not None:
+            dropped.append(f"tool_result/{kind}")
+    # Text blocks join as they always have; a document gets lines of its own.
+    return ("\n" if documents else "").join(text)
 
 
 def _system_text(body):
@@ -1213,12 +1255,15 @@ def build_request(body, tool_desc_cap=None):
                         "message_id": mid("tool", b),
                         "source": SRC_TOOL,
                         "tool_call_id": b.get("tool_use_id", ""),
-                        "prompt": _tool_result_text(b),
+                        "prompt": _tool_result_text(b, dropped),
                         # Without this a failed tool call replays as a successful
                         # one and the model has to infer failure from the text.
                         "tool_result_is_error": bool(b.get("is_error")),
+                        # Image blocks only. Any base64 source used to pass,
+                        # so a PDF went up as an "image" of application/pdf.
                         "images": [img for img in
-                                   (_image_of(x) for x in _blocks(b.get("content")))
+                                   (_image_of(x) for x in _blocks(b.get("content"))
+                                    if x.get("type") == "image")
                                    if img],
                     })
                 elif kind == "text":
@@ -1230,6 +1275,11 @@ def build_request(body, tool_desc_cap=None):
                     else:
                         dropped.append("image/" + str(
                             (b.get("source") or {}).get("type")))
+                elif kind == "document":
+                    doc, lost = _document_text(b)
+                    text_parts.append(doc)
+                    if lost:
+                        dropped.append(lost)
                 else:
                     dropped.append(str(kind))
             if text_parts or images:
@@ -3958,8 +4008,10 @@ def _content_chars(obj):
     if isinstance(obj, str):
         return len(obj)
     if isinstance(obj, dict):
+        # A text document's words sit under `data` too, and they are sent.
         return sum(_content_chars(v) for k, v in obj.items()
-                   if k not in _UNCOUNTED_KEYS)
+                   if k not in _UNCOUNTED_KEYS
+                   or (k == "data" and obj.get("type") == "text"))
     if isinstance(obj, (list, tuple)):
         return sum(_content_chars(v) for v in obj)
     return 0
