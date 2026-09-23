@@ -32,6 +32,7 @@ import json
 import os
 import random
 import re
+import select
 import struct
 import subprocess
 import signal
@@ -350,6 +351,99 @@ def _leave_request():
         if _active_requests.pop(key, None) is not None:
             _inflight["n"] -= 1
     _request_local.key = None
+
+
+class ClientGone(BaseException):
+    """The client hung up while its turn was being held.
+
+    A BaseException on purpose. Between the wait and the handler sit several
+    `except Exception` rescues — compaction failing forwards the turn as is, a
+    dropped connection is retried — and each of them would carry on with the
+    turn for nobody, spending requests on a quota metered in requests.
+    """
+
+
+# What run_swe hands back when there is nobody left to answer.
+CLIENT_GONE = "client_gone: the client disconnected while its turn was held"
+
+
+def _peer_open(sock):
+    """False once the client has closed its end of the connection.
+
+    A closed peer reads as readable-with-nothing-to-read; a client that sent
+    more (a pipelined request) reads as readable-with-data and is still there.
+    Nothing is consumed either way.
+    """
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        return False
+    if not readable:
+        return True
+    try:
+        return bool(sock.recv(1, socket.MSG_PEEK))
+    except (BlockingIOError, InterruptedError, socket.timeout):
+        return True
+    except OSError:
+        return False
+
+
+class Turn:
+    """One client turn: a single wait budget, and whether its client is there.
+
+    One deadline for everything the turn may be held for — the summary, the
+    fold of the summary and the turn's own rate-limit and outage waits. Each
+    used to get a budget of its own, so one turn could be held three times
+    over, an hour and a half, while occupying a slot and its conversation's
+    compaction lock.
+
+    Waits are counted as well as timed, so the budget is spent by waiting even
+    where the clock says otherwise, and they are taken in short steps so a
+    client that left is noticed within half a second instead of at the end
+    of a thirty-minute hold.
+    """
+
+    STEP = 0.5
+
+    def __init__(self, conn=None, gone=None, budget=None):
+        self.budget = RATE_WAIT_BUDGET if budget is None else budget
+        self.deadline = time.time() + self.budget
+        self.slept = 0.0
+        self.conn = conn
+        self.gone = gone if gone is not None else threading.Event()
+
+    def left(self):
+        return min(self.deadline - time.time(), self.budget - self.slept)
+
+    def spent(self):
+        return max(0.0, self.budget - self.left())
+
+    def client_gone(self):
+        if self.gone.is_set():
+            return True
+        if self.conn is not None and not _peer_open(self.conn):
+            self.gone.set()
+            return True
+        return False
+
+    def check(self):
+        if self.client_gone():
+            raise ClientGone()
+
+    def sleep(self, seconds):
+        remaining = max(0.0, seconds)
+        while remaining > 0:
+            self.check()
+            step = min(remaining, self.STEP)
+            time.sleep(step)
+            self.slept += step
+            remaining -= step
+        self.check()
+
+
+def current_turn():
+    """The turn this thread is serving, or a fresh one outside any turn."""
+    return getattr(_request_local, "turn", None) or Turn()
 
 
 # --------------------------------------------------------------------------- #
@@ -1391,7 +1485,7 @@ def _summary_body(messages, model, system, previous):
 _TOO_LONG = object()
 
 
-def _summarise_once(messages, model, system, previous, deadline):
+def _summarise_once(messages, model, system, previous, turn):
     """One summary, waited for rather than given up on.
 
     Every way this call used to fail is something that passes: a credential
@@ -1399,9 +1493,10 @@ def _summarise_once(messages, model, system, previous, deadline):
     and on 2026-09-23 this was the whole story: 39 agents lost the middle of
     their run because both accounts refused at the same instant and this
     function returned None without a word), the provider being down, a dropped
-    connection, an empty answer. So each of them is waited out, up to the same
-    budget a turn gets. The client does not see the wait as silence: the
-    keepalive is armed before compaction starts.
+    connection, an empty answer. So each of them is waited out, within the
+    turn's own budget: the summary is part of the turn, not a second hold on
+    top of it. The client does not see the wait as silence: the keepalive is
+    armed before compaction starts. A client that leaves ends it (ClientGone).
 
     Returns the text, None when the budget is spent or the error is not one
     that passes, or _TOO_LONG when the transcript itself is too big to be read
@@ -1410,17 +1505,11 @@ def _summarise_once(messages, model, system, previous, deadline):
     req, _ = build_request(_summary_body(messages, model, system, previous))
     t0 = time.time()
     acct, empties, outages, drops, others = None, 0, 0, 0, 0
-    # The waits are counted as well as timed, so the budget is spent by
-    # waiting even where the clock says otherwise.
-    budget, slept = deadline - t0, 0.0
-
-    def pause(seconds):
-        nonlocal slept
-        time.sleep(seconds)
-        slept += seconds
+    pause = turn.sleep
 
     while True:
-        left = min(deadline - time.time(), budget - slept)
+        turn.check()
+        left = turn.left()
         if left <= 0:
             print(f"summary: {time.time() - t0:.0f}s of waiting spent without "
                   f"an answer", flush=True)
@@ -1559,7 +1648,9 @@ def summarise_turns(messages, model, system, previous=None, never_empty=True):
     """
     if not messages:
         return None
-    deadline = time.time() + RATE_WAIT_BUDGET
+    # The turn's budget, not a fresh one (see Turn); outside a turn — tests,
+    # tools — a budget of its own.
+    turn = current_turn()
     summary, added = previous, []
     pending = _chunks(messages, SUMMARY_INPUT_CAP)
     if len(pending) > 1:
@@ -1567,7 +1658,7 @@ def summarise_turns(messages, model, system, previous=None, never_empty=True):
               flush=True)
     while pending:
         piece = pending.pop(0)
-        got = _summarise_once(piece, model, system, summary, deadline)
+        got = _summarise_once(piece, model, system, summary, turn)
         if got is _TOO_LONG and len(piece) > 1:
             half = len(piece) // 2
             pending[:0] = [piece[:half], piece[half:]]
@@ -2058,7 +2149,78 @@ def _stop_reason(stop, has_tools):
     return "end_turn"
 
 
-class AnthropicStream:
+class _KeepAlive:
+    """The keepalive both emitters share, and the client-gone flag it raises.
+
+    A turn that spends four minutes reasoning before its first token sends no
+    bytes at all, and both clients give up on a stream that has been silent for
+    five: Claude Code reports "The response stopped arriving", Codex drops the
+    stream and sends the request again — a duplicate, held in parallel with
+    the first. Each emitter says in _keepalive() what a harmless event is in
+    its own dialect.
+
+    The first keepalive is also the point of no return: writing it commits to
+    a 200, so an upstream refusal after that is an SSE error event rather than
+    an HTTP status. That is the same trade the real API makes, and it only
+    applies to turns already slower than any retry would be.
+
+    Every write goes through _write(), which sets `gone` when the socket
+    refuses it. That flag is the turn's: a keepalive that finds the client
+    gone used to stop in silence and leave the turn retrying for nobody.
+    """
+
+    def _keep_alive_init(self):
+        # One writer at a time: the keepalive runs on its own thread and an
+        # interleaved write would split an event in half on the wire.
+        self._wlock = threading.RLock()
+        self._last_write = time.time()
+        self._done = threading.Event()
+        self._alive = None
+        self.gone = threading.Event()
+
+    def _write(self, data):
+        try:
+            self.w.write(data)
+            self.w.flush()
+        except OSError:
+            self.gone.set()
+            raise
+        self._last_write = time.time()
+
+    def arm(self):
+        """Hold the connection open while the upstream thinks."""
+        if KEEPALIVE_EVERY <= 0 or self._alive is not None:
+            return
+
+        def loop():
+            while not self._done.wait(1.0):
+                if time.time() - self._last_write < KEEPALIVE_EVERY:
+                    continue
+                try:
+                    with self._wlock:
+                        if self._done.is_set():
+                            return
+                        if not self.started:
+                            self.start()
+                        else:
+                            self._keepalive()
+                except Exception:
+                    # The client is gone, or the socket is. Either way there is
+                    # nothing left to keep alive — and the turn has to know.
+                    self.gone.set()
+                    return
+
+        self._alive = threading.Thread(target=loop, daemon=True)
+        self._alive.start()
+
+    def release(self):
+        # Synchronise with a keepalive that may be about to commit HTTP 200.
+        # Once this returns the caller can decide safely between HTTP and SSE.
+        with self._wlock:
+            self._done.set()
+
+
+class AnthropicStream(_KeepAlive):
     """Emits the Anthropic SSE event sequence onto a raw socket.
 
     Blocks are opened lazily and closed when the next kind of content starts.
@@ -2084,70 +2246,23 @@ class AnthropicStream:
         self.pending_signature = None
         self.started = False
         self.tools = {}
-        # One writer at a time: the keepalive runs on its own thread and an
-        # interleaved write would split an event in half on the wire.
-        self._wlock = threading.RLock()
-        self._last_write = time.time()
-        self._done = threading.Event()
-        self._alive = None
+        self._keep_alive_init()
 
-    def arm(self):
-        """Hold the connection open while the upstream thinks.
-
-        A turn that spends four minutes reasoning before its first token sends
-        no bytes at all, and the client gives up on a stream that has been
-        silent for five. Emitting `ping` the way Anthropic's own API does costs
-        nothing and makes that silence impossible.
-
-        The first keepalive is also the point of no return: writing it commits
-        to a 200, so an upstream refusal after that is an SSE error event
-        rather than an HTTP status. That is the same trade the real API makes,
-        and it only applies to turns already slower than any retry would be.
-        """
-        if KEEPALIVE_EVERY <= 0 or self._alive is not None:
-            return
-
-        def loop():
-            while not self._done.wait(1.0):
-                if time.time() - self._last_write < KEEPALIVE_EVERY:
-                    continue
-                try:
-                    with self._wlock:
-                        if self._done.is_set():
-                            return
-                        if not self.started:
-                            self.start()
-                        else:
-                            self._send("ping", {"type": "ping"})
-                except Exception:
-                    # The client is gone, or the socket is. Either way there is
-                    # nothing left to keep alive.
-                    return
-
-        self._alive = threading.Thread(target=loop, daemon=True)
-        self._alive.start()
-
-    def release(self):
-        # Synchronise with a keepalive that may be about to commit HTTP 200.
-        # Once this returns the caller can decide safely between HTTP and SSE.
-        with self._wlock:
-            self._done.set()
+    def _keepalive(self):
+        # Anthropic's own API keeps a stream alive with `ping`.
+        self._send("ping", {"type": "ping"})
 
     def _send(self, event, data):
         with self._wlock:
-            self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
-            self.w.flush()
-            self._last_write = time.time()
+            self._write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
 
     def start(self, usage=None):
         with self._wlock:
             if self.started:
                 return
             self.started = True
-            self.w.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
-                         b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
-            self.w.flush()
-            self._last_write = time.time()
+            self._write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                        b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
             self._send("message_start", {
                 "type": "message_start",
                 "message": {"id": new_message_id(), "type": "message",
@@ -2264,6 +2379,13 @@ def run_swe(body, wfile, make_stream=None, outcome=None):
     """
     emitter = make_stream or AnthropicStream
     out = emitter(wfile, resolve_model(body)) if body.get("stream") else None
+    # The connection comes from the handler through the thread, not as an
+    # argument: every caller and test double keeps the same signature, and the
+    # non-streaming path, which has no emitter, is watched just the same.
+    turn = Turn(conn=getattr(_request_local, "conn", None),
+                gone=getattr(out, "gone", None))
+    outer = getattr(_request_local, "turn", None)
+    _request_local.turn = turn
     try:
         if out is not None:
             out.arm()
@@ -2273,9 +2395,34 @@ def run_swe(body, wfile, make_stream=None, outcome=None):
                                  "stream_error" if getattr(out, "failure", None)
                                  else "200")
         return response, err
+    except ClientGone:
+        # Nobody is left to answer, so nothing is written and no further
+        # upstream call is made on the turn's behalf.
+        print(f"client disconnected while its turn was held "
+              f"({turn.spent():.0f}s in); abandoning it", flush=True)
+        if outcome is not None:
+            outcome["status"] = "client_disconnected"
+        return None, CLIENT_GONE
     finally:
+        _request_local.turn = outer
         if out is not None:
             out.release()
+
+
+@contextlib.contextmanager
+def _paced_for(acct, turn):
+    """paced(), waited for in steps so a departed client is noticed."""
+    gate = paced(acct)
+    if not hasattr(gate, "acquire"):
+        with gate:
+            yield
+        return
+    while not gate.acquire(timeout=Turn.STEP):
+        turn.check()
+    try:
+        yield
+    finally:
+        gate.release()
 
 
 def _run_swe(body, out):
@@ -2286,6 +2433,7 @@ def _run_swe(body, out):
     the Codex flavour of Responses when the request came in on that route. Only
     the emitter differs — everything upstream of it is shared.
     """
+    turn = current_turn()
     # Before anything is sent: if this turn would not fit, reduce it here rather
     # than let the upstream refuse it and the client end the agent.
     try:
@@ -2320,9 +2468,12 @@ def _run_swe(body, out):
     # Cognition's input classifier denies borderline payloads nondeterministically
     # (the same body has been observed to pass and to fail). Retry while nothing
     # has reached the client yet.
-    attempt, waited, retries, outages = 0, 0.0, 0, 0
+    attempt, retries, outages = 0, 0, 0
     acct = None
     while attempt < 3:
+        # Before every attempt, first included: compaction may have held the
+        # turn for minutes, and every retry below is one more request.
+        turn.check()
         try:
             _request_phase("preparing")
             req, model = build_request(body, TOOL_DESC_CAPS[attempt])
@@ -2346,7 +2497,7 @@ def _run_swe(body, out):
                 acct = accounts()[0]
         try:
           _request_phase("waiting_capacity")
-          with paced(acct):
+          with _paced_for(acct, turn):
             for msg, e in chat_stream(req, acct):
                 if e:
                     err = e
@@ -2414,13 +2565,18 @@ def _run_swe(body, out):
             err = f"upstream {type(e).__name__}: {e}"
             print(err, flush=True)
 
+        if err:
+            # A write to a client that left raises the same OSErrors as a
+            # dropped upstream — ConnectionResetError is on the transient list —
+            # so without this a vanished client was retried as a network fault.
+            turn.check()
         if (err and not emitted and retries < NETWORK_RETRIES
                 and any(t in err for t in _TRANSIENT)):
             retries += 1
             delay = 1.5 * retries
             print(f"upstream connection failed ({err[:60]}), retrying in "
                   f"{delay:.0f}s ({retries}/{NETWORK_RETRIES})", flush=True)
-            time.sleep(delay)
+            turn.sleep(delay)
             continue
         if err and not emitted and "resource_exhausted" in err:
             # Both of Cognition's limits are per account, so another credential
@@ -2440,19 +2596,18 @@ def _run_swe(body, out):
                 acct = other
                 continue
             # Every account is blocked; wait for the first one to come back.
-            wait = min(max(until, RATE_FLOOR), RATE_WAIT_BUDGET - waited)
+            wait = min(max(until, RATE_FLOOR), turn.left())
             if wait > 0:
                 wait += random.uniform(0, min(5.0, wait * 0.1))
                 print(f"upstream rate limited on every credential, holding "
-                      f"the turn for {wait:.0f}s ({waited:.0f}s waited so far)",
-                      flush=True)
+                      f"the turn for {wait:.0f}s ({turn.spent():.0f}s of "
+                      f"{turn.budget}s spent so far)", flush=True)
                 _request_phase("waiting_rate_limit")
-                time.sleep(wait)
-                waited += wait
+                turn.sleep(wait)
                 acct, _ = claim_account()
                 continue
-            print(f"upstream rate limited and {RATE_WAIT_BUDGET}s of waiting is "
-                  f"spent; handing it back", flush=True)
+            print(f"upstream rate limited and the turn's {turn.budget}s budget "
+                  f"is spent; handing it back", flush=True)
             break
         if err and not emitted and any(t in err for t in _OUTAGE):
             # 93 turns died this way in twenty minutes on 2026-09-23: the
@@ -2460,17 +2615,16 @@ def _run_swe(body, out):
             # a second, and it was handed straight to the agent as a 502. The
             # outage cleared by itself; a turn that had waited would have lived.
             outages += 1
-            wait = min(15 * 2 ** (outages - 1), 120, RATE_WAIT_BUDGET - waited)
+            wait = min(15 * 2 ** (outages - 1), 120, turn.left())
             if wait > 0:
                 print(f"upstream unavailable (provider outage), holding the "
-                      f"turn for {wait:.0f}s ({waited:.0f}s waited so far)",
-                      flush=True)
+                      f"turn for {wait:.0f}s ({turn.spent():.0f}s of "
+                      f"{turn.budget}s spent so far)", flush=True)
                 _request_phase("waiting_outage")
-                time.sleep(wait)
-                waited += wait
+                turn.sleep(wait)
                 continue
-            print(f"upstream unavailable and {RATE_WAIT_BUDGET}s of waiting is "
-                  f"spent; handing it back", flush=True)
+            print(f"upstream unavailable and the turn's {turn.budget}s budget "
+                  f"is spent; handing it back", flush=True)
             break
         if err and not emitted and attempt < 2 and "permission_denied" in err:
             nxt = TOOL_DESC_CAPS[attempt + 1]
@@ -2713,25 +2867,22 @@ def responses_to_messages(body):
     return out, custom
 
 
-class ResponsesStream:
+class ResponsesStream(_KeepAlive):
     """Emits the Codex flavour of the Responses SSE stream onto a raw socket.
 
-    No keepalive here yet, deliberately rather than by omission: the Responses
-    dialect has no `ping` event, and inventing one for a parser whose
-    tolerances are unknown risks more than the silence does. The Codex route
-    therefore keeps the exposure the Messages route just lost, and the two
-    no-ops below exist so run_swe can drive either without asking which.
+    The keepalive invents nothing: the Responses dialect has no `ping`, so the
+    stream is opened with the response.created / response.in_progress pair it
+    starts with anyway, and a silence is filled by sending response.in_progress
+    again — the same response object, the next sequence_number. Codex resets
+    its idle timer on any event and has no use for this one beyond that.
+    Without it, Codex dropped a stream silent for five minutes (a long think,
+    a held rate limit, a summary) and sent the request again, so one turn ran
+    twice.
 
     Event order and field names are taken from a recorded upstream stream rather
     than from the public API docs: this dialect carries output_index,
     sequence_number and item_id on every event, and Codex reads them.
     """
-
-    def arm(self):
-        pass
-
-    def release(self):
-        pass
 
     def __init__(self, wfile, model, custom_names=()):
         self.w = wfile
@@ -2751,16 +2902,26 @@ class ResponsesStream:
         self.text_buf = []
         self.started = False
         self.tools = {}
+        # One response, one creation time, however often it is restated.
+        self.created_at = int(time.time())
+        self._keep_alive_init()
+
+    def _keepalive(self):
+        self._send("response.in_progress",
+                   {"type": "response.in_progress",
+                    "response": self._response("in_progress")})
 
     def _send(self, event, data):
-        data["sequence_number"] = self.seq
-        self.seq += 1
-        self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
-        self.w.flush()
+        # The number and the write under one lock, or the keepalive thread
+        # could put two events on the wire out of sequence.
+        with self._wlock:
+            data["sequence_number"] = self.seq
+            self.seq += 1
+            self._write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
 
     def _response(self, status, usage=None):
         out = {"id": self.response_id, "object": "response",
-               "created_at": int(time.time()), "status": status,
+               "created_at": self.created_at, "status": status,
                "model": self.model, "output": [], "error": None,
                "instructions": None, "incomplete_details": None,
                "parallel_tool_calls": False, "tool_choice": "auto",
@@ -2777,17 +2938,18 @@ class ResponsesStream:
         return out
 
     def start(self, usage=None):
-        if self.started:
-            return
-        self.started = True
-        self.w.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
-                     b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
-        self.w.flush()
-        self._send("response.created", {"type": "response.created",
-                                        "response": self._response("in_progress")})
-        self._send("response.in_progress",
-                   {"type": "response.in_progress",
-                    "response": self._response("in_progress")})
+        with self._wlock:
+            if self.started:
+                return
+            self.started = True
+            self._write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                        b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
+            self._send("response.created",
+                       {"type": "response.created",
+                        "response": self._response("in_progress")})
+            self._send("response.in_progress",
+                       {"type": "response.in_progress",
+                        "response": self._response("in_progress")})
 
     def thinking(self, text):
         """Dropped on purpose: Codex only replays reasoning it can hand back as
@@ -2885,6 +3047,7 @@ class ResponsesStream:
         self.tools = {}
 
     def finish(self, stop_reason, usage):
+        self.release()
         self.flush_tools()
         self._close_text()
         if stop_reason == "max_tokens":
@@ -2905,6 +3068,7 @@ class ResponsesStream:
     def stop(self):
         """No response.completed: a turn that failed must not be handed back as
         a finished one, or Codex stores the truncated answer and moves on."""
+        self.release()
         self._send("response.incomplete", {
             "type": "response.incomplete",
             "response": self._response("incomplete")})
@@ -3331,9 +3495,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(503, "overloaded_error",
                                  "Local request capacity reached; retry later", 1)
             return
+        # The socket, for run_swe to tell whether anyone is still waiting on
+        # a turn it is holding.
+        _request_local.conn = getattr(self, "connection", None)
         try:
             self._do_POST()
         finally:
+            _request_local.conn = None
             _leave_request()
 
     def _do_POST(self):
@@ -3449,13 +3617,17 @@ class Handler(BaseHTTPRequestHandler):
                 result = {}
                 _, err = run_swe(body, self.wfile, outcome=result)
                 outcome = result.get("status", "200")
-                if err:
+                if err == CLIENT_GONE:
+                    outcome = "client_disconnected"
+                elif err:
                     kind, status, message, wait = anthropic_error(err, body)
                     outcome = str(status)
                     self.send_error_json(status, kind, message, wait)
             else:
                 resp, err = run_swe(body, None)
-                if err:
+                if err == CLIENT_GONE:
+                    outcome = "client_disconnected"
+                elif err:
                     kind, status, message, wait = anthropic_error(err, body)
                     outcome = str(status)
                     self.send_error_json(status, kind, message, wait)
@@ -3492,7 +3664,9 @@ class Handler(BaseHTTPRequestHandler):
                             lambda w, m: ResponsesStream(w, m, custom),
                             outcome=result)
             outcome = result.get("status", "200")
-            if err:
+            if err == CLIENT_GONE:
+                outcome = "client_disconnected"
+            elif err:
                 kind, status, message, wait = anthropic_error(err, translated)
                 outcome = str(status)
                 self.send_error_json(status, kind, message, wait)

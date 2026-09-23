@@ -236,5 +236,227 @@ class CodexCatalogTests(unittest.TestCase):
             self.assertNotIn(private, sent)
 
 
+class Wire(io.RawIOBase):
+    """A socket stand-in the keepalive thread can write to safely."""
+
+    def __init__(self):
+        self.buf = b''
+        self.lock = threading.Lock()
+
+    def write(self, b):
+        with self.lock:
+            self.buf += b
+        return len(b)
+
+    def flush(self):
+        pass
+
+
+def sse(raw):
+    return [json.loads(line[6:]) for line in raw.decode().splitlines()
+            if line.startswith('data: ')]
+
+
+class ResponsesKeepaliveTests(unittest.TestCase):
+    """P5: the Codex route keeps a silent stream alive with its own events."""
+
+    def setUp(self):
+        patcher = mock.patch.object(devinx, 'KEEPALIVE_EVERY', 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_silent_turn_is_kept_alive_with_existing_events_only(self):
+        w = Wire()
+        out = devinx.ResponsesStream(w, 'swe-2-max')
+        out.arm()
+        time.sleep(3.5)
+        out.release()
+        text = w.buf.decode()
+        self.assertTrue(text.startswith('HTTP/1.1 200 OK'))
+        wire = sse(w.buf)
+        kinds = [e['type'] for e in wire]
+        self.assertEqual(kinds.count('response.created'), 1)
+        self.assertGreaterEqual(kinds.count('response.in_progress'), 3)
+        self.assertEqual(set(kinds), {'response.created', 'response.in_progress'})
+        self.assertEqual([e['sequence_number'] for e in wire], list(range(len(wire))))
+        self.assertEqual({e['response']['id'] for e in wire}, {out.response_id})
+        self.assertEqual(len({e['response']['created_at'] for e in wire}), 1)
+        before = len(w.buf)
+        time.sleep(1.5)
+        self.assertEqual(len(w.buf), before, 'written after release')
+
+    def test_disabled_with_the_anthropic_one(self):
+        with mock.patch.object(devinx, 'KEEPALIVE_EVERY', 0):
+            w = Wire()
+            out = devinx.ResponsesStream(w, 'swe-2-max')
+            out.arm()
+            time.sleep(1.5)
+            out.release()
+        self.assertEqual(w.buf, b'')
+
+    def test_a_failed_keepalive_marks_the_client_gone(self):
+        class Broken(Wire):
+            def write(self, b):
+                raise BrokenPipeError()
+        for emitter in (devinx.AnthropicStream, devinx.ResponsesStream):
+            with self.subTest(emitter=emitter.__name__):
+                out = emitter(Broken(), 'swe-2-max')
+                out.arm()
+                self.assertTrue(out.gone.wait(3), 'the turn was never told')
+                out.release()
+
+    def _turn(self, attempts, arm_now=True):
+        class Early(devinx.ResponsesStream):
+            def arm(self):
+                self.start()
+        buf = io.BytesIO()
+        body = {'model': 'swe-2-max', 'stream': True, 'messages': []}
+        with isolated_accounts(fake_accounts('a')), \
+             mock.patch.object(devinx, 'compact_body', side_effect=lambda b: b), \
+             mock.patch.object(devinx, 'build_request', return_value=(
+                 SimpleNamespace(cascade_id='test'), 'swe-2-max')), \
+             mock.patch.object(devinx, 'paced', return_value=contextlib.nullcontext()), \
+             mock.patch.object(devinx, 'chat_stream', side_effect=attempts), \
+             mock.patch.object(devinx.time, 'sleep'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = devinx.run_swe(body, buf, Early if arm_now else devinx.ResponsesStream)
+        return result, buf.getvalue()
+
+    def test_a_retry_after_the_keepalive_committed_reuses_the_stream(self):
+        result, raw = self._turn([iter([(None, 'upstream ConnectionError: dropped')]),
+                                  iter([(frame('complete'), None)])])
+        self.assertEqual(result, (None, None))
+        self.assertEqual(raw.count(b'HTTP/1.1 '), 1)
+        kinds = [e['type'] for e in sse(raw)]
+        self.assertEqual(kinds.count('response.created'), 1)
+        self.assertEqual(kinds[-1], 'response.completed')
+
+    def test_an_error_after_commit_is_sse_before_commit_is_http(self):
+        result, raw = self._turn([iter([(None, 'invalid_argument: nope')])])
+        self.assertEqual(result, (None, None))
+        self.assertEqual(raw.count(b'HTTP/1.1 '), 1)
+        self.assertEqual([e['type'] for e in sse(raw)][-2:],
+                         ['error', 'response.incomplete'])
+        result, raw = self._turn([iter([(None, 'invalid_argument: nope')])],
+                                 arm_now=False)
+        self.assertEqual(raw, b'')
+        self.assertEqual(result, (None, 'invalid_argument: nope'))
+
+
+class SharedDeadlineTests(unittest.TestCase):
+    """P8: the summary, its fold and the turn's own waits share one budget."""
+
+    def test_a_summary_that_waited_the_budget_leaves_the_turn_none(self):
+        sleeps = Sleeps()
+        calls = []
+
+        def chat(req, acct=None, purpose='turn'):
+            calls.append(purpose)
+            yield None, RATE_ZERO
+
+        messages = [{'role': 'user', 'content': 'task'}]
+        for i in range(12):
+            messages.append({'role': 'assistant' if i % 2 == 0 else 'user',
+                             'content': f'turn {i} ' + 'y' * 400})
+        body = {'model': 'swe-2-max', 'stream': False, 'messages': messages,
+                'metadata': {'user_id': 'shared-deadline'}}
+        with isolated_accounts(fake_accounts('a')), \
+             mock.patch.object(devinx, 'RATE_WAIT_BUDGET', 30), \
+             mock.patch.object(devinx, 'RATE_FLOOR', 3.0), \
+             mock.patch.object(devinx, 'COMPACT_AT', 400), \
+             mock.patch.object(devinx, '_summaries', {}), \
+             mock.patch.object(devinx, 'build_request', return_value=(
+                 SimpleNamespace(cascade_id='test'), 'swe-2-max')), \
+             mock.patch.object(devinx, 'paced', return_value=contextlib.nullcontext()), \
+             mock.patch.object(devinx, 'chat_stream', chat), \
+             mock.patch.object(devinx.time, 'sleep', sleeps), \
+             contextlib.redirect_stdout(io.StringIO()):
+            _, err = devinx.run_swe(body, None)
+        self.assertIn('resource_exhausted', err)
+        self.assertIn('summary', calls)
+        # One budget, plus at most one jittered wait that started inside it.
+        self.assertLessEqual(sleeps.total, 30 + 5)
+        self.assertLessEqual(calls.count('turn'), 2)
+
+
+class ClientGoneTests(unittest.TestCase):
+    """P1: a client that hangs up during a hold ends the hold, and the calls."""
+
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.calls = []
+        self.lock = threading.Lock()
+
+        def chat(req, acct=None, purpose='turn'):
+            with self.lock:
+                self.calls.append(purpose)
+            yield None, RATE_ZERO
+
+        self.stack.enter_context(isolated_accounts(fake_accounts('a')))
+        for name, value in {'RATE_FLOOR': 0.2, 'RATE_WAIT_BUDGET': 120,
+                            'KEEPALIVE_EVERY': 1, 'chat_stream': chat,
+                            '_summaries': {}}.items():
+            self.stack.enter_context(mock.patch.object(devinx, name, value))
+        self.stack.enter_context(mock.patch.object(devinx, 'build_request', return_value=(
+            SimpleNamespace(cascade_id='test'), 'swe-2-max')))
+        self.stack.enter_context(mock.patch.object(
+            devinx, 'paced', return_value=contextlib.nullcontext()))
+        self.log = io.StringIO()
+        self.stack.enter_context(contextlib.redirect_stdout(self.log))
+        self.live = LiveServer()
+        self.stack.callback(self.live.close)
+
+    def hang_up(self, path, body):
+        import socket
+        data = json.dumps(body).encode()
+        sock = socket.create_connection(('127.0.0.1', self.live.port), timeout=5)
+        sock.sendall(f'POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+                     f'Content-Type: application/json\r\n'
+                     f'Content-Length: {len(data)}\r\n\r\n'.encode() + data)
+        time.sleep(1.5)
+        with self.lock:
+            self.assertGreater(len(self.calls), 1, 'the turn was never held')
+        sock.close()
+        time.sleep(1.5)
+        with self.lock:
+            settled = len(self.calls)
+        time.sleep(2)
+        with self.lock:
+            self.assertEqual(len(self.calls), settled,
+                             'upstream calls went on after the client left')
+        deadline = time.time() + 3
+        while 'status=client_disconnected' not in self.log.getvalue() \
+                and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIn('status=client_disconnected', self.log.getvalue())
+
+    def test_messages_stream_and_non_stream(self):
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                with mock.patch.object(devinx, 'compact_body', side_effect=lambda b: b):
+                    self.hang_up('/v1/messages', {
+                        'model': 'swe-2-max', 'stream': stream, 'max_tokens': 16,
+                        'messages': [{'role': 'user', 'content': 'hi'}]})
+
+    def test_responses_route(self):
+        with mock.patch.object(devinx, 'compact_body', side_effect=lambda b: b):
+            self.hang_up('/v1/responses', {
+                'model': 'swe-2-max', 'stream': True,
+                'input': [{'type': 'message', 'role': 'user', 'content': 'hi'}]})
+
+    def test_during_the_summary(self):
+        messages = [{'role': 'user', 'content': 'task'}]
+        for i in range(12):
+            messages.append({'role': 'assistant' if i % 2 == 0 else 'user',
+                             'content': f'turn {i} ' + 'y' * 400})
+        with mock.patch.object(devinx, 'COMPACT_AT', 400):
+            self.hang_up('/v1/messages', {
+                'model': 'swe-2-max', 'stream': True, 'max_tokens': 16,
+                'metadata': {'user_id': 'gone-in-summary'}, 'messages': messages})
+        self.assertEqual(set(self.calls), {'summary'},
+                         'the turn went upstream after its client left')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
