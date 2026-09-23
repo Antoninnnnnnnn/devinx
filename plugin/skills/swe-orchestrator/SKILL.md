@@ -109,13 +109,21 @@ validation". If you do not specify, it will pick something, and you will be
 reviewing that choice instead of the code.
 
 **Name the files it owns.** List them. State that everything else is
-off-limits, including formatting. One writer per file, always. Set
-`DEVINX_OWNED_PATHS` to the same list, colon-separated, when you launch the
-agent: prose is a request, that variable is a wall. Measured on this fleet, an
-agent read "you own exactly these five files" and "stop and report rather than
-reaching for `apps/`", agreed to both, and then spent twelve and a half hours
-editing a file under `apps/`. The wall is not distrust of the model; it is
-what turns a boundary into one.
+off-limits, including formatting. One writer per file, always. `DEVINX_OWNED_PATHS`
+(the same list, `os.pathsep`-separated) is the enforced form of that boundary,
+checked by a hook on every Edit/Write/NotebookEdit: prose is a request, that
+variable is a wall. Measured on this fleet, an agent read "you own exactly
+these five files" and "stop and report rather than reaching for `apps/`",
+agreed to both, and then spent twelve and a half hours editing a file under
+`apps/`. The wall is not distrust of the model; it is what turns a boundary
+into one.
+
+Today this is a **session-wide** setting, not a per-agent one: the Agent tool
+has no way to set an environment variable for one spawned agent only, so
+`DEVINX_OWNED_PATHS` has to be exported before you start delegating, and it
+then applies to every agent in the session equally. If two tasks in flight at
+once need different owned files, that is not yet enforceable this way — say
+so rather than implying a per-agent wall that is not actually there.
 
 **Give acceptance criteria a machine can settle.** "`pytest
 tests/test_export.py -k currency` passes and nothing else in that file breaks"
@@ -208,7 +216,8 @@ Look specifically for:
 
 Then run the acceptance command yourself, or have `swe2-tester` run it in a
 fresh context. An agent verifying its own work is worth much less than an
-independent check — and the tester is free.
+independent check — and the tester spends the executors' shared budget, not
+yours, cheap but still metered per request.
 
 ## When an executor fails
 
@@ -232,8 +241,9 @@ There is no mandatory reviewer. Match the check to the stakes:
 - **Routine, small, well-covered by tests** — your own read of the diff is
   enough. Do not spawn anything.
 - **Non-trivial, or several agents touched it** — `swe2-reviewer` on a fresh
-  context. Free, independent, and it catches scope creep and missing cases
-  reliably.
+  context. Cheap against your own quota (it runs on the executors' shared
+  budget, not yours), independent, and it catches scope creep and missing
+  cases reliably.
 - **High stakes** — security, auth, migrations, data integrity, concurrency,
   payments, anything hard to reverse — `claude-reviewer`, which runs on your
   own model. It costs claude.ai quota. Spend it here and nowhere else.
@@ -257,8 +267,11 @@ Exploration is different — several readers on the same code cost nothing.
 
 ## Reporting back
 
-Do not narrate every spawn unless the user asks for orchestration visibility
-(`--forward-subagent-text` shows them the raw agent stream if they want it).
+Do not narrate every spawn unless the user asks for orchestration visibility —
+then say what each agent is doing as you go, in your own words. (There is a
+`--forward-subagent-text` client flag, but it only applies to a headless
+`--print --output-format=stream-json` run, not an interactive session like
+this one.)
 
 Lead with what changed, what you verified and how, what is still uncertain.
 Mention which agents did what when it helps the user judge the result.

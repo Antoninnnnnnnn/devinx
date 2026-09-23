@@ -10,7 +10,9 @@ written into ~/.claude unless you ask for it with --global-agents. Uses the
 standard library only, so it runs before any dependency exists.
 """
 import argparse
+import contextlib
 import glob
+import hashlib
 import json
 import os
 import re
@@ -19,8 +21,12 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import venv
+
+import diagnostics
+import launcher
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MIN_PYTHON = (3, 10)
@@ -146,11 +152,43 @@ def deps_satisfied(py):
         capture_output=True).returncode == 0
 
 
-def make_venv(force):
+def _running_service(port):
+    """The /api/hello payload of a devinx already listening on port, or None.
+
+    --force clears this exact virtualenv (venv.EnvBuilder(clear=True)); the
+    daemon a launcher generated from this install starts is exec'd with this
+    venv's own python, so a service still up on the configured port is almost
+    certainly running from the directory --force is about to empty out from
+    under it.
+    """
+    state, info = diagnostics.read_service("127.0.0.1", port)
+    return info if state == "running" else None
+
+
+def make_venv(force, port=None):
     py = venv_python(HERE)
     root = os.path.join(HERE, ".venv")
     req = os.path.join(HERE, "requirements.txt")
     uv = shutil.which("uv")
+
+    if force and port is not None:
+        # DEVINX_PORT in the environment (what launcher.PORT reads) may
+        # differ from --port (what a *new* wrapper script would be given):
+        # a service already running under the former is just as much at risk
+        # from clearing this venv as one on the latter.
+        ports = {port, launcher.PORT}
+        running = None
+        for candidate in ports:
+            running = _running_service(candidate)
+            if running:
+                port = candidate
+                break
+        if running:
+            pid = running.get("pid")
+            hint = f" ({launcher._kill_hint(pid)})" if isinstance(pid, int) else ""
+            die(f"a devinx service is already running on port {port}{hint} - "
+                f"--force would delete the virtualenv it is running from.\n"
+                f"       Stop it first, then run install.py --force again.")
 
     if os.path.exists(py) and not force:
         say(OK, "virtualenv already present")
@@ -234,7 +272,8 @@ def warn_shadowed(path):
     Python cannot see the live shell's functions, but the rc files that define
     them are readable."""
     name = os.path.basename(path).split(".")[0]
-    pattern = re.compile(rf"^\s*(?:function\s+)?{name}\s*\(\s*\)|^\s*alias\s+{name}=",
+    escaped = re.escape(name)
+    pattern = re.compile(rf"^\s*(?:function\s+)?{escaped}\s*\(\s*\)|^\s*alias\s+{escaped}=",
                          re.M)
     for rc in ("~/.bashrc", "~/.bash_profile", "~/.bash_aliases", "~/.zshrc",
                "~/.profile"):
@@ -247,7 +286,13 @@ def warn_shadowed(path):
         m = pattern.search(text)
         if m:
             line = text[:m.start()].count("\n") + 1
-            if "devinx" in text:
+            # Checking for the literal name (`devinx`) here is tautological:
+            # the match that got us into this branch already requires that
+            # exact string, so it is always present and this check could
+            # never fire the warning below. Looking for the actual launcher
+            # script instead — the thing the README's wiring snippet delegates
+            # to — tells shadowing-but-wired-through apart from shadowing.
+            if "launcher.py" in text:
                 # Already wired to delegate; shadowing the PATH launcher is then
                 # intentional rather than a problem.
                 say(OK, f"{rc}:{line} defines `{name}` and already handles devinx")
@@ -276,21 +321,25 @@ def report_agents():
     """
     names = sorted(os.path.splitext(n)[0] for n in agent_files())
     say(OK, f"agents injected per session: {', '.join(names)}")
+    agents_dir = os.path.join(claude_config_dir(), "agents")
     stale = [n for n in agent_files()
-             if os.path.exists(os.path.expanduser(f"~/.claude/agents/{n}"))]
+             if os.path.exists(os.path.join(agents_dir, n))]
     if stale:
         say(WARN, f"{len(stale)} agent file(s) from an older install are still "
-                  f"in ~/.claude/agents:")
+                  f"in {agents_dir}:")
         print("        " + ", ".join(stale))
-        print("        They shadow the session-scoped ones and stay visible "
-              "outside devin mode.\n"
-              "        Remove them by hand once you are happy with this "
-              "install.")
+        print("        A file on disk there is a plain project/user agent, no "
+              "different to one you wrote yourself, so it stays visible in "
+              "every session, devin mode or not - the opposite of what "
+              "session-scoped injection is for. Remove it by hand once you "
+              "are happy with this install.")
 
 
 def report_skill():
-    """The orchestrator skill rides on the launcher's --plugin-dir, so like the
-    agents it exists in --devin sessions and nowhere else."""
+    """The orchestrator skill rides on the launcher's --plugin-dir, which is
+    added only for --or (plugin_args() is called with use_orch, not
+    use_devin) - unlike the agents, it does not exist in a plain --devin
+    session, only one that also asked for --or."""
     skills = sorted(glob.glob(os.path.join(HERE, "plugin", "skills", "*",
                                            "SKILL.md")))
     if not skills:
@@ -310,8 +359,34 @@ def report_skill():
     say(OK, f"skill available with --or: {names}")
 
 
+def _with_mcp_deny(text):
+    """Match launcher.packaged_agents(): a session-injected agent gets
+    disallowedTools: [..., "mcp__*"] unless DEVINX_SUBAGENT_MCP=1, but a
+    globally-installed one was a byte-for-byte copy of the source file and
+    never got it, silently weaker than the README says it is.
+    """
+    if os.environ.get("DEVINX_SUBAGENT_MCP") == "1" or not text.startswith("---"):
+        return text
+    _, _, rest = text.partition("---")
+    front, sep, body = rest.partition("\n---")
+    if not sep:
+        return text
+    lines = front.splitlines()
+    for i, line in enumerate(lines):
+        key, colon, value = line.partition(":")
+        if colon and key.strip() == "disallowedTools":
+            tools = [t.strip() for t in value.split(",") if t.strip()]
+            if "mcp__*" not in tools:
+                tools.append("mcp__*")
+            lines[i] = "disallowedTools: " + ", ".join(tools)
+            break
+    else:
+        lines.append("disallowedTools: mcp__*")
+    return "---" + "\n".join(lines) + "\n---" + body
+
+
 def install_agents(force):
-    dest = os.path.expanduser("~/.claude/agents")
+    dest = os.path.join(claude_config_dir(), "agents")
     os.makedirs(dest, exist_ok=True)
     installed, kept = [], []
     for name in agent_files():
@@ -323,12 +398,25 @@ def install_agents(force):
         if os.path.exists(target) and not force:
             kept.append(name)
             continue
-        shutil.copyfile(src, target)
+        # A UTF-8 BOM (utf-8-sig) at the start of the file would make the
+        # "---" frontmatter check below fail to match, silently skipping the
+        # deny-list patch for that one file.
+        with open(src, encoding="utf-8-sig") as fh:
+            text = fh.read()
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(_with_mcp_deny(text))
         installed.append(name)
     if installed:
         say(OK, f"agents installed: {', '.join(installed)}")
     if kept:
         say(WARN, f"agents already present, left untouched: {', '.join(kept)}")
+
+
+def claude_config_dir():
+    """Claude Code itself honours CLAUDE_CONFIG_DIR to relocate ~/.claude;
+    hard-coding the default here meant --global-agents (and the stale-file
+    check) looked in the wrong place for anyone who has moved it."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 
 
 def codex_home():
@@ -395,6 +483,87 @@ def strip_plugin_entry(path, entry):
     return removed
 
 
+def _packaged_skill_hash():
+    packaged = os.path.join(HERE, "codex", "marketplace", "plugins",
+                            "swe-orchestrator", "skills", "swe-orchestrator",
+                            "SKILL.md")
+    try:
+        with open(packaged, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _cached_skill_hash(cache_root, version):
+    for candidate in launcher.codex_cache_paths(cache_root, version):
+        try:
+            with open(candidate, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue
+    return None
+
+
+def _set_aside_stale_codex_cache(home):
+    """Move a stale cached copy of *our own* packaged version out of the way
+    before `codex plugin add` runs, returning the aside path to finalise
+    afterwards (or None if nothing needed moving).
+
+    `codex plugin add` never re-copies an already-cached version on its own
+    (H6), so simply running it again after a content change with no version
+    bump does nothing - the launcher's warning that told the user to rerun
+    install.py was not actually true until this existed. Only the exact
+    version directory this package declares is ever touched; an unrelated
+    version some other install put there is left alone.
+
+    Moved aside rather than deleted outright: whether `add` recreates a
+    directory it did not have to make room for has not been verified, so the
+    recoverable order is to keep the old copy until a fresh one is confirmed
+    (finalise below), and restore it if `add` does nothing.
+    """
+    version = launcher.codex_plugin_version()
+    packaged_hash = _packaged_skill_hash()
+    if not version or not packaged_hash:
+        return None
+    cache_root = os.path.join(home, "plugins", "cache", "devinx", "swe-orchestrator")
+    version_dir = os.path.join(cache_root, version)
+    cached_hash = _cached_skill_hash(cache_root, version)
+    if cached_hash is None or cached_hash == packaged_hash:
+        return None  # not cached yet, or already fresh: nothing to do
+    aside = version_dir + ".stale"
+    with contextlib.suppress(OSError):
+        shutil.rmtree(aside)  # a leftover from an interrupted previous run
+    try:
+        os.replace(version_dir, aside)
+    except OSError:
+        return None
+    return aside
+
+
+def _finalise_codex_cache_refresh(aside, home):
+    """After `codex plugin add`: if a fresh copy showed up, drop the old one
+    we moved aside; otherwise restore it and say plainly that the cache is
+    still stale, rather than leaving no skill installed at all."""
+    if aside is None:
+        return
+    version = launcher.codex_plugin_version()
+    packaged_hash = _packaged_skill_hash()
+    cache_root = os.path.join(home, "plugins", "cache", "devinx", "swe-orchestrator")
+    version_dir = aside[:-len(".stale")]
+    cached_hash = _cached_skill_hash(cache_root, version) if version else None
+    if cached_hash is not None and cached_hash == packaged_hash:
+        shutil.rmtree(aside, ignore_errors=True)
+        say(OK, f"refreshed the cached Codex skill: {version_dir}")
+        return
+    with contextlib.suppress(OSError):
+        if os.path.exists(version_dir):
+            shutil.rmtree(version_dir)
+        os.replace(aside, version_dir)
+    say(WARN, f"the cached Codex skill at {version_dir} is still stale - "
+              f"`codex plugin add` did not refresh it; remove that directory "
+              f"by hand and run install.py again")
+
+
 def install_codex(force):
     """Install the Codex side: a profile file, and the plugin cache it needs.
 
@@ -416,29 +585,39 @@ def install_codex(force):
     if os.path.exists(profile) and not force:
         say(WARN, f"{profile} exists - keeping it (use --force to overwrite)")
     else:
+        # market is a filesystem path, pasted verbatim into a config file
+        # Codex will parse as TOML: an unescaped quote, backslash (every
+        # Windows path) or non-BMP character (an emoji anywhere in the
+        # install path) produced a broken profile. _toml_string() is the
+        # same escaping launcher.py already uses for its own -c overrides.
         with open(profile, "w", encoding="utf-8") as fh:
             fh.write("# Written by devinx install.py. Inert unless selected with\n"
                      "# `-p devinx`, which the devinx launcher passes only for\n"
                      "# --codex --or sessions.\n"
                      "[marketplaces.devinx]\n"
                      'source_type = "local"\n'
-                     f'source = "{market}"\n\n'
+                     f'source = {launcher._toml_string(market)}\n\n'
                      '[plugins."swe-orchestrator@devinx"]\n'
                      "enabled = true\n")
         say(OK, f"codex profile written: {profile}")
 
+    aside = _set_aside_stale_codex_cache(home)
+
     # The plugin has to be materialised into the cache; a profile alone leaves
-    # it "not installed" and the skill never loads.
+    # it "not installed" and the skill never loads. Same escaping concern as
+    # the profile file above, this time for a -c override on the command line.
     r = subprocess.run(
         ["codex", "-c", 'marketplaces.devinx.source_type="local"',
-         "-c", f'marketplaces.devinx.source="{market}"',
+         "-c", f'marketplaces.devinx.source={launcher._toml_string(market)}',
          "plugin", "add", "swe-orchestrator@devinx"],
         capture_output=True, text=True)
     if r.returncode:
         say(WARN, "could not install the Codex plugin:\n        "
                   + (r.stderr or r.stdout).strip()[:300])
+        _finalise_codex_cache_refresh(aside, home)
         return
     say(OK, "codex plugin installed: swe-orchestrator@devinx")
+    _finalise_codex_cache_refresh(aside, home)
     if strip_plugin_entry(os.path.join(home, "config.toml"),
                           "swe-orchestrator@devinx"):
         say(OK, "removed the global enable it wrote; the profile decides instead")
@@ -464,7 +643,11 @@ def check_credential():
 
 def smoke(py, have_credential):
     port = free_port()
-    env = dict(os.environ, DEVINX_PORT=str(port))
+    # DEVINX_DASHBOARD_PORT=0: the smoke instance is transient and on a port
+    # nothing else knows about, so its dashboard listener has no business
+    # binding a real port (8317 by default) that a concurrent real service
+    # would want.
+    env = dict(os.environ, DEVINX_PORT=str(port), DEVINX_DASHBOARD_PORT="0")
     log = open(os.path.join(data_dir(), "install-smoke.log"), "wb")
     os.makedirs(data_dir(), exist_ok=True)
     proc = subprocess.Popen([py, os.path.join(HERE, "devinx.py")],
@@ -485,8 +668,14 @@ def smoke(py, have_credential):
         else:
             die("devinx did not start within 30s")
 
-        with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
-            models = [m["id"] for m in json.loads(r.read())["data"]]
+        try:
+            with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
+                models = [m["id"] for m in json.loads(r.read())["data"]]
+        except urllib.error.HTTPError as error:
+            die(f"smoke test: /v1/models returned HTTP {error.code} - "
+                f"{error.read()[:300]!r}")
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            die(f"smoke test: could not reach /v1/models - {error}")
         say(OK, f"service responds: {', '.join(models)}")
 
         if not have_credential:
@@ -500,8 +689,14 @@ def smoke(py, have_credential):
         req = urllib.request.Request(base + "/v1/messages", body,
                                      {"content-type": "application/json",
                                       "anthropic-version": "2023-06-01"})
-        with urllib.request.urlopen(req, timeout=180) as r:
-            d = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                d = json.loads(r.read())
+        except urllib.error.HTTPError as error:
+            die(f"smoke test: the live SWE-2 call returned HTTP {error.code} - "
+                f"{error.read()[:300]!r}")
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            die(f"smoke test: the live SWE-2 call failed - {error}")
         text = "".join(b.get("text", "") for b in d.get("content", [])
                        if b.get("type") == "text")
         usage = d.get("usage", {})
@@ -526,7 +721,8 @@ def smoke(py, have_credential):
 def main():
     ap = argparse.ArgumentParser(description="Install devinx.")
     ap.add_argument("--force", action="store_true",
-                    help="overwrite an existing launcher, agents and virtualenv")
+                    help="overwrite an existing launcher, agents, virtualenv "
+                         "and devinx.config.toml (the Codex profile)")
     ap.add_argument("--port", type=int, default=8316, help="service port")
     ap.add_argument("--bin", default=default_bin(), help="where to put the launcher")
     ap.add_argument("--no-smoke", action="store_true", help="skip the smoke test")
@@ -539,7 +735,7 @@ def main():
     check_python()
     check_claude()
     check_descriptors()
-    py = make_venv(args.force)
+    py = make_venv(args.force, args.port)
     os.makedirs(data_dir(), exist_ok=True)
     say(OK, f"data directory: {data_dir()}")
     if args.global_agents:

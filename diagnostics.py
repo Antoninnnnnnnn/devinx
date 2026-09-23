@@ -1,4 +1,5 @@
 """Read-only local diagnostics: no inference, credentials, log or prompt export."""
+import http.client
 import importlib.metadata
 import json
 import os
@@ -29,8 +30,72 @@ def read_service(host, port):
                                        if key in CONFIG_FIELDS and isinstance(
                                            value, (int, float, bool, type(None)))}
         return 'running', public
-    except (OSError, ValueError):
+    # Something is listening but does not speak HTTP at all (a non-HTTP
+    # process squatting the port, a truncated response): this must be
+    # reported as an ordinary diagnostic state, not a crash with a traceback.
+    except (OSError, ValueError, http.client.HTTPException):
         return 'unavailable', {}
+
+
+def parse_config_value(name, raw):
+    """Parse one DEVINX_* runtime setting the way the service itself does.
+
+    Shared so a value is judged the same way whether it is being validated
+    before the service starts (launcher.py), or compared against what an
+    already-running service reports (below, and --status/--explain). Raises
+    ValueError on a value the service would also reject.
+    """
+    if name == 'DEVINX_COMPACT_STRICT':
+        return raw == '1'
+    value = float(raw)
+    if name == 'DEVINX_RELAY_READ_TIMEOUT' and value == 0:
+        return None
+    return value
+
+
+def configuration_mismatches(env, service_config):
+    """Requested DEVINX_* settings that differ from a running service's own.
+
+    Session flags never reconfigure a daemon that is already up - changing a
+    variable in a new terminal silently does nothing unless this is said out
+    loud. `service_config` is the 'configuration' object from /api/hello (or
+    {} if unknown); an unparsable request is reported too, since the service
+    will not have honoured it however it started.
+    """
+    warnings = []
+    for name in CONFIG_FIELDS:
+        if name not in env:
+            continue
+        actual = service_config.get(name, 'unknown') if service_config else 'unknown'
+        try:
+            wanted = parse_config_value(name, env[name])
+        except ValueError:
+            warnings.append(f'{name} is invalid.')
+            continue
+        if actual == 'unknown':
+            warnings.append(f'The running value of {name} is unavailable.')
+        elif wanted != actual:
+            warnings.append(
+                f'{name} differs from the running service; session flags do not reconfigure a daemon.')
+    return warnings
+
+
+def requested_configuration(env):
+    """Parsed DEVINX_* settings the given environment is asking for.
+
+    An entry that fails to parse is left out here; configuration_mismatches()
+    reports that separately, so a bad value is never silently reported as
+    some other, arbitrary parsed value.
+    """
+    out = {}
+    for name in CONFIG_FIELDS:
+        if name not in env:
+            continue
+        try:
+            out[name] = parse_config_value(name, env[name])
+        except ValueError:
+            continue
+    return out
 
 
 def collect(mode, args, launcher):
@@ -40,24 +105,8 @@ def collect(mode, args, launcher):
     problems = []
     if state == 'running' and service.get('build') != expected:
         problems.append('The service is running a different build.')
-    requested = {}
-    for name in CONFIG_FIELDS:
-        if name not in os.environ:
-            continue
-        actual = service.get('configuration', {}).get(name, 'unknown')
-        raw = os.environ[name]
-        try:
-            wanted = raw == '1' if name == 'DEVINX_COMPACT_STRICT' else float(raw)
-            if name == 'DEVINX_RELAY_READ_TIMEOUT' and wanted == 0:
-                wanted = None
-        except ValueError:
-            problems.append(f'{name} is invalid.')
-            continue
-        requested[name] = wanted
-        if actual == 'unknown':
-            problems.append(f'The running value of {name} is unavailable.')
-        elif wanted != actual:
-            problems.append(f'{name} differs from the running service; session flags do not reconfigure a daemon.')
+    requested = requested_configuration(os.environ)
+    problems.extend(configuration_mismatches(os.environ, service.get('configuration', {})))
     report = {'state': state, 'expected_build': expected, 'service': service,
               'requested_configuration': requested, 'warnings': problems}
     if mode != '--status':
@@ -99,4 +148,9 @@ def main(mode, args, launcher):
                 print(f'{key}: {json.dumps(value, sort_keys=True)}')
         for warning in report['warnings']:
             print(f'warning: {warning}')
+    if mode == '--explain':
+        # --explain answers "what would this command line do", which it can
+        # do whether or not a service happens to be running right now; the
+        # service being down is not a failure of the explanation.
+        return 0
     return 0 if report['state'] == 'running' else 1

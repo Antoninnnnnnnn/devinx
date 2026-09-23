@@ -1,6 +1,6 @@
 ---
 name: swe2-reviewer
-description: Read-only SWE-2 Max reviewer. Use for an independent read of a finished change — correctness, regressions, scope creep, weakened tests, missing cases. Free to run, so prefer it for any non-trivial change. Escalate to claude-reviewer for high-stakes code. Never edits files.
+description: Read-only SWE-2 Max reviewer. Use for an independent read of a finished change — correctness, regressions, scope creep, weakened tests, missing cases. Cheap against the root's own quota (spends the executors' shared, metered budget instead), so prefer it for any non-trivial change. Escalate to claude-reviewer for high-stakes code. Never edits files.
 model: swe-2-max
 disallowedTools: Edit, Write, NotebookEdit
 ---

@@ -11,11 +11,19 @@ An instruction the model can reconsider is not a boundary. This is the same
 instruction expressed where it cannot be reconsidered.
 
 The orchestrator states ownership in the subagent's prompt. A prompt is text,
-so the boundary is read back out of it: DEVINX_OWNED_PATHS, set per agent, is
-a colon-separated list of paths (or glob patterns) that agent may write. With
-it unset this hook does nothing at all — no fleet-wide default, because a
+so the boundary is read back out of it: DEVINX_OWNED_PATHS is a
+os.pathsep-separated list of paths (or glob patterns - '*' stays inside one
+path segment, '**' crosses any number of them) that may be written. With it
+unset this hook does nothing at all — no fleet-wide default, because a
 boundary nobody declared is not a boundary and guessing one would break every
 agent that legitimately writes anywhere.
+
+It is a session-wide setting, not a per-agent one: the Agent tool has no
+environment parameter, and the launcher does not set this variable itself, so
+today every subagent in a session sees the same DEVINX_OWNED_PATHS the root
+happened to have when it started. A real per-agent boundary needs an
+agent_id in the hook's own event plus a SubagentStart hook, which this pass
+does not add.
 
 Hook contract: PreToolUse on stdin, exit 0 allows, exit 2 blocks with stderr
 put in front of the model.
@@ -29,34 +37,93 @@ import sys
 WRITERS = ("Edit", "Write", "NotebookEdit")
 
 
+def _segments(path):
+    """The path split into its non-empty, non-'.' components, for a glob
+    match that walks segment by segment instead of treating the whole path
+    as one string."""
+    return [s for s in path.split(os.sep) if s and s != "."]
+
+
+def _glob_match(path_segs, pattern_segs):
+    """fnmatch, but '*' never crosses a path separator and '**' always does.
+
+    Plain fnmatch.fnmatch("src/a/b.py", "src/*.py") is True - a single '*'
+    matches the slash in "a/b.py" too, so a pattern meant to own the files
+    directly under src/ silently also owns everything under src/ no matter
+    how deep. Matching one path segment against one pattern segment at a
+    time is what keeps '*' inside its own directory level; '**' opts back
+    into crossing any number of segments (including zero) when that is
+    actually wanted.
+    """
+    if not pattern_segs:
+        return not path_segs
+    head = pattern_segs[0]
+    if head == "**":
+        if _glob_match(path_segs, pattern_segs[1:]):
+            return True
+        return bool(path_segs) and _glob_match(path_segs[1:], pattern_segs)
+    if not path_segs:
+        return False
+    return (fnmatch.fnmatch(path_segs[0], head)
+            and _glob_match(path_segs[1:], pattern_segs[1:]))
+
+
 def owned(path, patterns, root):
-    full = os.path.abspath(path)
+    # A relative target is resolved against the event's own cwd, the same
+    # root a relative pattern is resolved against below - os.path.abspath()
+    # here used the *process's* cwd instead, which need not be the same
+    # directory the tool call actually happened in.
+    target = path if os.path.isabs(path) else os.path.join(root, path)
+    # realpath on both sides: a symlink inside the target path (or inside an
+    # owned pattern's own directory) that points outside the declared
+    # boundary must not be able to walk around it.
+    full = os.path.realpath(target)
     for pattern in patterns:
         pattern = os.path.expanduser(pattern.strip())
         if not pattern:
             continue
         if not os.path.isabs(pattern):
             pattern = os.path.join(root, pattern)
-        pattern = os.path.normpath(pattern)
-        if fnmatch.fnmatch(full, pattern) or full == pattern:
+        pattern = os.path.realpath(os.path.normpath(pattern))
+        if full == pattern:
             return True
-        # A directory named as owned carries what is under it.
-        if full.startswith(pattern.rstrip("/") + os.sep):
+        # A directory named as owned carries what is under it, no globbing
+        # needed - and no risk of '*' crossing anything, since there isn't one.
+        if full.startswith(pattern.rstrip(os.sep) + os.sep):
+            return True
+        if _glob_match(_segments(full), _segments(pattern)):
             return True
     return False
 
 
 def main():
-    patterns = [p for p in os.environ.get("DEVINX_OWNED_PATHS", "").split(":") if p]
+    """Fail open on literally anything unexpected, not just malformed JSON:
+    os.path.realpath() can raise ValueError on a path with an embedded NUL,
+    for one. None of that is the model's fault, so none of it may become a
+    traceback (or an uncaught exception's exit code, which is not exit 2 and
+    would not put a useful message in front of it either)."""
+    try:
+        return _run()
+    except Exception:
+        return 0
+
+
+def _run():
+    # os.pathsep, not a literal ':': on Windows that splits "C:\..." in half.
+    patterns = [p for p in os.environ.get("DEVINX_OWNED_PATHS", "").split(os.pathsep) if p]
     if not patterns:
         return 0
     try:
         event = json.load(sys.stdin)
     except (ValueError, OSError):
         return 0
+    if not isinstance(event, dict):
+        return 0     # Valid JSON, unexpected shape (e.g. a bare list): fail open.
     if event.get("tool_name") not in WRITERS:
         return 0
-    args = event.get("tool_input") or {}
+    args = event.get("tool_input")
+    if not isinstance(args, dict):
+        return 0
     target = args.get("file_path") or args.get("notebook_path")
     if not target:
         return 0

@@ -12,14 +12,20 @@ devinx --doctor --json
 devinx --explain --cx --or
 ```
 
-These flags are recognised only in the first launcher argument. A plain
-`devinx`, client subcommands and arguments after `--` keep their existing
-meaning. Diagnostics never start a service, read credentials or make an
-inference call. They query the local `/api/hello` endpoint and return 0 for a
-running devinx service, 1 otherwise. `--doctor` adds dependency/client presence
-and descriptor counts; this is a local check, **not** proof that an upstream
-account is working. `--explain` shows the selected client and injected agents,
-not the user's prompt. `--json` is useful for support reports.
+These flags are recognised in the first launcher argument, and also after
+devinx's own flags (`devinx --d --status`) as long as they come before `--`
+and before any client subcommand or prompt — an ambiguous position (anything
+that is not one of devinx's own flags precedes it) is left to the client
+instead. A plain `devinx`, client subcommands and arguments after `--` keep
+their existing meaning. Diagnostics never start a service, read credentials or
+make an inference call. `--status` and `--doctor` query the local `/api/hello`
+endpoint and return 0 for a running devinx service, 1 otherwise. `--doctor`
+adds dependency/client presence and descriptor counts; this is a local check,
+**not** proof that an upstream account is working. `--explain` shows the
+selected client and injected agents, not the user's prompt, and returns 0 once
+it has answered that question — whether or not a service happens to be
+running is not a failure of the explanation. `--json` is useful for support
+reports.
 
 The service reports an explicit allowlist of numeric/boolean runtime settings.
 Diagnostics compare explicitly requested environment settings with the daemon's
@@ -71,6 +77,16 @@ Settings are read when the **service starts**:
 | `DEVINX_MAX_INFLATED_FRAME` | 67108864 | Maximum decoded frame bytes, including concatenated gzip streams. |
 | `DEVINX_RELAY_READ_TIMEOUT` | 0 | Relay read inactivity limit in seconds; 0 keeps the previous unlimited read wait. |
 | `DEVINX_COMPACT_STRICT` | 0 | Set to 1 for the strict compaction policy below. |
+| `DEVINX_MAX_BODY` | 134217728 (128 MiB) | Maximum accepted request body size in bytes. |
+| `DEVINX_KEEPALIVE` | 25 | Seconds between keepalive heartbeats on a silent stream; the client's own idle timeout otherwise reports "the response stopped arriving" on a turn that is still in progress. 0 disables it. |
+| `DEVINX_PACE` | 4 | How many turns may be in flight at once on a credential that refused something recently. 0 disables the cap. |
+| `DEVINX_PACE_WINDOW` | 120 | Seconds after a refusal that `DEVINX_PACE` applies to that credential. |
+| `DEVINX_NETWORK_RETRIES` | 2 | Retries for a connection that breaks mid-response (reset, truncated stream) rather than being refused outright; these are not caught by the rate-limit/classifier retry loop. |
+| `DEVINX_LEAD_CAP` | 8000 | Token threshold above which the blocks leading into a flattened (collapsed) run of tool calls give way to text instead of replayed thinking, when unflattening a legacy history shape. |
+| `DEVINX_SUMMARY_TOKENS` | 16384 | `max_tokens` budget for the compaction summary call itself. |
+| `DEVINX_MID_CONV_REFUSALS` | 3 | How many times one conversation is told a mid-conversation system turn is not accepted before the proxy gives up and carries it through anyway. |
+| `DEVINX_DRAIN` | 300 | Seconds a shutting-down process gives the turns it is already carrying before cutting them short. |
+| `DEVINX_MAX_SWE_INFLIGHT` | *(added separately from this pass — see devinx.py for the current default)* | A cap on concurrent SWE-2 turns independent from `DEVINX_MAX_INFLIGHT`, so a burst of held rate-limit waits on the SWE side cannot starve `claude-*`/`gpt-*` relays of the same shared POST-handler budget. |
 
 Other existing settings, including the 128 MiB request body limit and drain
 budget, keep their defaults. Body framing now requires exactly one non-negative
