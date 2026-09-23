@@ -34,6 +34,7 @@ import math
 import os
 import random
 import re
+import select
 import struct
 import subprocess
 import signal
@@ -50,6 +51,13 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 from urllib3.util.retry import Retry
+try:
+    import tomllib
+except ImportError:          # Python < 3.11
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None       # _read_key falls back to a pattern
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf import timestamp_pb2, duration_pb2, any_pb2, struct_pb2
 from google.protobuf import wrappers_pb2, empty_pb2, field_mask_pb2, type_pb2
@@ -302,10 +310,20 @@ BUILD = _build_id()
 # In-flight requests, so a restart can wait for an idle moment rather than
 # cutting a turn in half.
 _inflight_lock = threading.Lock()
-_inflight = {"n": 0}
+# "n" is everything in flight, which is what a drain waits for; "swe" is the
+# part of it that is SWE-2 turns, which have a cap of their own.
+_inflight = {"n": 0, "swe": 0}
 _active_requests = {}
 _request_local = threading.local()
+# Two caps, because the two kinds of work do not wait alike. A SWE-2 turn can
+# be held for up to the whole rate-limit budget; a relayed claude-*/gpt-* turn
+# or a count_tokens call is the main session and is never held. Under one
+# shared cap a fleet of held subagents filled every slot and the session that
+# launched them was answered 503. MAX_INFLIGHT covers everything that is not a
+# SWE-2 turn — relays, count_tokens, bodies still being read — and
+# MAX_SWE_INFLIGHT the SWE-2 turns. 0 disables either.
 MAX_INFLIGHT = int(os.environ.get("DEVINX_MAX_INFLIGHT", "64"))
+MAX_SWE_INFLIGHT = int(os.environ.get("DEVINX_MAX_SWE_INFLIGHT", "64"))
 HTTP_READ_TIMEOUT = float(os.environ.get("DEVINX_HTTP_READ_TIMEOUT", "30"))
 CLIENT_WRITE_TIMEOUT = float(os.environ.get("DEVINX_CLIENT_WRITE_TIMEOUT", "120"))
 RELAY_READ_TIMEOUT = float(os.environ.get("DEVINX_RELAY_READ_TIMEOUT", "0")) or None
@@ -336,7 +354,8 @@ def live_requests():
 def _enter_request():
     key, now = uuid.uuid4().hex[:12], time.monotonic()
     with _inflight_lock:
-        if MAX_INFLIGHT > 0 and _inflight["n"] >= MAX_INFLIGHT:
+        general = _inflight["n"] - _inflight.get("swe", 0)
+        if MAX_INFLIGHT > 0 and general >= MAX_INFLIGHT:
             return False
         _inflight["n"] += 1
         _active_requests[key] = {"id": key, "model": None,
@@ -346,12 +365,134 @@ def _enter_request():
     return True
 
 
+def _enter_swe():
+    """Move this request from the general slots to a SWE-2 one.
+
+    Called once the body says it is a SWE-2 turn. The request stays counted
+    in "n" throughout, so a drain never loses sight of it.
+    """
+    key = getattr(_request_local, "key", None)
+    with _inflight_lock:
+        entry = _active_requests.get(key)
+        if entry is None or entry.get("swe"):
+            return True
+        if MAX_SWE_INFLIGHT > 0 and _inflight.get("swe", 0) >= MAX_SWE_INFLIGHT:
+            return False
+        entry["swe"] = True
+        _inflight["swe"] = _inflight.get("swe", 0) + 1
+        return True
+
+
 def _leave_request():
     key = getattr(_request_local, "key", None)
     with _inflight_lock:
-        if _active_requests.pop(key, None) is not None:
+        entry = _active_requests.pop(key, None)
+        if entry is not None:
             _inflight["n"] -= 1
+            if entry.get("swe"):
+                _inflight["swe"] = _inflight.get("swe", 0) - 1
     _request_local.key = None
+
+
+class ClientGone(BaseException):
+    """The client hung up while its turn was being held.
+
+    A BaseException on purpose. Between the wait and the handler sit several
+    `except Exception` rescues — compaction failing forwards the turn as is, a
+    dropped connection is retried — and each of them would carry on with the
+    turn for nobody, spending requests on a quota metered in requests.
+    """
+
+
+# What run_swe hands back when there is nobody left to answer.
+CLIENT_GONE = "client_gone: the client disconnected while its turn was held"
+
+
+def _peer_open(sock):
+    """False once the client has closed its end of the connection.
+
+    A closed peer reads as readable-with-nothing-to-read; a client that sent
+    more (a pipelined request) reads as readable-with-data and is still there.
+    Nothing is consumed either way. A check that cannot be made answers
+    "still there": abandoning a live turn is the worse mistake of the two.
+    poll() where it exists, because select() refuses any descriptor past
+    FD_SETSIZE (1024) with a ValueError on a busy service.
+    """
+    try:
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(sock, select.POLLIN)
+            readable = poller.poll(0)
+        else:
+            readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    if not readable:
+        return True
+    try:
+        return bool(sock.recv(1, socket.MSG_PEEK))
+    except (BlockingIOError, InterruptedError, socket.timeout):
+        return True
+    except OSError:
+        return False
+
+
+class Turn:
+    """One client turn: a single wait budget, and whether its client is there.
+
+    One deadline for everything the turn may be held for — the summary, the
+    fold of the summary and the turn's own rate-limit and outage waits. Each
+    used to get a budget of its own, so one turn could be held three times
+    over, an hour and a half, while occupying a slot and its conversation's
+    compaction lock.
+
+    Waits are counted as well as timed, so the budget is spent by waiting even
+    where the clock says otherwise, and they are taken in short steps so a
+    client that left is noticed within half a second instead of at the end
+    of a thirty-minute hold.
+    """
+
+    STEP = 0.5
+
+    def __init__(self, conn=None, gone=None, budget=None):
+        self.budget = RATE_WAIT_BUDGET if budget is None else budget
+        self.deadline = time.time() + self.budget
+        self.slept = 0.0
+        self.conn = conn
+        self.gone = gone if gone is not None else threading.Event()
+
+    def left(self):
+        return min(self.deadline - time.time(), self.budget - self.slept)
+
+    def spent(self):
+        return max(0.0, self.budget - self.left())
+
+    def client_gone(self):
+        if self.gone.is_set():
+            return True
+        if self.conn is not None and not _peer_open(self.conn):
+            self.gone.set()
+            return True
+        return False
+
+    def check(self):
+        if self.client_gone():
+            raise ClientGone()
+
+    def sleep(self, seconds):
+        remaining = max(0.0, seconds)
+        while remaining > 0:
+            self.check()
+            step = min(remaining, self.STEP)
+            time.sleep(step)
+            self.slept += step
+            remaining -= step
+        self.check()
+
+
+def current_turn():
+    """The turn this thread is serving, or a fresh one outside any turn."""
+    return getattr(_request_local, "turn", None) or Turn()
 
 
 # --------------------------------------------------------------------------- #
@@ -452,15 +593,52 @@ def _credential_files():
     return found
 
 
-def _read_key(path):
-    try:
-        with open(path) as fh:
-            for line in fh:
-                if line.startswith("windsurf_api_key"):
-                    return line.split('"')[1]
-    except OSError:
-        pass
+# Only for when no TOML parser is importable (Python < 3.11 without tomli):
+# the one line that matters, in either quoting style TOML allows.
+_KEY_LINE = re.compile(r"""^[ \t]*windsurf_api_key[ \t]*=[ \t]*"""
+                       r"""(?:"((?:[^"\\\n]|\\.)*)"|'([^'\n]*)')""", re.M)
+
+
+def _find_key(table):
+    """windsurf_api_key at the top level, or in a table one level down."""
+    value = table.get("windsurf_api_key")
+    if isinstance(value, str):
+        return value
+    for sub in table.values():
+        if isinstance(sub, dict) and isinstance(sub.get("windsurf_api_key"), str):
+            return sub["windsurf_api_key"]
     return None
+
+
+def _read_key(path):
+    """The key in one credentials.toml, or None — never an exception.
+
+    Split on double quotes, a file written with single quotes (valid TOML)
+    raised IndexError, and since every credential is read on the same pass
+    one such file made every SWE-2 request fail with "list index out of
+    range". Each file now stands or falls on its own.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    key = None
+    if tomllib is not None:
+        try:
+            key = _find_key(tomllib.loads(raw))
+        except Exception:
+            key = None
+    if key is None:
+        found = _KEY_LINE.search(raw)
+        if found:
+            key = (found.group(1).replace('\\"', '"').replace("\\\\", "\\")
+                   if found.group(1) is not None else found.group(2))
+    if key is None or not key.strip():
+        if os.path.exists(path):
+            print(f"warning: no windsurf_api_key readable in {path}", flush=True)
+        return None
+    return key.strip()
 
 
 # Every credentials.toml sits in a directory called "devin", so naming an
@@ -498,7 +676,12 @@ def _load_accounts():
                 paths.append(None)
     else:
         for path in _credential_files():
-            key = _read_key(path)
+            try:
+                key = _read_key(path)
+            except Exception as e:
+                # One unreadable file must not take the others down with it.
+                print(f"warning: skipping {path}: {type(e).__name__}", flush=True)
+                key = None
             if key and key not in keys:
                 keys.append(key)
                 names.append(_credential_name(path))
@@ -677,14 +860,51 @@ def api_key():
 
 
 def reset_key():
-    """Forget the memoised credentials so the next use re-reads the files.
+    """Re-read the credential files now, keeping what is known per account.
 
     Called when the upstream rejects our auth: the usual cause is that the user
     just ran `devin auth login` again, which rewrites credentials.toml while this
     process happily keeps using the string it read at startup.
+
+    It used to empty the list and let the next use reload it. That also wiped
+    every account's block and pacing state — one 401 on one account released
+    a burst at accounts that were rate limited — and the retry right after it
+    still went out with the old key, the reload only happening on the next
+    request. Now the reload happens here and updates the existing account
+    dicts in place, matched by key and then by name, so a caller holding one
+    retries with the new key and nothing else forgets it was blocked.
     """
+    try:
+        fresh = _load_accounts()
+    except RuntimeError as e:
+        # Nothing readable right now (a login mid-write, say): keep what is in
+        # use rather than leave nothing to use at all.
+        print(f"devinx: credential reload found nothing ({e}); keeping the "
+              f"current ones", flush=True)
+        return
+    fresh_keys = {a["key"] for a in fresh}
     with _acct_lock:
-        _accounts.clear()
+        by_key = {a["key"]: a for a in _accounts}
+        by_name = {a["name"]: a for a in _accounts}
+        merged = []
+        for new in fresh:
+            old = by_key.get(new["key"])
+            if old is None:
+                old = by_name.get(new["name"])
+                if old is not None and old["key"] not in fresh_keys:
+                    # The same credential file with a new key written into it.
+                    old.update(key=new["key"], jwt=None, exp=0.0, base=None)
+                else:
+                    old = None
+            if old is None or any(old is m for m in merged):
+                merged.append(new)
+            else:
+                merged.append(old)
+        changed = {a["key"] for a in merged} != set(by_key)
+        _accounts[:] = merged
+    if changed:
+        print(f"devinx: credentials reloaded "
+              f"({', '.join(a['name'] for a in merged)})", flush=True)
 
 
 _turn = {"n": 0}
@@ -755,6 +975,13 @@ def claim_account(avoid=None):
     account its refusals thin out, its rate climbs back and so does its share.
     """
     _maybe_rescan()
+    if not _accounts:
+        # Nothing loaded yet, or a reload found nothing: an empty list would
+        # read as "wait for nobody" rather than as the missing credential.
+        try:
+            accounts()
+        except RuntimeError:
+            pass
     now = time.time()
     with _acct_lock:
         live = [a for a in _accounts if not a.get("excluded")]
@@ -777,14 +1004,25 @@ def claim_account(avoid=None):
             pick["credit"] -= total
             pick.setdefault("attempts", collections.deque()).append(now)
             return pick, 0.0
-        soonest = min((a["blocked_until"] for a in live
-                       if a is not avoid), default=now)
+        # The avoided account counts here. Leaving it out made the answer
+        # "nothing to wait for" with a single credential — the turn was handed
+        # back at once — and with two it waited out the other one's thirty
+        # minutes when the one that just refused was back in five seconds.
+        soonest = min((a["blocked_until"] for a in live), default=now)
         return None, max(0.0, soonest - now)
 
 
 def block_account(acct, seconds):
+    """Take a credential out of rotation for at least RATE_FLOOR seconds.
+
+    The upstream does say "reset in 0 seconds" — 129 times in one log — and
+    taken literally that blocks nothing: the next claim hands the same
+    credential straight back and the retry goes out on the next round trip,
+    for as long as the budget lasts. The floor is what makes every refusal
+    cost a pause.
+    """
     with _acct_lock:
-        acct["blocked_until"] = time.time() + seconds
+        acct["blocked_until"] = time.time() + max(seconds, RATE_FLOOR)
         # The refusal is remembered for as long as the upstream said the
         # limit would last, within a minute and half an hour.
         acct.setdefault("refusals", collections.deque()).append(
@@ -823,7 +1061,15 @@ def paced(acct):
     return sem
 
 
-_jwt_lock = threading.Lock()
+# One lock per credential, not one for the process: the lock is held across
+# a network call of up to 30s, and a slow auth endpoint for one account used
+# to hold up the turns of every other account behind it.
+_jwt_locks = {}
+
+
+def _jwt_lock_for(acct):
+    with _acct_lock:
+        return _jwt_locks.setdefault(acct["key"], threading.Lock())
 
 
 def _metadata(jwt="", key=None):
@@ -852,7 +1098,7 @@ def get_jwt(acct=None, force=False):
     """A JWT for one account, cached on that account rather than globally."""
     if acct is None:
         acct = _first_usable()
-    with _jwt_lock:
+    with _jwt_lock_for(acct):
         now = time.time()
         if not force and acct["jwt"] and acct["exp"] - 60 > now:
             return acct["jwt"], acct["base"]
@@ -874,6 +1120,40 @@ def get_jwt(acct=None, force=False):
         acct["base"] = resp.custom_api_server_url.strip() or None
         _check_plan(acct, resp.user_jwt)
         return acct["jwt"], acct["base"]
+
+
+def _auth_refused(error):
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) in (401, 403)
+
+
+def _jwt_or_reload(acct, force=False):
+    """(jwt, base, None), or (None, None, error) when the credential is refused.
+
+    The JWT endpoint is where an expired or replaced key is refused first,
+    and a refusal there never reached reset_key(): SWE-2 stayed broken until
+    a restart, and the turn failed as a 502 api_error the client cannot act
+    on. Refused once, the credentials are re-read and the call tried again;
+    refused twice, it is an authentication_error.
+    """
+    for attempt in range(2):
+        try:
+            jwt, base = get_jwt(acct, force=force or attempt > 0)
+            return jwt, base, None
+        except requests.HTTPError as e:
+            if not _auth_refused(e):
+                raise
+            status = e.response.status_code
+            if attempt == 0:
+                print(f"auth endpoint refused {acct['name']} (HTTP {status}); "
+                      f"re-reading the credentials", flush=True)
+                reset_key()
+                continue
+            print(f"auth endpoint refused {acct['name']} again (HTTP {status})",
+                  flush=True)
+            return None, None, (
+                f"unauthenticated: the Devin credential {acct['name']} was "
+                f"refused (HTTP {status}); run `devin auth login`")
 
 
 # --------------------------------------------------------------------------- #
@@ -941,12 +1221,54 @@ def _image_of(block):
             "mime_type": src.get("media_type") or "image/png"}
 
 
-def _tool_result_text(block):
-    """tool_result content is a string or a list of blocks (text and/or image)."""
+def _document_text(block):
+    """(text, None) for a document the upstream can be given as text, or
+    (placeholder, label) for one it cannot.
+
+    Cognition takes text and images and nothing else, so a PDF has nowhere to
+    go. It used to vanish without a word when it sat inside a tool_result —
+    the Read tool returns PDFs that way — and the model answered as if it had
+    read a file it never saw. A document whose source is plain text loses
+    nothing by being sent as text; any other kind is replaced by a line
+    saying it was left out, so the model knows to say so.
+    """
+    src = block.get("source") or {}
+    title = block.get("title") or ""
+    head = f"[document: {title}]\n" if title else ""
+    if src.get("type") == "text" and isinstance(src.get("data"), str):
+        return head + src["data"], None
+    if src.get("type") == "content":
+        text = _text_of(src.get("content"))
+        if text:
+            return head + text, None
+    kind = src.get("media_type") or src.get("type") or "unknown"
+    name = f" {title!r}" if title else ""
+    return (f"[document{name} ({kind}) omitted: this model cannot read it]",
+            f"document/{src.get('type')}")
+
+
+def _tool_result_text(block, dropped=None):
+    """tool_result content is a string or a list of blocks (text, images,
+    documents). Images travel separately; anything else is named in
+    `dropped` when the caller keeps that list."""
     content = block.get("content")
     if isinstance(content, str):
         return content
-    return _text_of(content)
+    text, documents = [], False
+    for b in _blocks(content):
+        kind = b.get("type")
+        if kind == "text":
+            text.append(b.get("text", ""))
+        elif kind == "document":
+            doc, lost = _document_text(b)
+            text.append(doc)
+            documents = True
+            if lost and dropped is not None:
+                dropped.append(lost)
+        elif kind != "image" and dropped is not None:
+            dropped.append(f"tool_result/{kind}")
+    # Text blocks join as they always have; a document gets lines of its own.
+    return ("\n" if documents else "").join(text)
 
 
 def _system_text(body):
@@ -1068,6 +1390,8 @@ TOOL_DESC_CAPS = (None, 6000, 2500)
 # handed back as errors after waiting the full ten. A held turn is a paused
 # agent; a handed-back turn is usually a dead one.
 RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "1800"))
+# The shortest a refused credential is left alone, whatever the upstream says.
+RATE_FLOOR = float(os.environ.get("DEVINX_RATE_FLOOR", "3"))
 # The upstream's own words when the model behind it is down, as opposed to
 # refusing this account. Switching credential cannot help; waiting can.
 _OUTAGE = ("experiencing issues", "currently not available",
@@ -1146,12 +1470,15 @@ def build_request(body, tool_desc_cap=None):
                         "message_id": mid("tool", b),
                         "source": SRC_TOOL,
                         "tool_call_id": b.get("tool_use_id", ""),
-                        "prompt": _tool_result_text(b),
+                        "prompt": _tool_result_text(b, dropped),
                         # Without this a failed tool call replays as a successful
                         # one and the model has to infer failure from the text.
                         "tool_result_is_error": bool(b.get("is_error")),
+                        # Image blocks only. Any base64 source used to pass,
+                        # so a PDF went up as an "image" of application/pdf.
                         "images": [img for img in
-                                   (_image_of(x) for x in _blocks(b.get("content")))
+                                   (_image_of(x) for x in _blocks(b.get("content"))
+                                    if x.get("type") == "image")
                                    if img],
                     })
                 elif kind == "text":
@@ -1163,6 +1490,11 @@ def build_request(body, tool_desc_cap=None):
                     else:
                         dropped.append("image/" + str(
                             (b.get("source") or {}).get("type")))
+                elif kind == "document":
+                    doc, lost = _document_text(b)
+                    text_parts.append(doc)
+                    if lost:
+                        dropped.append(lost)
                 else:
                     dropped.append(str(kind))
             if text_parts or images:
@@ -1319,7 +1651,10 @@ def chat_stream(req, acct=None, purpose="turn"):
     if acct is None:
         acct = _first_usable()
     _request_phase("summarizing" if purpose == "summary" else "authenticating")
-    jwt, base = get_jwt(acct)
+    jwt, base, err = _jwt_or_reload(acct)
+    if err:
+        yield None, err
+        return
     req.metadata.api_key = acct["key"]
     req.metadata.user_jwt = jwt
     body = req.SerializeToString()
@@ -1349,16 +1684,23 @@ def chat_stream(req, acct=None, purpose="turn"):
             if status in (401, 403) and attempt == 0:
                 # Re-read the credential file too: after `devin auth login` the
                 # process would otherwise keep retrying with the stale key it
-                # memoised at first use.
+                # memoised at first use. reset_key() updates this very dict,
+                # so acct["key"] below is the reloaded one.
                 reset_key()
-                jwt, base = get_jwt(acct, force=True)
+                jwt, base, err = _jwt_or_reload(acct, force=True)
+                if err:
+                    yield None, err
+                    return
                 req.metadata.api_key = acct["key"]
                 req.metadata.user_jwt = jwt
                 body = req.SerializeToString()
                 continue
             print(f"upstream HTTP {status} on {acct['name']}: {detail}",
                   flush=True)
-            yield None, f"upstream {status}: {detail}"
+            if status in (401, 403):
+                yield None, f"unauthenticated: upstream {status}: {detail}"
+            else:
+                yield None, f"upstream {status}: {detail}"
             return
         # conv= is the cascade id, which is derived from the conversation and
         # stable across its turns: the join key the log never had. Without one,
@@ -1478,6 +1820,10 @@ COMPACT_PROMPT_MORE = """Your task is to create a detailed summary of the RECENT
 
 _summary_lock = threading.Lock()
 _summaries = {}
+# Summaries kept per conversation key: enough for a few runs sharing one key
+# (parallel subagents with the same prompt and task, a resume) not to evict
+# each other's.
+SUMMARIES_PER_KEY = 4
 _summary_flights = {}
 COMPACT_STRICT = os.environ.get("DEVINX_COMPACT_STRICT") == "1"
 
@@ -1507,7 +1853,7 @@ def _block_hashes(span):
                  for pair in span)
 
 
-def _uncovered_blocks(span, previous, flattened=False):
+def _uncovered_blocks(span, previous, flattened=False, hashes=None):
     """Return new blocks, or None if previously summarised content changed.
 
     Ordinary histories must extend a prefix. Legacy flattened histories insert
@@ -1515,7 +1861,8 @@ def _uncovered_blocks(span, previous, flattened=False):
     and every inserted block must still be carried or summarised (not skipped
     using the old block count).
     """
-    hashes = _block_hashes(span)
+    if hashes is None:
+        hashes = _block_hashes(span)
     if not flattened:
         if hashes[:len(previous)] != previous:
             return None
@@ -1558,6 +1905,10 @@ def _render_turns(messages):
 
 
 def _summary_body(messages, model, system, previous):
+    """The summariser's request. `system` is accepted and deliberately unused:
+    the agent's own system prompt (its first 2000 characters used to ride
+    along) says nothing about the turns being summarised, and it was paid for
+    on every summary call."""
     return {
         "model": model,
         # Room for the model to think *and* answer. At 4096 it was spending the
@@ -1570,7 +1921,6 @@ def _summary_body(messages, model, system, previous):
             (f"<earlier_summary>\n{previous}\n</earlier_summary>\n\n"
              if previous else "")
             + f"<conversation>\n{_render_turns(messages)}\n</conversation>\n\n"
-            f"The agent's own instructions began: {system[:2000]}\n\n"
             + (COMPACT_PROMPT_MORE if previous else COMPACT_PROMPT)}]}],
     }
 
@@ -1578,7 +1928,7 @@ def _summary_body(messages, model, system, previous):
 _TOO_LONG = object()
 
 
-def _summarise_once(messages, model, system, previous, deadline):
+def _summarise_once(messages, model, system, previous, turn):
     """One summary, waited for rather than given up on.
 
     Every way this call used to fail is something that passes: a credential
@@ -1586,9 +1936,10 @@ def _summarise_once(messages, model, system, previous, deadline):
     and on 2026-09-23 this was the whole story: 39 agents lost the middle of
     their run because both accounts refused at the same instant and this
     function returned None without a word), the provider being down, a dropped
-    connection, an empty answer. So each of them is waited out, up to the same
-    budget a turn gets. The client does not see the wait as silence: the
-    keepalive is armed before compaction starts.
+    connection, an empty answer. So each of them is waited out, within the
+    turn's own budget: the summary is part of the turn, not a second hold on
+    top of it. The client does not see the wait as silence: the keepalive is
+    armed before compaction starts. A client that leaves ends it (ClientGone).
 
     Returns the text, None when the budget is spent or the error is not one
     that passes, or _TOO_LONG when the transcript itself is too big to be read
@@ -1597,8 +1948,11 @@ def _summarise_once(messages, model, system, previous, deadline):
     req, _ = build_request(_summary_body(messages, model, system, previous))
     t0 = time.time()
     acct, empties, outages, drops, others = None, 0, 0, 0, 0
+    pause = turn.sleep
+
     while True:
-        left = deadline - time.time()
+        turn.check()
+        left = turn.left()
         if left <= 0:
             print(f"summary: {time.time() - t0:.0f}s of waiting spent without "
                   f"an answer", flush=True)
@@ -1617,7 +1971,7 @@ def _summarise_once(messages, model, system, previous, deadline):
                 print(f"summary: every credential rate limited, waiting "
                       f"{wait:.0f}s ({time.time() - t0:.0f}s so far)", flush=True)
                 _request_phase("waiting_rate_limit")
-                time.sleep(wait)
+                pause(wait)
                 continue
         texts, thinks, err = [], [], None
         for msg, e in chat_stream(req, acct, purpose="summary"):
@@ -1659,20 +2013,20 @@ def _summarise_once(messages, model, system, previous, deadline):
             print(f"summary: provider unavailable, waiting {wait:.0f}s",
                   flush=True)
             _request_phase("waiting_outage")
-            time.sleep(wait)
+            pause(wait)
             continue
         if any(t in err for t in _TRANSIENT):
             drops += 1
             wait = min(2 ** drops, 30, left)
             print(f"summary: {err[:60]}, retrying in {wait:.0f}s", flush=True)
-            time.sleep(wait)
+            pause(wait)
             continue
         if "too long" in err.lower():
             return _TOO_LONG
         others += 1
         if others <= 3:
             print(f"summary: {err[:80]}, retrying ({others}/3)", flush=True)
-            time.sleep(5 * others)
+            pause(min(5 * others, max(left, 0)))
             continue
         print(f"summary: giving up on {err[:80]}", flush=True)
         return None
@@ -1743,7 +2097,9 @@ def summarise_turns(messages, model, system, previous=None, never_empty=True):
     """
     if not messages:
         return None
-    deadline = time.time() + RATE_WAIT_BUDGET
+    # The turn's budget, not a fresh one (see Turn); outside a turn — tests,
+    # tools — a budget of its own.
+    turn = current_turn()
     summary, added = previous, []
     pending = _chunks(messages, SUMMARY_INPUT_CAP)
     if len(pending) > 1:
@@ -1751,7 +2107,7 @@ def summarise_turns(messages, model, system, previous=None, never_empty=True):
               flush=True)
     while pending:
         piece = pending.pop(0)
-        got = _summarise_once(piece, model, system, summary, deadline)
+        got = _summarise_once(piece, model, system, summary, turn)
         if got is _TOO_LONG and len(piece) > 1:
             half = len(piece) // 2
             pending[:0] = [piece[:half], piece[half:]]
@@ -1947,17 +2303,20 @@ def _tail_start(messages, budget):
 
 def compact_body(body):
     messages = body.get("messages") or []
-    if estimate_tokens(body) <= COMPACT_AT:
+    # One memo for the whole compaction: every estimate below reweighs the
+    # same message objects.
+    memo = {}
+    if estimate_tokens(body, memo) <= COMPACT_AT:
         return body
     if len(messages) < 4:
         if COMPACT_STRICT:
             raise CompactionUnavailable("context exceeds the budget with no safely droppable turns")
         return body
     with _summary_guard(_conv_key(body)):
-        return _compact_body(body)
+        return _compact_body(body, memo)
 
 
-def _compact_body(body):
+def _compact_body(body, memo=None):
     """Replace the middle of an over-long conversation with a summary.
 
     The first turn stays: it is the task. The recent turns stay verbatim: they
@@ -1965,7 +2324,7 @@ def _compact_body(body):
     summary, written with Claude Code's own compaction prompt.
     """
     messages = body.get("messages") or []
-    if len(messages) < 4 or estimate_tokens(body) <= COMPACT_AT:
+    if len(messages) < 4 or estimate_tokens(body, memo) <= COMPACT_AT:
         return body
     start = _tail_start(messages, int(COMPACT_AT * COMPACT_TAIL))
     if start <= 1 or start >= len(messages):
@@ -1979,27 +2338,36 @@ def _compact_body(body):
     key = _conv_key(body)
     span = _span_blocks(messages, start)
     total_blocks = _count_blocks(messages)
-    with _summary_lock:
-        covered, summary, built_at, covered_hashes = _summaries.get(
-            key, (0, None, 0, ()))
+    # Several summaries per key, each good for exactly the history it covers.
     # A resumed agent is the same task under the same system prompt in the same
-    # session, so it hashes to the same key — and would inherit the summary of
-    # the run that failed, then extend it rather than rebuild it, so each resume
-    # starts further from the truth than the last. A conversation that is
-    # suddenly shorter than when the summary was built is a new run, not a
-    # continuation: the summary is dropped and rebuilt from what is actually
-    # there. Only the summary is reset; the cascade id stays, because that is
-    # what keeps the upstream prefix cache and it is worth about 60% of the
-    # input tokens.
-    if summary is not None and total_blocks < built_at:
-        print(f"compaction: conversation restarted ({total_blocks} blocks, was "
-              f"{built_at}); dropping the summary from the previous run",
-              flush=True)
-        covered, summary, covered_hashes = 0, None, ()
-    fresh = _uncovered_blocks(span, covered_hashes, _is_flattened(messages))
-    if fresh is None:
-        print("compaction: covered content changed; rebuilding the summary", flush=True)
+    # session, so it hashes to the same key — and so do two subagents launched
+    # in parallel with the same prompt and the same first task. With one
+    # summary per key, a resume inherited the failed run's summary, and the
+    # two parallel runs took turns throwing each other's away ("conversation
+    # restarted") and rebuilding their own, on every turn. A summary is now
+    # used only when the blocks it covers are still, unchanged, the start of
+    # this history; each run finds its own and a restarted one finds none.
+    # Only the summary is chosen this way; the cascade id stays the key's,
+    # because that is what keeps the upstream prefix cache and it is worth
+    # about 60% of the input tokens.
+    flattened = _is_flattened(messages)
+    span_hashes = _block_hashes(span)
+    with _summary_lock:
+        stored = list(_summaries.get(key) or ())
+    entry, fresh = None, None
+    for candidate in sorted(stored, key=lambda e: len(e[3]), reverse=True):
+        got = _uncovered_blocks(span, candidate[3], flattened, span_hashes)
+        if got is not None:
+            entry, fresh = candidate, got
+            break
+    if entry is None:
+        if stored:
+            print(f"compaction: none of the {len(stored)} summaries kept for "
+                  f"this conversation covers its history; building a new one",
+                  flush=True)
         covered, summary, covered_hashes, fresh = 0, None, (), span
+    else:
+        covered, summary, _, covered_hashes = entry
     retained = ""
     if COMPACT_STRICT:
         user_text = [b.get("text", "") for role, b in span
@@ -2020,12 +2388,12 @@ def _compact_body(body):
             {"type": "text", "text": (text or "") + retained}]}]
         trial = dict(body)
         trial["messages"] = head + _regroup(uncovered) + messages[start:]
-        return estimate_tokens(trial) <= COMPACT_AT, trial
+        return estimate_tokens(trial, memo) <= COMPACT_AT, trial
 
     room, _ = fits(summary, fresh)
     if summary is None or not room:
         model = resolve_model(body)
-        before = estimate_tokens(body)
+        before = estimate_tokens(body, memo)
         # Only what arrived since the last summary, extending it rather than
         # rebuilding it: the difference between a few seconds a turn and half a
         # minute a turn.
@@ -2067,13 +2435,15 @@ def _compact_body(body):
                 summary = folded
         if new:
             covered = len(span)
-            covered_hashes = _block_hashes(span)
+            covered_hashes = span_hashes
             fresh = []
         with _summary_lock:
             # Bounded insertion-order eviction, not a fleet-wide cache wipe.
             if key not in _summaries and len(_summaries) >= 64:
                 _summaries.pop(next(iter(_summaries)))
-            _summaries[key] = (covered, summary, total_blocks, covered_hashes)
+            kept = [e for e in (_summaries.get(key) or ()) if e is not entry]
+            _summaries[key] = (kept + [(covered, summary, total_blocks,
+                                        covered_hashes)])[-SUMMARIES_PER_KEY:]
         if new:
             print(f"compaction: {fresh_count} more blocks summarised "
                   f"({covered} of {len(span)} covered, {before} tokens "
@@ -2103,9 +2473,9 @@ def _compact_body(body):
         return out
 
     compacted = assemble(carried)
-    if COMPACT_STRICT and estimate_tokens(compacted) > COMPACT_AT:
+    if COMPACT_STRICT and estimate_tokens(compacted, memo) > COMPACT_AT:
         raise CompactionUnavailable("preserved context still exceeds the compaction budget")
-    if carried and estimate_tokens(compacted) > COMPACT_AT:
+    if carried and estimate_tokens(compacted, memo) > COMPACT_AT:
         # The summary could not be extended far enough to make room. Whatever
         # it does not cover goes, because a body over the limit comes back
         # refused and that ends the agent.
@@ -2117,7 +2487,7 @@ def _compact_body(body):
     # is worth knowing from measurement rather than assumption.
     def anatomy(m):
         raw = len(json.dumps(m, default=str)) // 4
-        est = estimate_tokens({"messages": [m]})
+        est = estimate_tokens({"messages": [m]}, memo)
         parts = []
         for b in _blocks(m.get("content")):
             kind = b.get("type")
@@ -2128,7 +2498,7 @@ def _compact_body(body):
 
     worst = max(messages, key=lambda m: len(json.dumps(m, default=str)))
     raw, est, role, nblocks, parts = anatomy(worst)
-    print(f"compaction: {estimate_tokens(body)} -> {estimate_tokens(compacted)} "
+    print(f"compaction: {estimate_tokens(body, memo)} -> {estimate_tokens(compacted, memo)} "
           f"tokens; {len(messages)} msgs; biggest: role={role} blocks={nblocks} "
           f"raw={raw}t est={est}t :: {' | '.join(parts)}", flush=True)
     return compacted
@@ -2242,7 +2612,78 @@ def _stop_reason(stop, has_tools):
     return "end_turn"
 
 
-class AnthropicStream:
+class _KeepAlive:
+    """The keepalive both emitters share, and the client-gone flag it raises.
+
+    A turn that spends four minutes reasoning before its first token sends no
+    bytes at all, and both clients give up on a stream that has been silent for
+    five: Claude Code reports "The response stopped arriving", Codex drops the
+    stream and sends the request again — a duplicate, held in parallel with
+    the first. Each emitter says in _keepalive() what a harmless event is in
+    its own dialect.
+
+    The first keepalive is also the point of no return: writing it commits to
+    a 200, so an upstream refusal after that is an SSE error event rather than
+    an HTTP status. That is the same trade the real API makes, and it only
+    applies to turns already slower than any retry would be.
+
+    Every write goes through _write(), which sets `gone` when the socket
+    refuses it. That flag is the turn's: a keepalive that finds the client
+    gone used to stop in silence and leave the turn retrying for nobody.
+    """
+
+    def _keep_alive_init(self):
+        # One writer at a time: the keepalive runs on its own thread and an
+        # interleaved write would split an event in half on the wire.
+        self._wlock = threading.RLock()
+        self._last_write = time.time()
+        self._done = threading.Event()
+        self._alive = None
+        self.gone = threading.Event()
+
+    def _write(self, data):
+        try:
+            self.w.write(data)
+            self.w.flush()
+        except OSError:
+            self.gone.set()
+            raise
+        self._last_write = time.time()
+
+    def arm(self):
+        """Hold the connection open while the upstream thinks."""
+        if KEEPALIVE_EVERY <= 0 or self._alive is not None:
+            return
+
+        def loop():
+            while not self._done.wait(1.0):
+                if time.time() - self._last_write < KEEPALIVE_EVERY:
+                    continue
+                try:
+                    with self._wlock:
+                        if self._done.is_set():
+                            return
+                        if not self.started:
+                            self.start()
+                        else:
+                            self._keepalive()
+                except Exception:
+                    # The client is gone, or the socket is. Either way there is
+                    # nothing left to keep alive — and the turn has to know.
+                    self.gone.set()
+                    return
+
+        self._alive = threading.Thread(target=loop, daemon=True)
+        self._alive.start()
+
+    def release(self):
+        # Synchronise with a keepalive that may be about to commit HTTP 200.
+        # Once this returns the caller can decide safely between HTTP and SSE.
+        with self._wlock:
+            self._done.set()
+
+
+class AnthropicStream(_KeepAlive):
     """Emits the Anthropic SSE event sequence onto a raw socket.
 
     Blocks are opened lazily and closed when the next kind of content starts.
@@ -2268,70 +2709,23 @@ class AnthropicStream:
         self.pending_signature = None
         self.started = False
         self.tools = {}
-        # One writer at a time: the keepalive runs on its own thread and an
-        # interleaved write would split an event in half on the wire.
-        self._wlock = threading.RLock()
-        self._last_write = time.time()
-        self._done = threading.Event()
-        self._alive = None
+        self._keep_alive_init()
 
-    def arm(self):
-        """Hold the connection open while the upstream thinks.
-
-        A turn that spends four minutes reasoning before its first token sends
-        no bytes at all, and the client gives up on a stream that has been
-        silent for five. Emitting `ping` the way Anthropic's own API does costs
-        nothing and makes that silence impossible.
-
-        The first keepalive is also the point of no return: writing it commits
-        to a 200, so an upstream refusal after that is an SSE error event
-        rather than an HTTP status. That is the same trade the real API makes,
-        and it only applies to turns already slower than any retry would be.
-        """
-        if KEEPALIVE_EVERY <= 0 or self._alive is not None:
-            return
-
-        def loop():
-            while not self._done.wait(1.0):
-                if time.time() - self._last_write < KEEPALIVE_EVERY:
-                    continue
-                try:
-                    with self._wlock:
-                        if self._done.is_set():
-                            return
-                        if not self.started:
-                            self.start()
-                        else:
-                            self._send("ping", {"type": "ping"})
-                except Exception:
-                    # The client is gone, or the socket is. Either way there is
-                    # nothing left to keep alive.
-                    return
-
-        self._alive = threading.Thread(target=loop, daemon=True)
-        self._alive.start()
-
-    def release(self):
-        # Synchronise with a keepalive that may be about to commit HTTP 200.
-        # Once this returns the caller can decide safely between HTTP and SSE.
-        with self._wlock:
-            self._done.set()
+    def _keepalive(self):
+        # Anthropic's own API keeps a stream alive with `ping`.
+        self._send("ping", {"type": "ping"})
 
     def _send(self, event, data):
         with self._wlock:
-            self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
-            self.w.flush()
-            self._last_write = time.time()
+            self._write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
 
     def start(self, usage=None):
         with self._wlock:
             if self.started:
                 return
             self.started = True
-            self.w.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
-                         b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
-            self.w.flush()
-            self._last_write = time.time()
+            self._write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                        b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
             self._send("message_start", {
                 "type": "message_start",
                 "message": {"id": new_message_id(), "type": "message",
@@ -2448,6 +2842,13 @@ def run_swe(body, wfile, make_stream=None, outcome=None):
     """
     emitter = make_stream or AnthropicStream
     out = emitter(wfile, resolve_model(body)) if body.get("stream") else None
+    # The connection comes from the handler through the thread, not as an
+    # argument: every caller and test double keeps the same signature, and the
+    # non-streaming path, which has no emitter, is watched just the same.
+    turn = Turn(conn=getattr(_request_local, "conn", None),
+                gone=getattr(out, "gone", None))
+    outer = getattr(_request_local, "turn", None)
+    _request_local.turn = turn
     try:
         if out is not None:
             out.arm()
@@ -2457,9 +2858,34 @@ def run_swe(body, wfile, make_stream=None, outcome=None):
                                  "stream_error" if getattr(out, "failure", None)
                                  else "200")
         return response, err
+    except ClientGone:
+        # Nobody is left to answer, so nothing is written and no further
+        # upstream call is made on the turn's behalf.
+        print(f"client disconnected while its turn was held "
+              f"({turn.spent():.0f}s in); abandoning it", flush=True)
+        if outcome is not None:
+            outcome["status"] = "client_disconnected"
+        return None, CLIENT_GONE
     finally:
+        _request_local.turn = outer
         if out is not None:
             out.release()
+
+
+@contextlib.contextmanager
+def _paced_for(acct, turn):
+    """paced(), waited for in steps so a departed client is noticed."""
+    gate = paced(acct)
+    if not hasattr(gate, "acquire"):
+        with gate:
+            yield
+        return
+    while not gate.acquire(timeout=Turn.STEP):
+        turn.check()
+    try:
+        yield
+    finally:
+        gate.release()
 
 
 def _run_swe(body, out):
@@ -2470,6 +2896,7 @@ def _run_swe(body, out):
     the Codex flavour of Responses when the request came in on that route. Only
     the emitter differs — everything upstream of it is shared.
     """
+    turn = current_turn()
     # Before anything is sent: if this turn would not fit, reduce it here rather
     # than let the upstream refuse it and the client end the agent.
     try:
@@ -2504,9 +2931,12 @@ def _run_swe(body, out):
     # Cognition's input classifier denies borderline payloads nondeterministically
     # (the same body has been observed to pass and to fail). Retry while nothing
     # has reached the client yet.
-    attempt, waited, retries, outages = 0, 0.0, 0, 0
+    attempt, retries, outages = 0, 0, 0
     acct = None
     while attempt < 3:
+        # Before every attempt, first included: compaction may have held the
+        # turn for minutes, and every retry below is one more request.
+        turn.check()
         try:
             _request_phase("preparing")
             req, model = build_request(body, TOOL_DESC_CAPS[attempt])
@@ -2532,7 +2962,7 @@ def _run_swe(body, out):
                 acct = _first_usable()
         try:
           _request_phase("waiting_capacity")
-          with paced(acct):
+          with _paced_for(acct, turn):
             for msg, e in chat_stream(req, acct):
                 if e:
                     err = e
@@ -2600,19 +3030,28 @@ def _run_swe(body, out):
             err = f"upstream {type(e).__name__}: {e}"
             print(err, flush=True)
 
+        if err:
+            # A write to a client that left raises the same OSErrors as a
+            # dropped upstream — ConnectionResetError is on the transient list —
+            # so without this a vanished client was retried as a network fault.
+            turn.check()
         if (err and not emitted and retries < NETWORK_RETRIES
                 and any(t in err for t in _TRANSIENT)):
             retries += 1
             delay = 1.5 * retries
             print(f"upstream connection failed ({err[:60]}), retrying in "
                   f"{delay:.0f}s ({retries}/{NETWORK_RETRIES})", flush=True)
-            time.sleep(delay)
+            turn.sleep(delay)
             continue
         if err and not emitted and "resource_exhausted" in err:
             # Both of Cognition's limits are per account, so another credential
             # is a switch rather than a wait. Only when every one of them is
             # spent does the turn actually have to be held.
-            delay = reset_delay(err)
+            # Floored: "reset in 0 seconds" is a real answer, and read
+            # literally it made this a loop with no pause in it — two
+            # credentials handed the turn back and forth on every round trip,
+            # and a single one handed it back to the client at once.
+            delay = max(reset_delay(err), RATE_FLOOR)
             if acct is not None:
                 block_account(acct, delay)
             other, until = claim_account(avoid=acct)
@@ -2621,20 +3060,26 @@ def _run_swe(body, out):
                       f"{other['name']}", flush=True)
                 acct = other
                 continue
+            if until is None:
+                # Every credential is excluded (free plan): none comes back
+                # on its own, so holding the turn would only burn its budget.
+                print("upstream rate limited and every credential is excluded; "
+                      "handing it back", flush=True)
+                break
             # Every account is blocked; wait for the first one to come back.
-            wait = min(until or delay, RATE_WAIT_BUDGET - waited)
+            wait = min(max(until, RATE_FLOOR), turn.left())
             if wait > 0:
                 wait += random.uniform(0, min(5.0, wait * 0.1))
                 print(f"upstream rate limited on every credential, holding "
-                      f"the turn for {wait:.0f}s ({waited:.0f}s waited so far)",
+                      f"the turn for {wait:.0f}s "
+                      f"({turn.spent():.0f}s waited so far)",
                       flush=True)
                 _request_phase("waiting_rate_limit")
-                time.sleep(wait)
-                waited += wait
+                turn.sleep(wait)
                 acct, _ = claim_account()
                 continue
-            print(f"upstream rate limited and {RATE_WAIT_BUDGET}s of waiting is "
-                  f"spent; handing it back", flush=True)
+            print(f"upstream rate limited and the turn's {turn.budget}s budget "
+                  f"is spent; handing it back", flush=True)
             break
         if err and not emitted and any(t in err for t in _OUTAGE):
             # 93 turns died this way in twenty minutes on 2026-09-23: the
@@ -2642,17 +3087,17 @@ def _run_swe(body, out):
             # a second, and it was handed straight to the agent as a 502. The
             # outage cleared by itself; a turn that had waited would have lived.
             outages += 1
-            wait = min(15 * 2 ** (outages - 1), 120, RATE_WAIT_BUDGET - waited)
+            wait = min(15 * 2 ** (outages - 1), 120, turn.left())
             if wait > 0:
                 print(f"upstream unavailable (provider outage), holding the "
-                      f"turn for {wait:.0f}s ({waited:.0f}s waited so far)",
+                      f"turn for {wait:.0f}s "
+                      f"({turn.spent():.0f}s waited so far)",
                       flush=True)
                 _request_phase("waiting_outage")
-                time.sleep(wait)
-                waited += wait
+                turn.sleep(wait)
                 continue
-            print(f"upstream unavailable and {RATE_WAIT_BUDGET}s of waiting is "
-                  f"spent; handing it back", flush=True)
+            print(f"upstream unavailable and the turn's {turn.budget}s budget "
+                  f"is spent; handing it back", flush=True)
             break
         if err and not emitted and attempt < 2 and "permission_denied" in err:
             nxt = TOOL_DESC_CAPS[attempt + 1]
@@ -2895,25 +3340,22 @@ def responses_to_messages(body):
     return out, custom
 
 
-class ResponsesStream:
+class ResponsesStream(_KeepAlive):
     """Emits the Codex flavour of the Responses SSE stream onto a raw socket.
 
-    No keepalive here yet, deliberately rather than by omission: the Responses
-    dialect has no `ping` event, and inventing one for a parser whose
-    tolerances are unknown risks more than the silence does. The Codex route
-    therefore keeps the exposure the Messages route just lost, and the two
-    no-ops below exist so run_swe can drive either without asking which.
+    The keepalive invents nothing: the Responses dialect has no `ping`, so the
+    stream is opened with the response.created / response.in_progress pair it
+    starts with anyway, and a silence is filled by sending response.in_progress
+    again — the same response object, the next sequence_number. Codex resets
+    its idle timer on any event and has no use for this one beyond that.
+    Without it, Codex dropped a stream silent for five minutes (a long think,
+    a held rate limit, a summary) and sent the request again, so one turn ran
+    twice.
 
     Event order and field names are taken from a recorded upstream stream rather
     than from the public API docs: this dialect carries output_index,
     sequence_number and item_id on every event, and Codex reads them.
     """
-
-    def arm(self):
-        pass
-
-    def release(self):
-        pass
 
     def __init__(self, wfile, model, custom_names=()):
         self.w = wfile
@@ -2933,43 +3375,59 @@ class ResponsesStream:
         self.text_buf = []
         self.started = False
         self.tools = {}
+        # One response, one creation time, however often it is restated.
+        self.created_at = int(time.time())
+        self._keep_alive_init()
+
+    def _keepalive(self):
+        self._send("response.in_progress",
+                   {"type": "response.in_progress",
+                    "response": self._response("in_progress")})
 
     def _send(self, event, data):
-        data["sequence_number"] = self.seq
-        self.seq += 1
-        self.w.write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
-        self.w.flush()
+        # The number and the write under one lock, or the keepalive thread
+        # could put two events on the wire out of sequence.
+        with self._wlock:
+            data["sequence_number"] = self.seq
+            self.seq += 1
+            self._write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
 
     def _response(self, status, usage=None):
         out = {"id": self.response_id, "object": "response",
-               "created_at": int(time.time()), "status": status,
+               "created_at": self.created_at, "status": status,
                "model": self.model, "output": [], "error": None,
                "instructions": None, "incomplete_details": None,
                "parallel_tool_calls": False, "tool_choice": "auto",
                "tools": [], "metadata": {}}
         if usage is not None:
+            # OpenAI counts cached input inside input_tokens; Anthropic, and
+            # Cognition, count it beside. Passed through as it was, Codex saw a
+            # 121k-token context as 3k — its context gauge and auto-compaction
+            # off by forty times — and cached_tokens larger than the input.
+            cached = usage.get("cache_read_input_tokens", 0)
+            prompt = (usage.get("input_tokens", 0) + cached
+                      + usage.get("cache_creation_input_tokens", 0))
             out["usage"] = {
-                "input_tokens": usage.get("input_tokens", 0),
-                "input_tokens_details": {"cached_tokens": usage.get(
-                    "cache_read_input_tokens", 0)},
+                "input_tokens": prompt,
+                "input_tokens_details": {"cached_tokens": cached},
                 "output_tokens": usage.get("output_tokens", 0),
                 "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": usage.get("input_tokens", 0)
-                + usage.get("output_tokens", 0)}
+                "total_tokens": prompt + usage.get("output_tokens", 0)}
         return out
 
     def start(self, usage=None):
-        if self.started:
-            return
-        self.started = True
-        self.w.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
-                     b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
-        self.w.flush()
-        self._send("response.created", {"type": "response.created",
-                                        "response": self._response("in_progress")})
-        self._send("response.in_progress",
-                   {"type": "response.in_progress",
-                    "response": self._response("in_progress")})
+        with self._wlock:
+            if self.started:
+                return
+            self.started = True
+            self._write(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                        b"cache-control: no-cache\r\nconnection: close\r\n\r\n")
+            self._send("response.created",
+                       {"type": "response.created",
+                        "response": self._response("in_progress")})
+            self._send("response.in_progress",
+                       {"type": "response.in_progress",
+                        "response": self._response("in_progress")})
 
     def thinking(self, text):
         """Dropped on purpose: Codex only replays reasoning it can hand back as
@@ -3067,6 +3525,7 @@ class ResponsesStream:
         self.tools = {}
 
     def finish(self, stop_reason, usage):
+        self.release()
         self.flush_tools()
         self._close_text()
         if stop_reason == "max_tokens":
@@ -3087,6 +3546,7 @@ class ResponsesStream:
     def stop(self):
         """No response.completed: a turn that failed must not be handed back as
         a finished one, or Codex stores the truncated answer and moves on."""
+        self.release()
         self._send("response.incomplete", {
             "type": "response.incomplete",
             "response": self._response("incomplete")})
@@ -3118,6 +3578,20 @@ _RETRY = Retry(total=3, connect=3, read=3, status=0, redirect=0,
 for _scheme in ("http://", "https://"):
     SESSION.mount(_scheme, requests.adapters.HTTPAdapter(
         pool_connections=8, pool_maxsize=32, max_retries=_RETRY))
+
+
+# What Codex's own catalog request carries, and nothing else: the ChatGPT
+# login, the workspace it belongs to, and how the client names itself.
+_CODEX_CATALOG_HEADERS = {"authorization", "chatgpt-account-id", "originator",
+                          "user-agent", "version", "accept",
+                          "openai-organization", "openai-project"}
+_CODEX_CATALOG_PREFIXES = ("x-openai-", "x-codex-", "openai-")
+
+
+def _codex_catalog_header(name):
+    name = name.lower()
+    return (name in _CODEX_CATALOG_HEADERS
+            or name.startswith(_CODEX_CATALOG_PREFIXES))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3225,24 +3699,36 @@ class Handler(BaseHTTPRequestHandler):
         """
         rows = [self.catalog_row(mid, name, i)
                 for i, (mid, name) in enumerate(SWE_MODELS)]
-        auth = self.headers.get("authorization")
-        if not auth:
+        query = urlsplit(self.path).query
+        # Only a request that is identifiably Codex goes to chatgpt.com. Claude
+        # Code's gateway discovery asks this same path (/v1/models?limit=1000)
+        # with its own Anthropic credential, and forwarding every header of
+        # every caller sent that credential to OpenAI. Codex always names its
+        # version in the query and never speaks the anthropic-* dialect.
+        names = {name.lower() for name in self.headers.keys()}
+        if (not self.headers.get("authorization")
+                or "client_version" not in parse_qs(query)
+                or "x-api-key" in names
+                or any(n.startswith("anthropic-") for n in names)):
             return rows
         try:
             headers = {name: value for name, value in self.headers.items()
-                       if name.lower() not in REQUEST_EXCLUDED}
+                       if _codex_catalog_header(name)}
             # Forward the query verbatim: Codex asks for
             # /v1/models?client_version=…, and the upstream answers differently
             # — or not at all — without it.
-            query = urlsplit(self.path).query
             r = SESSION.get(CODEX_UPSTREAM + "/models"
                             + (f"?{query}" if query else ""),
                             headers=headers, timeout=(10, 20))
-            upstream = r.json().get("models") if r.status_code == 200 else None
-        except (requests.RequestException, ValueError):
-            upstream = None
+            status = r.status_code
+            upstream = r.json().get("models") if status == 200 else None
+        except (requests.RequestException, ValueError) as e:
+            status, upstream = type(e).__name__, None
         if not isinstance(upstream, list):
-            print("codex catalog: upstream unavailable, serving swe-2 only",
+            # The status is the only clue when the forwarded headers turn out
+            # to be missing one the upstream wants.
+            print(f"codex catalog: upstream unavailable ({status}), serving "
+                  f"swe-2 only",
                   flush=True)
             return rows
         for entry in upstream:
@@ -3496,9 +3982,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(503, "overloaded_error",
                                  "Local request capacity reached; retry later", 1)
             return
+        # The socket, for run_swe to tell whether anyone is still waiting on
+        # a turn it is holding.
+        _request_local.conn = getattr(self, "connection", None)
         try:
             self._do_POST()
         finally:
+            _request_local.conn = None
             _leave_request()
 
     def _do_POST(self):
@@ -3566,6 +4056,10 @@ class Handler(BaseHTTPRequestHandler):
             if path.endswith("count_tokens"):
                 self.send_json(200, {"input_tokens": estimate_tokens(body)})
                 return
+            if not _enter_swe():
+                self.send_error_json(503, "overloaded_error",
+                                     "Local SWE-2 capacity reached; retry later", 1)
+                return
             if path == "/v1/responses":
                 self.serve_swe_responses(body)
                 return
@@ -3614,13 +4108,17 @@ class Handler(BaseHTTPRequestHandler):
                 result = {}
                 _, err = run_swe(body, self.wfile, outcome=result)
                 outcome = result.get("status", "200")
-                if err:
+                if err == CLIENT_GONE:
+                    outcome = "client_disconnected"
+                elif err:
                     kind, status, message, wait = anthropic_error(err, body)
                     outcome = str(status)
                     self.send_error_json(status, kind, message, wait)
             else:
                 resp, err = run_swe(body, None)
-                if err:
+                if err == CLIENT_GONE:
+                    outcome = "client_disconnected"
+                elif err:
                     kind, status, message, wait = anthropic_error(err, body)
                     outcome = str(status)
                     self.send_error_json(status, kind, message, wait)
@@ -3657,7 +4155,9 @@ class Handler(BaseHTTPRequestHandler):
                             lambda w, m: ResponsesStream(w, m, custom),
                             outcome=result)
             outcome = result.get("status", "200")
-            if err:
+            if err == CLIENT_GONE:
+                outcome = "client_disconnected"
+            elif err:
                 kind, status, message, wait = anthropic_error(err, translated)
                 outcome = str(status)
                 self.send_error_json(status, kind, message, wait)
@@ -3770,8 +4270,10 @@ def _content_chars(obj):
     if isinstance(obj, str):
         return len(obj)
     if isinstance(obj, dict):
+        # A text document's words sit under `data` too, and they are sent.
         return sum(_content_chars(v) for k, v in obj.items()
-                   if k not in _UNCOUNTED_KEYS)
+                   if k not in _UNCOUNTED_KEYS
+                   or (k == "data" and obj.get("type") == "text"))
     if isinstance(obj, (list, tuple)):
         return sum(_content_chars(v) for v in obj)
     return 0
@@ -3791,17 +4293,51 @@ def _image_tokens_in(obj):
     return total
 
 
-def estimate_tokens(body):
+def _weigh(obj, memo, measure):
+    """measure(obj), remembered in `memo` for as long as the memo lives.
+
+    Keyed by id() and holding the object itself, so an id cannot be reused by
+    a newer object while its entry is still there.
+    """
+    if memo is None:
+        return measure(obj)
+    hit = memo.get(id(obj))
+    if hit is not None and hit[0] is obj:
+        return hit[1]
+    value = measure(obj)
+    memo[id(obj)] = (obj, value)
+    return value
+
+
+def _message_weight(m):
+    chars = tokens = 0
+    for b in _blocks(m.get("content")):
+        chars += _content_chars(b)
+        tokens += _image_tokens_in(b)
+    return chars, tokens
+
+
+def _tools_chars(tools):
+    return sum(len(t.get("description", "")) + len(json.dumps(t.get("input_schema") or {}))
+               for t in tools)
+
+
+def estimate_tokens(body, memo=None):
     """Rough local estimate. Cognition exposes no counting endpoint; this is
-    what count_tokens answers and what compaction decides on."""
+    what count_tokens answers and what compaction decides on.
+
+    `memo` is for a caller that estimates many bodies sharing the same message
+    objects — one compaction weighs the same few hundred kilobytes a dozen
+    times over. The figure is the same with or without it.
+    """
     chars, tokens = len(_system_text(body)), 0
     for m in body.get("messages", []):
-        for b in _blocks(m.get("content")):
-            chars += _content_chars(b)
-            tokens += _image_tokens_in(b)
-    for t in body.get("tools") or []:
-        chars += len(t.get("description", "")) + \
-            len(json.dumps(t.get("input_schema") or {}))
+        c, t = _weigh(m, memo, _message_weight)
+        chars += c
+        tokens += t
+    tools = body.get("tools") or []
+    if tools:
+        chars += _weigh(tools, memo, _tools_chars)
     return max(1, chars // 4 + tokens)
 
 
