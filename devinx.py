@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import random
 import re
@@ -689,30 +690,52 @@ def reset_key():
 _turn = {"n": 0}
 
 
-# How long a refusal keeps steering turns away from the account that refused,
-# and how many attempts one refusal weighs against. An account that is being
-# refused is near a ceiling; every turn sent to it anyway is likely one more
-# refusal, and a refusal is a request spent for nothing.
-REFUSAL_MEMORY = 900
-REFUSAL_WEIGHT = 20
+# How long a success keeps counting toward an account's measured success rate.
+# A refusal's memory is not a setting at all: it is the reset the upstream
+# announced in that refusal, so "reset in 20 seconds" is forgotten in about a
+# minute and "reset in 30 minutes" weighs for about half an hour.
+SUCCESS_MEMORY = float(os.environ.get("DEVINX_SUCCESS_MEMORY", "900"))
 
 
-def _load(acct, now):
-    """Attempts in the last hour, plus a heavy weight per recent refusal."""
+def _success_rate(acct, now):
+    """The share of this account's recent attempts that were served.
+
+    Counted with exponential forgetting: each attempt weighs exp(-age / τ),
+    τ being SUCCESS_MEMORY for attempts and the announced reset for refusals.
+    Laplace-smoothed, so an account with no history — a new login — starts
+    at a neutral 1/2-to-1 and earns its share from what it actually serves
+    rather than from a guess.
+    """
     att = acct.setdefault("attempts", collections.deque())
     refs = acct.setdefault("refusals", collections.deque())
-    while att and att[0] < now - 3600:
+    while att and now - att[0] > 6 * SUCCESS_MEMORY:
         att.popleft()
-    while refs and refs[0] < now - REFUSAL_MEMORY:
+    while refs and now - refs[0][0] > 6 * refs[0][1]:
         refs.popleft()
-    return len(att) + REFUSAL_WEIGHT * len(refs)
+    a = sum(math.exp(-(now - t) / SUCCESS_MEMORY) for t in att)
+    r = sum(math.exp(-(now - t) / tau) for t, tau in refs)
+    rate = (max(a - r, 0.0) + 1.0) / (a + 2.0)
+    # Never exactly zero: a refusing account keeps a sliver of traffic, which
+    # is how the fleet notices that its limit has freed up again.
+    return max(rate, 0.02)
+
+
+def shares(now=None):
+    """Each usable account's share of new turns, as the picker sees it now."""
+    now = now or time.time()
+    with _acct_lock:
+        live = [a for a in _accounts
+                if not a.get("excluded") and a["blocked_until"] <= now]
+        w = {a["name"]: _success_rate(a, now) for a in live}
+    total = sum(w.values()) or 1.0
+    return {k: v / total for k, v in w.items()}
 
 
 def claim_account(avoid=None):
     """A credential that is not rate limited, and when the earliest one frees up
     if none is.
 
-    Least loaded rather than first-fit. The limits are per credential, so always
+    Proportional rather than first-fit. The limits are per credential, so always
     starting at the same one keeps that one permanently at its ceiling while the
     others idle — the short limit would still be hit on every burst, merely
     followed by a switch. Spreading the turns divides the rate each account sees,
@@ -722,9 +745,14 @@ def claim_account(avoid=None):
     account being refused kept its full share, and each of those turns was
     likely one more refusal. Measured over 24 hours on 2026-09-23, the work
     served was even (12 089 against 12 295) while the refusals were not (901
-    against 2 712). The pick now weighs each account's attempts in the last hour
-    and, far more heavily, its refusals in the last fifteen minutes, so turns
-    drift toward the credential with headroom and back once the refusals age.
+    against 2 712).
+
+    Each account now gets a share of new turns proportional to its measured
+    success rate. Two accounts that serve everything split evenly; one refused
+    one time in ten gets somewhat less; one refused most of the time keeps a
+    sliver, enough to notice it has recovered. Nothing is winner-take-all, and
+    the weights are measurements, not settings. As traffic moves off a refusing
+    account its refusals thin out, its rate climbs back and so does its share.
     """
     _maybe_rescan()
     now = time.time()
@@ -736,12 +764,17 @@ def claim_account(avoid=None):
         usable = [a for a in live
                   if a["blocked_until"] <= now and a is not avoid]
         if usable:
-            _turn["n"] += 1
-            # Rotate the starting point so equal loads still alternate, then
-            # take the least loaded: min() keeps the first of equal values.
-            k = _turn["n"] % len(usable)
-            order = usable[k:] + usable[:k]
-            pick = min(order, key=lambda a: _load(a, now))
+            # Smooth weighted round robin: every account accumulates its weight
+            # on each pick and the highest total is chosen and paid down by the
+            # sum. Over any run of picks each account gets exactly its share,
+            # interleaved rather than in streaks, with no randomness to make a
+            # small fleet lurch.
+            weights = {id(a): _success_rate(a, now) for a in usable}
+            total = sum(weights.values())
+            for a in usable:
+                a["credit"] = a.get("credit", 0.0) + weights[id(a)]
+            pick = max(usable, key=lambda a: a["credit"])
+            pick["credit"] -= total
             pick.setdefault("attempts", collections.deque()).append(now)
             return pick, 0.0
         soonest = min((a["blocked_until"] for a in live
@@ -752,7 +785,10 @@ def claim_account(avoid=None):
 def block_account(acct, seconds):
     with _acct_lock:
         acct["blocked_until"] = time.time() + seconds
-        acct.setdefault("refusals", collections.deque()).append(time.time())
+        # The refusal is remembered for as long as the upstream said the
+        # limit would last, within a minute and half an hour.
+        acct.setdefault("refusals", collections.deque()).append(
+            (time.time(), min(max(float(seconds), 60.0), 1800.0)))
         acct["refused_at"] = time.time()
 
 
@@ -3296,6 +3332,7 @@ class Handler(BaseHTTPRequestHandler):
             payload["cached_age"] = round(time.time() - slot["at"], 1)
         with _inflight_lock:
             busy = _inflight["n"]
+        live_shares = shares()
         payload["service"] = {"build": BUILD, "pid": os.getpid(), "port": PORT,
                               "inflight": busy, "started": _STARTED,
                               "uptime": round(time.time() - _STARTED),
@@ -3304,6 +3341,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "excluded": a.get("excluded"),
                                    "tier": a.get("tier"),
                                    "pro": a.get("pro"),
+                                   "share": round(live_shares.get(a["name"], 0.0), 3),
                                    # The live answer to "is the upstream
                                    # refusing work", which the log can only
                                    # reconstruct after the fact.

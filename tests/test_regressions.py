@@ -10,6 +10,7 @@ only a temp file.
     .venv/bin/python tests/test_regressions.py
 """
 
+import collections
 import contextlib
 import copy
 import io
@@ -1160,7 +1161,7 @@ FreePlanExclusionTests.real_rescan = staticmethod(devinx._maybe_rescan)
 
 
 class BalancingTests(unittest.TestCase):
-    """Turns go where there is headroom, and still spread when loads are equal."""
+    """Turns are shared in proportion to what each account actually serves."""
 
     def setUp(self):
         self.a = {"name": "a", "key": "ka", "blocked_until": 0.0}
@@ -1170,22 +1171,60 @@ class BalancingTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_equal_loads_alternate(self):
-        picks = [devinx.claim_account()[0]["name"] for _ in range(10)]
-        self.assertEqual(picks.count("a"), 5)
-        self.assertEqual(picks.count("b"), 5)
+    def _picks(self, n=100):
+        return [devinx.claim_account()[0]["name"] for _ in range(n)]
 
-    def test_an_account_being_refused_is_avoided(self):
-        devinx.block_account(self.a, 0)       # refused, block already over
-        picks = [devinx.claim_account()[0]["name"] for _ in range(10)]
-        self.assertGreaterEqual(picks.count("b"), 9,
-                                f"the refusing account kept its share: {picks}")
+    def _history(self, acct, attempts, refusals, reset=600):
+        now = time.time()
+        acct["attempts"] = collections.deque(now - i for i in range(attempts))
+        acct["refusals"] = collections.deque((now - i, reset) for i in range(refusals))
 
-    def test_the_refusal_ages_out(self):
-        devinx.block_account(self.a, 0)
-        self.a["refusals"][0] -= devinx.REFUSAL_MEMORY + 1
-        picks = [devinx.claim_account()[0]["name"] for _ in range(10)]
-        self.assertEqual(picks.count("a"), 5)
+    def test_two_healthy_accounts_split_evenly_without_streaks(self):
+        picks = self._picks(100)
+        self.assertEqual(picks.count("a"), 50)
+        streak = max(len(list(g)) for _, g in __import__("itertools").groupby(picks))
+        self.assertLessEqual(streak, 2, "turns came in streaks, not interleaved")
+
+    # The shares below are read at an instant. Simulating hundreds of picks
+    # without recording the refusals they would draw would let the refusing
+    # account "recover" inside the test — which is exactly what it should do
+    # in production once its refusals stop.
+
+    def test_some_refusals_mean_somewhat_less_not_nothing(self):
+        self._history(self.a, 100, 10)       # a refused one time in ten
+        self._history(self.b, 100, 0)
+        share = devinx.shares()["a"]
+        self.assertGreater(share, 0.40, "one refusal in ten starved the account")
+        self.assertLess(share, 0.50, "the refusing account was not eased off")
+
+    def test_mostly_refused_keeps_a_sliver(self):
+        self._history(self.a, 100, 95)
+        self._history(self.b, 100, 0)
+        share = devinx.shares()["a"]
+        self.assertGreater(share, 0.0, "a refusing account got nothing — it can never recover")
+        self.assertLess(share, 0.15)
+
+    def test_the_picker_follows_the_shares(self):
+        self._history(self.a, 100, 50)        # a serves about half
+        self._history(self.b, 100, 0)
+        expected = devinx.shares()["a"]
+        got = self._picks(30).count("a") / 30
+        self.assertAlmostEqual(got, expected, delta=0.1)
+
+    def test_a_short_announced_reset_is_forgotten_quickly(self):
+        now = time.time()
+        self._history(self.a, 100, 0)
+        self._history(self.b, 100, 0)
+        self.a["refusals"] = collections.deque((now - 300, 60) for _ in range(20))
+        self.b["refusals"] = collections.deque((now - 300, 1800) for _ in range(20))
+        sh = devinx.shares(now)
+        self.assertGreater(sh["a"], sh["b"],
+                           "a 60s reset weighed as long as a 30 min one")
+
+    def test_a_new_account_starts_with_a_fair_share(self):
+        self._history(self.a, 200, 0)
+        share = self._picks(100).count("b") / 100   # b has no history at all
+        self.assertGreater(share, 0.3)
 
 
 class MessageIdTests(unittest.TestCase):

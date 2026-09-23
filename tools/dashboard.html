@@ -260,7 +260,7 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 <div class="grid g3">
   <div class="card">
     <h3>Par credential</h3>
-    <div class="tw"><table><thead><tr><th>compte</th><th>plan</th><th class="n">tours</th>
+    <div class="tw"><table><thead><tr><th>compte</th><th>plan</th><th class="n">part</th><th class="n">tours</th>
       <th class="n">refus de quota</th><th class="n">taux</th></tr></thead>
       <tbody id="byacct"></tbody></table></div>
   </div>
@@ -529,7 +529,11 @@ function render(d){
         : live.pro === true ? `<span class="pill ok">Pro</span>`
         : live.pro === false ? `<span class="pill crit">Free</span>`
         : `<span style="color:var(--ink-3)" title="lu au prochain jeton">?</span>`;
-      return `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td>${plan}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
+      // La part que le répartiteur donne à ce compte maintenant, d'après son
+      // taux de réussite mesuré. Vide pour un compte bloqué ou exclu.
+      const share = live && typeof live.share === "number" && live.share > 0
+        ? pct(live.share) : "—";
+      return `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td>${plan}</td><td class="n">${share}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
         <td class="n"><span class="pill ${cls}">${pct(r)}</span></td></tr>`; }).join("");
 
   // débit — la seule question qu'un quota compté en requêtes pose vraiment
