@@ -267,7 +267,7 @@ class PathsepSplitTests(unittest.TestCase):
     """H9: split on os.pathsep, not a literal ':' (which breaks 'C:\\...')."""
 
     def test_source_uses_os_pathsep_not_a_literal_colon(self):
-        source = __import__("inspect").getsource(ownership_guard.main)
+        source = __import__("inspect").getsource(ownership_guard._run)
         self.assertIn("os.pathsep", source)
         self.assertNotIn('split(":")', source)
 
@@ -300,6 +300,32 @@ class FailOpenOnUnexpectedJsonTests(unittest.TestCase):
         event = json.dumps({"tool_name": "Edit", "cwd": "/repo", "tool_input": "oops"})
         r = self._run(OWNERSHIP_GUARD, event)
         self.assertEqual(r.returncode, 0)
+
+    def test_ownership_guard_survives_a_nul_byte_in_the_path(self):
+        # os.path.realpath() raises ValueError on an embedded NUL.
+        event = json.dumps({"tool_name": "Edit", "cwd": "/repo",
+                            "tool_input": {"file_path": "/repo/a\x00b.py"}})
+        env = dict(os.environ, DEVINX_OWNED_PATHS="/repo")
+        r = subprocess.run([sys.executable, OWNERSHIP_GUARD], input=event,
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stderr, "")
+
+    def test_edit_loop_guard_survives_an_unwritable_state_directory(self):
+        # DEVINX_DATA pointing at a plain file: _state_dir()'s makedirs()
+        # fails, and the next os.open() for the lock file must not raise.
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "blocks-the-hooks-subdir")
+            with open(blocker, "w") as fh:
+                fh.write("not a directory")
+            event = json.dumps({"session_id": "s", "tool_name": "Edit",
+                                "tool_input": {"file_path": "/a/b.py",
+                                              "old_string": "X", "new_string": "Y"}})
+            env = dict(os.environ, DEVINX_DATA=blocker)
+            r = subprocess.run([sys.executable, EDIT_GUARD], input=event,
+                               capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stderr, "")
 
 
 if __name__ == "__main__":

@@ -167,9 +167,14 @@ def _load(path):
     try:
         with os.fdopen(fd, encoding="utf-8") as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    # Every entry must itself be a dict for entry.get(...) below to be safe -
+    # a hand-edited or corrupted file with some other shape must not crash
+    # the hook on the very next read.
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
 
 
 def _save(path, data):
@@ -252,6 +257,24 @@ _SESSION_CLEARING_SOURCES = frozenset({"startup", "resume", "clear"})
 
 
 def main():
+    """Fail open on literally anything unexpected, not just malformed JSON.
+
+    _run() below assumes a writable state directory, a well-formed lock file
+    and paths safe to realpath - an unwritable HOME, DEVINX_DATA pointing at
+    a plain file, or a target containing an embedded NUL each raise
+    something _run() does not itself catch. None of those are the model's
+    fault, so none of them may become a traceback in front of it, or - worse
+    - an uncaught exception's exit code (1), the one caller-visible value
+    that already means something else (in ownership_guard.py) or nothing
+    reliable at all here.
+    """
+    try:
+        return _run()
+    except Exception:
+        return 0
+
+
+def _run():
     try:
         event = json.load(sys.stdin)
     except (ValueError, OSError):

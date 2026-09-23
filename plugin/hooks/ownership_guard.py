@@ -97,6 +97,18 @@ def owned(path, patterns, root):
 
 
 def main():
+    """Fail open on literally anything unexpected, not just malformed JSON:
+    os.path.realpath() can raise ValueError on a path with an embedded NUL,
+    for one. None of that is the model's fault, so none of it may become a
+    traceback (or an uncaught exception's exit code, which is not exit 2 and
+    would not put a useful message in front of it either)."""
+    try:
+        return _run()
+    except Exception:
+        return 0
+
+
+def _run():
     # os.pathsep, not a literal ':': on Windows that splits "C:\..." in half.
     patterns = [p for p in os.environ.get("DEVINX_OWNED_PATHS", "").split(os.pathsep) if p]
     if not patterns:
