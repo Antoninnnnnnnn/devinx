@@ -12,14 +12,20 @@ devinx --doctor --json
 devinx --explain --cx --or
 ```
 
-These flags are recognised only in the first launcher argument. A plain
-`devinx`, client subcommands and arguments after `--` keep their existing
-meaning. Diagnostics never start a service, read credentials or make an
-inference call. They query the local `/api/hello` endpoint and return 0 for a
-running devinx service, 1 otherwise. `--doctor` adds dependency/client presence
-and descriptor counts; this is a local check, **not** proof that an upstream
-account is working. `--explain` shows the selected client and injected agents,
-not the user's prompt. `--json` is useful for support reports.
+These flags are recognised in the first launcher argument, and also after
+devinx's own flags (`devinx --d --status`) as long as they come before `--`
+and before any client subcommand or prompt — an ambiguous position (anything
+that is not one of devinx's own flags precedes it) is left to the client
+instead. A plain `devinx`, client subcommands and arguments after `--` keep
+their existing meaning. Diagnostics never start a service, read credentials or
+make an inference call. `--status` and `--doctor` query the local `/api/hello`
+endpoint and return 0 for a running devinx service, 1 otherwise. `--doctor`
+adds dependency/client presence and descriptor counts; this is a local check,
+**not** proof that an upstream account is working. `--explain` shows the
+selected client and injected agents, not the user's prompt, and returns 0 once
+it has answered that question — whether or not a service happens to be
+running is not a failure of the explanation. `--json` is useful for support
+reports.
 
 The service reports an explicit allowlist of numeric/boolean runtime settings.
 Diagnostics compare explicitly requested environment settings with the daemon's
