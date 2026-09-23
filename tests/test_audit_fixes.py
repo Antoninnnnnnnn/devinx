@@ -853,5 +853,59 @@ class SharedKeySummaryTests(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class CompactionCostTests(unittest.TestCase):
+    """Estimates are memoized per compaction; the summary skips the agent prompt."""
+
+    BODY = {'model': 'swe-2-max', 'system': [{'type': 'text', 'text': 'S' * 900}],
+            'tools': [{'name': 'Read', 'description': 'd' * 300,
+                       'input_schema': {'type': 'object'}}],
+            'messages': [
+                {'role': 'user', 'content': 'task ' * 50},
+                {'role': 'assistant', 'content': [
+                    {'type': 'thinking', 'thinking': 't' * 777, 'signature': 'zz' * 99},
+                    {'type': 'tool_use', 'id': 'a', 'name': 'Read', 'input': {'p': 'q' * 55}}]},
+                {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'a',
+                                              'content': [{'type': 'text', 'text': 'r' * 1234},
+                                                          {'type': 'image', 'source': {
+                                                              'type': 'base64', 'data': 'A' * 300001}}]}]},
+                {'role': 'user', 'content': [{'type': 'document', 'source': {
+                    'type': 'text', 'data': 'D' * 4321}}, 'bare string']}]}
+
+    def test_the_memoized_estimate_is_the_same_figure(self):
+        plain = devinx.estimate_tokens(self.BODY)
+        memo = {}
+        self.assertEqual(devinx.estimate_tokens(self.BODY, memo), plain)
+        self.assertEqual(devinx.estimate_tokens(self.BODY, memo), plain)
+        trial = dict(self.BODY, messages=self.BODY['messages'][:2] + [
+            {'role': 'user', 'content': 'new ' * 30}])
+        self.assertEqual(devinx.estimate_tokens(trial, memo), devinx.estimate_tokens(trial))
+
+    def test_each_message_is_weighed_once_per_compaction(self):
+        messages = [{'role': 'user', 'content': 'task'}] + [
+            {'role': 'assistant' if i % 2 else 'user', 'content': f'{i} ' + 'y' * 400}
+            for i in range(20)]
+        body = {'model': 'swe-2-max', 'messages': messages,
+                'metadata': {'user_id': 'memo'}}
+        real, seen = devinx._message_weight, []
+
+        def counting(m):
+            seen.append(id(m))
+            return real(m)
+        with mock.patch.object(devinx, '_message_weight', counting), \
+             mock.patch.object(devinx, '_summaries', {}), \
+             mock.patch.object(devinx, 'COMPACT_AT', 1500), \
+             mock.patch.object(devinx, 'summarise_turns', return_value='S'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            devinx.compact_body(body)
+        for m in messages:
+            self.assertLessEqual(seen.count(id(m)), 1)
+
+    def test_the_summary_request_leaves_the_agent_prompt_out(self):
+        body = devinx._summary_body([{'role': 'user', 'content': 'x'}], 'swe-2-max',
+                                    'SECRET-AGENT-PROMPT', None)
+        self.assertNotIn('SECRET-AGENT-PROMPT', json.dumps(body))
+        self.assertIn('<conversation>', json.dumps(body))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -1690,6 +1690,10 @@ def _render_turns(messages):
 
 
 def _summary_body(messages, model, system, previous):
+    """The summariser's request. `system` is accepted and deliberately unused:
+    the agent's own system prompt (its first 2000 characters used to ride
+    along) says nothing about the turns being summarised, and it was paid for
+    on every summary call."""
     return {
         "model": model,
         # Room for the model to think *and* answer. At 4096 it was spending the
@@ -1702,7 +1706,6 @@ def _summary_body(messages, model, system, previous):
             (f"<earlier_summary>\n{previous}\n</earlier_summary>\n\n"
              if previous else "")
             + f"<conversation>\n{_render_turns(messages)}\n</conversation>\n\n"
-            f"The agent's own instructions began: {system[:2000]}\n\n"
             + (COMPACT_PROMPT_MORE if previous else COMPACT_PROMPT)}]}],
     }
 
@@ -2079,17 +2082,20 @@ def _tail_start(messages, budget):
 
 def compact_body(body):
     messages = body.get("messages") or []
-    if estimate_tokens(body) <= COMPACT_AT:
+    # One memo for the whole compaction: every estimate below reweighs the
+    # same message objects.
+    memo = {}
+    if estimate_tokens(body, memo) <= COMPACT_AT:
         return body
     if len(messages) < 4:
         if COMPACT_STRICT:
             raise CompactionUnavailable("context exceeds the budget with no safely droppable turns")
         return body
     with _summary_guard(_conv_key(body)):
-        return _compact_body(body)
+        return _compact_body(body, memo)
 
 
-def _compact_body(body):
+def _compact_body(body, memo=None):
     """Replace the middle of an over-long conversation with a summary.
 
     The first turn stays: it is the task. The recent turns stay verbatim: they
@@ -2097,7 +2103,7 @@ def _compact_body(body):
     summary, written with Claude Code's own compaction prompt.
     """
     messages = body.get("messages") or []
-    if len(messages) < 4 or estimate_tokens(body) <= COMPACT_AT:
+    if len(messages) < 4 or estimate_tokens(body, memo) <= COMPACT_AT:
         return body
     start = _tail_start(messages, int(COMPACT_AT * COMPACT_TAIL))
     if start <= 1 or start >= len(messages):
@@ -2161,12 +2167,12 @@ def _compact_body(body):
             {"type": "text", "text": (text or "") + retained}]}]
         trial = dict(body)
         trial["messages"] = head + _regroup(uncovered) + messages[start:]
-        return estimate_tokens(trial) <= COMPACT_AT, trial
+        return estimate_tokens(trial, memo) <= COMPACT_AT, trial
 
     room, _ = fits(summary, fresh)
     if summary is None or not room:
         model = resolve_model(body)
-        before = estimate_tokens(body)
+        before = estimate_tokens(body, memo)
         # Only what arrived since the last summary, extending it rather than
         # rebuilding it: the difference between a few seconds a turn and half a
         # minute a turn.
@@ -2246,9 +2252,9 @@ def _compact_body(body):
         return out
 
     compacted = assemble(carried)
-    if COMPACT_STRICT and estimate_tokens(compacted) > COMPACT_AT:
+    if COMPACT_STRICT and estimate_tokens(compacted, memo) > COMPACT_AT:
         raise CompactionUnavailable("preserved context still exceeds the compaction budget")
-    if carried and estimate_tokens(compacted) > COMPACT_AT:
+    if carried and estimate_tokens(compacted, memo) > COMPACT_AT:
         # The summary could not be extended far enough to make room. Whatever
         # it does not cover goes, because a body over the limit comes back
         # refused and that ends the agent.
@@ -2260,7 +2266,7 @@ def _compact_body(body):
     # is worth knowing from measurement rather than assumption.
     def anatomy(m):
         raw = len(json.dumps(m, default=str)) // 4
-        est = estimate_tokens({"messages": [m]})
+        est = estimate_tokens({"messages": [m]}, memo)
         parts = []
         for b in _blocks(m.get("content")):
             kind = b.get("type")
@@ -2271,7 +2277,7 @@ def _compact_body(body):
 
     worst = max(messages, key=lambda m: len(json.dumps(m, default=str)))
     raw, est, role, nblocks, parts = anatomy(worst)
-    print(f"compaction: {estimate_tokens(body)} -> {estimate_tokens(compacted)} "
+    print(f"compaction: {estimate_tokens(body, memo)} -> {estimate_tokens(compacted, memo)} "
           f"tokens; {len(messages)} msgs; biggest: role={role} blocks={nblocks} "
           f"raw={raw}t est={est}t :: {' | '.join(parts)}", flush=True)
     return compacted
@@ -4047,17 +4053,51 @@ def _image_tokens_in(obj):
     return total
 
 
-def estimate_tokens(body):
+def _weigh(obj, memo, measure):
+    """measure(obj), remembered in `memo` for as long as the memo lives.
+
+    Keyed by id() and holding the object itself, so an id cannot be reused by
+    a newer object while its entry is still there.
+    """
+    if memo is None:
+        return measure(obj)
+    hit = memo.get(id(obj))
+    if hit is not None and hit[0] is obj:
+        return hit[1]
+    value = measure(obj)
+    memo[id(obj)] = (obj, value)
+    return value
+
+
+def _message_weight(m):
+    chars = tokens = 0
+    for b in _blocks(m.get("content")):
+        chars += _content_chars(b)
+        tokens += _image_tokens_in(b)
+    return chars, tokens
+
+
+def _tools_chars(tools):
+    return sum(len(t.get("description", "")) + len(json.dumps(t.get("input_schema") or {}))
+               for t in tools)
+
+
+def estimate_tokens(body, memo=None):
     """Rough local estimate. Cognition exposes no counting endpoint; this is
-    what count_tokens answers and what compaction decides on."""
+    what count_tokens answers and what compaction decides on.
+
+    `memo` is for a caller that estimates many bodies sharing the same message
+    objects — one compaction weighs the same few hundred kilobytes a dozen
+    times over. The figure is the same with or without it.
+    """
     chars, tokens = len(_system_text(body)), 0
     for m in body.get("messages", []):
-        for b in _blocks(m.get("content")):
-            chars += _content_chars(b)
-            tokens += _image_tokens_in(b)
-    for t in body.get("tools") or []:
-        chars += len(t.get("description", "")) + \
-            len(json.dumps(t.get("input_schema") or {}))
+        c, t = _weigh(m, memo, _message_weight)
+        chars += c
+        tokens += t
+    tools = body.get("tools") or []
+    if tools:
+        chars += _weigh(tools, memo, _tools_chars)
     return max(1, chars // 4 + tokens)
 
 
