@@ -2927,14 +2927,19 @@ class ResponsesStream(_KeepAlive):
                "parallel_tool_calls": False, "tool_choice": "auto",
                "tools": [], "metadata": {}}
         if usage is not None:
+            # OpenAI counts cached input inside input_tokens; Anthropic, and
+            # Cognition, count it beside. Passed through as it was, Codex saw a
+            # 121k-token context as 3k — its context gauge and auto-compaction
+            # off by forty times — and cached_tokens larger than the input.
+            cached = usage.get("cache_read_input_tokens", 0)
+            prompt = (usage.get("input_tokens", 0) + cached
+                      + usage.get("cache_creation_input_tokens", 0))
             out["usage"] = {
-                "input_tokens": usage.get("input_tokens", 0),
-                "input_tokens_details": {"cached_tokens": usage.get(
-                    "cache_read_input_tokens", 0)},
+                "input_tokens": prompt,
+                "input_tokens_details": {"cached_tokens": cached},
                 "output_tokens": usage.get("output_tokens", 0),
                 "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": usage.get("input_tokens", 0)
-                + usage.get("output_tokens", 0)}
+                "total_tokens": prompt + usage.get("output_tokens", 0)}
         return out
 
     def start(self, usage=None):

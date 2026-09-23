@@ -257,6 +257,24 @@ def sse(raw):
             if line.startswith('data: ')]
 
 
+class ResponsesUsageTests(unittest.TestCase):
+    """P4: OpenAI's input_tokens include the cached part."""
+
+    def test_cached_tokens_are_inside_input_tokens(self):
+        buf = io.BytesIO()
+        out = devinx.ResponsesStream(buf, 'swe-2-max')
+        out.start()
+        out.finish('end_turn', {'input_tokens': 100, 'output_tokens': 5,
+                                'cache_read_input_tokens': 1000,
+                                'cache_creation_input_tokens': 10})
+        usage = sse(buf.getvalue())[-1]['response']['usage']
+        self.assertEqual(usage['input_tokens'], 1110)
+        self.assertEqual(usage['input_tokens_details']['cached_tokens'], 1000)
+        self.assertEqual(usage['total_tokens'], 1115)
+        self.assertLessEqual(usage['input_tokens_details']['cached_tokens'],
+                             usage['input_tokens'])
+
+
 class ResponsesKeepaliveTests(unittest.TestCase):
     """P5: the Codex route keeps a silent stream alive with its own events."""
 
