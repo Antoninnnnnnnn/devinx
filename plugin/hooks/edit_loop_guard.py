@@ -121,7 +121,8 @@ def _locked(path):
     instead of 3 with 40 agents hammering the same file.
     """
     lock_path = path + ".lock"
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
     fd = os.open(lock_path, flags, 0o600)
     try:
         if os.name == "nt":
