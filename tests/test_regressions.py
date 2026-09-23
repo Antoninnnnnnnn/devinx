@@ -1038,6 +1038,64 @@ class SummaryNeverAbandonedTests(unittest.TestCase):
                          "some turns were never summarised")
 
 
+class CredentialRescanTests(unittest.TestCase):
+    """A `devin auth login` done while the service runs is picked up by itself."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.dir, True)
+        for patcher in (
+            mock.patch.object(devinx, "_accounts", []),
+            mock.patch.object(devinx, "_scan", {"at": 0.0, "sig": None}),
+            mock.patch.object(devinx, "_credential_files", self._files),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _files(self):
+        import glob
+        return sorted(glob.glob(os.path.join(self.dir, "*", "devin", "credentials.toml")))
+
+    def _login(self, name, key):
+        d = os.path.join(self.dir, name, "devin")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "credentials.toml"), "w") as fh:
+            fh.write(f'windsurf_api_key = "{key}"\n')
+
+    def _rescan(self):
+        devinx._scan["at"] = 0.0          # skip the 30s interval
+        return [a["name"] for a in devinx.accounts()]
+
+    def test_a_new_login_joins_without_a_restart(self):
+        self._login("first", "k1")
+        self.assertEqual([a["name"] for a in devinx.accounts()], ["first"])
+        self._login("second", "k2")
+        self.assertEqual(self._rescan(), ["first", "second"])
+
+    def test_a_known_account_keeps_its_block(self):
+        self._login("first", "k1")
+        devinx.accounts()[0]["blocked_until"] = 9e18
+        self._login("second", "k2")
+        self._rescan()
+        first = [a for a in devinx.accounts() if a["name"] == "first"][0]
+        self.assertEqual(first["blocked_until"], 9e18,
+                         "a rescan unblocked a rate-limited credential")
+
+    def test_a_removed_login_leaves(self):
+        self._login("first", "k1")
+        self._login("second", "k2")
+        devinx.accounts()
+        os.remove(os.path.join(self.dir, "second", "devin", "credentials.toml"))
+        self.assertEqual(self._rescan(), ["first"])
+
+    def test_losing_every_file_keeps_the_accounts(self):
+        self._login("first", "k1")
+        devinx.accounts()
+        os.remove(os.path.join(self.dir, "first", "devin", "credentials.toml"))
+        self.assertEqual(self._rescan(), ["first"],
+                         "a failed read left the service with no account")
+
+
 class MessageIdTests(unittest.TestCase):
     """The constant that collapsed every run into three messages.
 

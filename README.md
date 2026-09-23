@@ -460,7 +460,7 @@ between switching on every burst and not being limited at all. On a rate limit
 the turn moves to another credential immediately, and only waits when every one
 of them is spent. `DEVINX_API_KEYS` takes a
 comma-separated list instead. Each request logs the account that served it, so
-which credential a limit belongs to is answerable from the log.
+which credential a limit belongs to is answerable from the log. A login done while the service is running is picked up without a restart, within 30 seconds (`DEVINX_RESCAN`); deleting a credential's file removes it the same way.
 
 `DEVINX_RATE_WAIT` bounds the total wait (600s by default) — the client has its
 own timeout, and an answer that never comes is worse than one that says to try

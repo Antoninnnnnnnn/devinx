@@ -523,16 +523,78 @@ _acct_lock = threading.Lock()
 _accounts = []
 
 
+# How often the credential files are looked at again. A `devin auth login`
+# done while the service runs is picked up within this many seconds, with no
+# restart: the service is meant to outlive the sessions that use it, and a new
+# account is exactly the kind of change that should not need one.
+RESCAN_EVERY = float(os.environ.get("DEVINX_RESCAN", "30"))
+_scan = {"at": 0.0, "sig": None}
+
+
+def _credential_signature():
+    out = []
+    for path in _credential_files():
+        try:
+            out.append((path, os.path.getmtime(path)))
+        except OSError:
+            pass
+    return tuple(out)
+
+
+def _maybe_rescan():
+    """Add the credentials that appeared, drop the ones whose file is gone.
+
+    Accounts already known keep their state — their JWT, and above all their
+    block: a credential that is rate limited stays rate limited across a rescan.
+    A rescan that finds nothing at all is treated as a failed read and changes
+    nothing, so a moment of filesystem trouble cannot leave the service with no
+    account.
+    """
+    if os.environ.get("DEVINX_API_KEYS") or os.environ.get("DEVINX_API_KEY"):
+        return
+    now = time.time()
+    with _acct_lock:
+        if not _accounts or now - _scan["at"] < RESCAN_EVERY:
+            return
+        _scan["at"] = now
+    sig = _credential_signature()
+    with _acct_lock:
+        if sig == _scan["sig"]:
+            return
+        _scan["sig"] = sig
+    try:
+        fresh = _load_accounts()
+    except Exception as e:
+        print(f"devinx: credential rescan failed, keeping the current ones: {e}",
+              flush=True)
+        return
+    with _acct_lock:
+        known = {a["key"] for a in _accounts}
+        keep = {f["key"] for f in fresh}
+        added = [f for f in fresh if f["key"] not in known]
+        removed = [a for a in _accounts if a["key"] not in keep]
+        for a in removed:
+            _accounts.remove(a)
+        _accounts.extend(added)
+        names = ", ".join(a["name"] for a in _accounts)
+    for a in added:
+        print(f"devinx: new Devin credential {a['name']} ({names})", flush=True)
+    for a in removed:
+        print(f"devinx: Devin credential {a['name']} removed ({names})", flush=True)
+
+
 def accounts():
-    """Resolved on first SWE-2 use, never at import.
+    """Resolved on first SWE-2 use, never at import, and kept current after.
 
     The Claude relay needs no Devin credential, so a missing or expired one must
     degrade to "SWE-2 requests fail" rather than "the service refuses to start"
     and take the main session down with it.
     """
+    _maybe_rescan()
     with _acct_lock:
         if not _accounts:
             _accounts.extend(_load_accounts())
+            _scan["at"], _scan["sig"] = time.time(), _credential_signature()
             if len(_accounts) > 1:
                 print(f"devinx: {len(_accounts)} Devin credentials "
                       f"({', '.join(a['name'] for a in _accounts)})", flush=True)
@@ -568,6 +630,7 @@ def claim_account(avoid=None):
     followed by a switch. Spreading the turns halves the rate each account sees,
     which is the difference between switching constantly and not being limited.
     """
+    _maybe_rescan()
     now = time.time()
     with _acct_lock:
         usable = [a for a in _accounts
