@@ -44,7 +44,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from runtime_support import CONFIG_FIELDS, build_id
+from runtime_support import CONFIG_FIELDS, PortLock, build_id, hello_proof, service_secret
 from http.cookiejar import DefaultCookiePolicy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -3959,10 +3959,20 @@ class Handler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path == "/api/hello":
             with _inflight_lock:
                 busy = _inflight["n"]
-            self.send_json(200, {"service": "devinx", "build": BUILD,
-                                 "pid": os.getpid(), "port": PORT,
-                                 "inflight": busy,
-                                 "configuration": effective_configuration()})
+            hello = {"service": "devinx", "build": BUILD,
+                     "pid": os.getpid(), "port": PORT, "inflight": busy,
+                     "configuration": effective_configuration()}
+            # The answer to the launcher's challenge: proof that this process
+            # can read the install's secret, which a squatter of another user
+            # cannot. API port only — the published dashboard port must not be
+            # an oracle that signs nonces for whoever reaches it.
+            nonce = (parse_qs(urlsplit(self.path).query).get("nonce") or [""])[0]
+            if type(self) is Handler and re.fullmatch(r"[0-9a-f]{16,64}", nonce):
+                try:
+                    hello["proof"] = hello_proof(service_secret(DATA_DIR), nonce)
+                except OSError:
+                    pass
+            self.send_json(200, hello)
             return
         if urlsplit(self.path).path != "/v1/models":
             self.send_error_json(404, "not_found_error", "Not found")
@@ -4386,21 +4396,26 @@ class _Stamped:
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
+    # One listener per port, enforced by PortLock rather than shared through
+    # SO_REUSEPORT. SO_REUSEPORT let a second devinx bind beside the first and
+    # the kernel then spread connections between them; a deploy no longer
+    # needs it, because the old process closes its listener and releases the
+    # lock before it drains, so the new one binds a free port. On Windows the
+    # stdlib's SO_REUSEADDR has the same double-bind meaning, so it is off
+    # there and the port is claimed exclusively instead.
+    allow_reuse_address = os.name != "nt"
+
     def server_bind(self):
-        # SO_REUSEPORT so a new build can bind the port while the old process
-        # is still finishing its turns. Without it a deploy is a choice between
-        # waiting for a quiet moment that never comes — an agent fleet keeps
-        # this port busy around the clock — and cutting live turns, which is
-        # not a deploy, it is an outage. With it, the new process takes the new
-        # connections and the old one drains.
-        try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except (AttributeError, OSError):
-            pass
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET,
+                                       socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
         return ThreadingHTTPServer.server_bind(self)
 
 
-def drain_and_exit(srv, extra_servers=()):
+def drain_and_exit(srv, extra_servers=(), on_closed=None):
     """Close listeners, then drain accepted turns without blocking signals.
 
     The signal handler runs on the serve_forever thread. It must return so that
@@ -4418,6 +4433,13 @@ def drain_and_exit(srv, extra_servers=()):
                 server.shutdown()
             finally:
                 server.server_close()
+        if on_closed is not None:
+            # Not listening any more: a successor may take the port now,
+            # while this process finishes the turns it already accepted.
+            try:
+                on_closed()
+            except Exception:
+                pass
         while time.monotonic() < deadline:
             with _inflight_lock:
                 busy = _inflight["n"]
@@ -4496,11 +4518,17 @@ def serve_dashboard_port(port):
 if __name__ == "__main__":
     sys.stdout = _Stamped(sys.stdout)
     sys.stderr = _Stamped(sys.stderr)
+    _port_lock = PortLock(PORT)
+    if not _port_lock.acquire(wait=15):
+        print(f"devinx: another devinx is already listening on port {PORT} "
+              f"(lock {_port_lock.path}); not starting a second one", flush=True)
+        sys.exit(1)
+    service_secret(DATA_DIR)
+    _srv = Server((HOST, PORT), Handler)
     print(f"devinx listening on http://{HOST}:{PORT}  "
           f"(build {BUILD}, pid {os.getpid()}, data: {DATA_DIR})", flush=True)
-    _srv = Server((HOST, PORT), Handler)
     _dashboard_srv = serve_dashboard_port(DASHBOARD_PORT) if DASHBOARD_PORT else None
-    drain_and_exit(_srv, (_dashboard_srv,))
+    drain_and_exit(_srv, (_dashboard_srv,), on_closed=_port_lock.release)
     if os.environ.get("DEVINX_DUMP"):
         print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
               f"conversation and any credentials the client sends, is being "

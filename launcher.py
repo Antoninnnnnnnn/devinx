@@ -11,7 +11,9 @@ but call this file.
 """
 import glob
 import hashlib
+import hmac
 import json
+import secrets
 import os
 import shutil
 import signal
@@ -20,7 +22,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from runtime_support import build_id, startup_lock
+from runtime_support import build_id, hello_proof, service_secret, startup_lock
 
 def _port_env(name, default):
     """A bad DEVINX_PORT must not crash the launcher before main() ever runs
@@ -560,8 +562,12 @@ def service_state():
         sock.settimeout(0.5)
         if sock.connect_ex((HOST, PORT)) != 0:
             return "absent", {}
+    if not _listener_is_ours():
+        return "foreign", {}
+    nonce = secrets.token_hex(16)
     try:
-        with _opener.open(f"http://{HOST}:{PORT}/api/hello", timeout=3) as r:
+        with _opener.open(f"http://{HOST}:{PORT}/api/hello?nonce={nonce}",
+                          timeout=3) as r:
             info = json.loads(r.read())
     except Exception:
         # A devinx old enough to predate /api/hello still answers /v1/models.
@@ -570,10 +576,47 @@ def service_state():
     # that happens to answer with a JSON array) must not crash the launcher.
     if not isinstance(info, dict) or info.get("service") != "devinx":
         return "foreign", {}
+    # Saying "devinx" costs nothing; answering the challenge takes the
+    # install's secret, which only this user can read. A build old enough to
+    # predate the proof sends none, and is judged on the socket owner above.
+    if "proof" in info:
+        try:
+            expected = hello_proof(service_secret(data_dir()), nonce)
+        except OSError:
+            expected = None
+        if not expected or not hmac.compare_digest(str(info["proof"]), expected):
+            sys.stderr.write(
+                f"devinx: the service on {HOST}:{PORT} failed the identity check "
+                f"(another user's process, or a devinx with another data "
+                f"directory); not using it\n")
+            return "foreign", {}
     want = local_build()
     if want and info.get("build") != want:
         return "stale", info
     return "fresh", info
+
+
+def _listener_is_ours():
+    """Linux: is the socket listening on our port owned by this user?
+
+    /proc/net/tcp names the uid of every socket, which settles the question
+    a process squatting a free port could otherwise answer however it liked.
+    Elsewhere, or when the table cannot be read, this cannot tell and says
+    yes; the hello challenge is then the check.
+    """
+    if not hasattr(os, "getuid"):
+        return True
+    want = f"0100007F:{PORT:04X}"
+    try:
+        with open("/proc/net/tcp", encoding="ascii") as fh:
+            next(fh, None)
+            for line in fh:
+                cols = line.split()
+                if len(cols) > 7 and cols[1] == want and cols[3] == "0A":
+                    return int(cols[7]) == os.getuid()
+    except (OSError, ValueError):
+        return True
+    return True
 
 
 def _pid_runs_devinx(pid):

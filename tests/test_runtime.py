@@ -254,7 +254,10 @@ class DiagnosticTests(unittest.TestCase):
     def test_hello_and_launcher_build_match_without_accounts(self):
         self.assertEqual(launcher.local_build(), devinx.BUILD)
         self.assertTrue(devinx.BUILD and devinx.BUILD != 'unknown')
-        self.assertEqual(set(devinx.effective_configuration()), set(runtime_support.CONFIG_FIELDS))
+        self.assertEqual(set(devinx.effective_configuration()),
+                         set(runtime_support.CONFIG_FIELDS) | set(devinx.RISKY_FLAGS))
+        self.assertTrue(all(isinstance(devinx.effective_configuration()[k], bool)
+                            for k in devinx.RISKY_FLAGS))
         self.assertTrue(all(isinstance(x, (int, float, bool, type(None)))
                             for x in devinx.effective_configuration().values()))
 

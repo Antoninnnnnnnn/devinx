@@ -11,6 +11,7 @@ sys.path.insert(0, ROOT)
 HOOK = os.path.join(ROOT, "plugin", "hooks", "ownership_guard.py")
 
 import diagnostics  # noqa: E402
+import runtime_support  # noqa: E402
 
 
 def run_hook(event, env_paths=None):
@@ -85,6 +86,82 @@ class RiskySwitchTests(unittest.TestCase):
 
     def test_old_service_without_the_fields_says_nothing(self):
         self.assertEqual(diagnostics.configuration_mismatches({}, {}), [])
+
+
+class PortLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._orig = runtime_support._lock_dir
+        runtime_support._lock_dir = lambda: self.tmp.name
+        self.addCleanup(lambda: setattr(runtime_support, "_lock_dir", self._orig))
+
+    def test_second_service_on_the_same_port_is_refused_until_release(self):
+        program = ("import sys, runtime_support as r\n"
+                   f"r._lock_dir = lambda: {self.tmp.name!r}\n"
+                   "sys.exit(0 if r.PortLock(18555).acquire(wait=0.3) else 3)\n")
+        first = runtime_support.PortLock(18555)
+        self.assertTrue(first.acquire(wait=0))
+        other = subprocess.run([sys.executable, "-c", program], cwd=ROOT)
+        self.assertEqual(other.returncode, 3)
+        first.release()
+        other = subprocess.run([sys.executable, "-c", program], cwd=ROOT)
+        self.assertEqual(other.returncode, 0)
+
+    def test_server_no_longer_shares_its_port(self):
+        import devinx
+        a = devinx.Server(("127.0.0.1", 0), devinx.Handler)
+        self.addCleanup(a.server_close)
+        with self.assertRaises(OSError):
+            devinx.Server(("127.0.0.1", a.server_port), devinx.Handler)
+
+
+class HelloProofTests(unittest.TestCase):
+    def test_proof_matches_only_with_the_same_secret(self):
+        with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
+            s1 = runtime_support.service_secret(d1)
+            self.assertEqual(runtime_support.service_secret(d1), s1)
+            self.assertEqual(os.stat(os.path.join(d1, "service-secret")).st_mode & 0o777, 0o600)
+            s2 = runtime_support.service_secret(d2)
+            nonce = "ab" * 16
+            self.assertEqual(runtime_support.hello_proof(s1, nonce),
+                             runtime_support.hello_proof(s1, nonce))
+            self.assertNotEqual(runtime_support.hello_proof(s1, nonce),
+                                runtime_support.hello_proof(s2, nonce))
+
+    def test_launcher_rejects_a_wrong_proof_and_accepts_the_right_one(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlsplit
+        import launcher
+        with tempfile.TemporaryDirectory() as data:
+            secret = runtime_support.service_secret(data)
+            mode = {"good": True}
+
+            class Fake(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    nonce = parse_qs(urlsplit(self.path).query).get("nonce", [""])[0]
+                    proof = runtime_support.hello_proof(secret if mode["good"] else "x" * 64, nonce)
+                    body = json.dumps({"service": "devinx", "build": launcher.local_build(),
+                                       "pid": 1, "inflight": 0, "proof": proof}).encode()
+                    self.send_response(200)
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *a):
+                    pass
+
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.shutdown)
+            old_port, old_dd = launcher.PORT, launcher.data_dir
+            launcher.PORT, launcher.data_dir = srv.server_port, (lambda: data)
+            self.addCleanup(lambda: (setattr(launcher, "PORT", old_port),
+                                     setattr(launcher, "data_dir", old_dd)))
+            self.assertEqual(launcher.service_state()[0], "fresh")
+            mode["good"] = False
+            self.assertEqual(launcher.service_state()[0], "foreign")
 
 
 if __name__ == "__main__":

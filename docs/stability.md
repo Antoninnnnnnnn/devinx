@@ -62,7 +62,17 @@ output as a substitute for the allowlisted diagnostics.
 - Concurrent launchers with the same data directory and port use an OS file
   lock. A foreign service is never started over or killed. An older busy devinx
   is still left running, with the existing warning. This is not automatic
-  blue/green deployment or cross-user process isolation.
+  blue/green deployment.
+- One service per port: the service holds a per-user port lock (under
+  `/run/user/<uid>/devinx`, or `~/.cache/devinx/run`) for as long as it
+  listens, whatever its data directory, and no longer sets `SO_REUSEPORT`; a
+  second devinx on the same port waits 15s for the lock and then exits. The
+  lock is released as soon as the listener closes, so a successor can start
+  while the old process drains. On Windows the port is bound exclusively.
+- The launcher checks who it is talking to: on Linux the listening socket
+  must belong to the current user, and `/api/hello` must answer a nonce with
+  an HMAC of the install's `service-secret` (data directory, mode 0600). A
+  wrong answer is treated as a foreign service and never used or signalled.
 
 ## Resource controls
 

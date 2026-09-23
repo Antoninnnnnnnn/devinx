@@ -1,1 +1,4 @@
 model = "swe-2-max"
+# Read-only role: the sandbox enforces what the brief asks. Honoured if the
+# role layer applies it; harmless if a Codex version ignores it.
+sandbox_mode = "read-only"
