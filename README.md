@@ -118,19 +118,26 @@ whatever your Codex config already says; only what it delegates changes.
 
 | flag | effect |
 |---|---|
-| `--devin`, `--d` | route Claude Code through devinx; inject the `swe2-*` agents |
+| `--devin`, `--d` | route Claude Code through devinx; inject the `swe2-*` agents and `claude-reviewer` |
 | `--codex`, `--cx` | route Codex through devinx; pin the SWE-2 roles |
 | `--or` | add the orchestrator skill; implies the client flag it is used with |
+| `--plain` | cancel `DEVINX_ALWAYS=1` for this one run (an explicit `--devin`/`--or`/`--codex` still wins) |
 | `--` | everything after it passes through verbatim |
+| `--status`, `--doctor`, `--explain` | local diagnostics (see [stability controls](docs/stability.md)); recognised in the first position or after devinx's own flags (`devinx --d --status`), as long as the position is unambiguous |
 
 | variable | effect |
 |---|---|
 | `DEVINX_ALWAYS=1` | make the SWE-2 layer the default |
-| `DEVINX_ORCHESTRATOR=1` | make the orchestrator the default |
+| `DEVINX_ORCHESTRATOR=1` | make the orchestrator the default (implies `DEVINX_ALWAYS`) |
 | `DEVINX_SUBAGENT_MCP=1` | give subagents their MCP tools back |
 | `DEVINX_PORT` | change the port for one run |
 | `DEVINX_CONTEXT_TOKENS` | override the context window devinx declares (default 262144) |
 | `DEVINX_ALLOW_BROWSER=1` | accept browser-originated requests (see below) |
+| `DEVINX_DATA` | override the data directory (logs, lock file, Devin credentials); defaults to the platform data dir |
+| `DEVINX_LOG` | override the log file path; defaults to `devinx.log` in the data directory |
+| `DEVINX_API_KEYS` / `DEVINX_API_KEY` | comma-separated Devin credentials (or a single one), instead of every `credentials.toml` under the data directory |
+| `DEVINX_OWNED_PATHS` | `os.pathsep`-separated paths/globs the `--or` hooks enforce as owned files (see [hooks](#hooks) below); unset means unenforced |
+| `DEVINX_DESCRIPTORS` | an extra directory of protobuf `*.fdp` descriptors to load, ahead of the packaged ones |
 
 `--or` is separate from the client flags on purpose: the SWE-2 layer changes
 which model does the work, the orchestrator changes who decides what the work
@@ -180,7 +187,7 @@ decomposition, what the diff actually says, what to tell you.
 | `swe2-tester` | running tests, reproducing failures, adding tests | yes |
 | `swe2-researcher` | external docs, version-specific API behaviour | no |
 | `swe2-reviewer` | independent read of a finished change | no |
-| `claude-reviewer` | the same, on your own model, for high-stakes changes | no |
+| `claude-reviewer` *(Claude Code only)* | the same, on your own model, for high-stakes changes | no |
 
 Every SWE role is pinned to `swe-2-max`, because it is the strongest — not
 because it is free. Under rate limiting a weaker tier is a real lever: the same
@@ -258,6 +265,33 @@ is wrong in the permissive direction is not going to announce itself.
 Naming the roles is optional; the skill picks them on its own. Saying it is
 worth doing when you already know the shape of the work, or when you want the
 expensive reviewer on something that looks routine and is not.
+
+### Hooks
+
+`--or` also loads two Claude Code hooks (`plugin/hooks/`), the same
+session-scoped way it loads the skill: `--devin` alone does not, and neither
+does Codex, which has no equivalent hook mechanism.
+
+- **`edit_loop_guard.py`** refuses the 4th identical Edit/Write/NotebookEdit
+  attempt at the same file with the same content — the same failing call
+  retried forever instead of the agent reading the file and adjusting. A
+  successful edit, or re-reading the file, forgives the attempts recorded
+  against it; a new session starts clean.
+- **`ownership_guard.py`** enforces `DEVINX_OWNED_PATHS` (see the variable
+  table above) by refusing an Edit/Write/NotebookEdit outside the declared
+  list — the wall the skill tells you to set alongside a subagent's file
+  ownership, since a prompt alone is a request an agent can talk itself out
+  of. It is a session-wide setting, not a per-agent one, today.
+
+Both fail open on anything they cannot parse: a hook erroring out must never
+be the reason a legitimate edit is blocked.
+
+`hooks.json`'s commands resolve `python3`, then `python`, then `py` at
+invocation time through a POSIX shell (`command -v`); on Windows, where hook
+commands are not run through a POSIX shell, this resolution does not apply,
+so a `python` reachable exactly that way on PATH is required for the hooks to
+run there at all. A missing interpreter means the hooks silently do not load
+— not that anything is refused wrongly.
 
 ## Choosing a tier by hand
 
@@ -464,7 +498,7 @@ of them is spent. `DEVINX_API_KEYS` takes a
 comma-separated list instead. Each request logs the account that served it, so
 which credential a limit belongs to is answerable from the log.
 
-`DEVINX_RATE_WAIT` bounds the total wait (600s by default) — the client has its
+`DEVINX_RATE_WAIT` bounds the total wait (1800s by default) — the client has its
 own timeout, and an answer that never comes is worse than one that says to try
 later. Past that budget the refusal does go back, as a 429 `rate_limit_error`
 carrying `retry-after`.

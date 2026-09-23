@@ -77,6 +77,16 @@ Settings are read when the **service starts**:
 | `DEVINX_MAX_INFLATED_FRAME` | 67108864 | Maximum decoded frame bytes, including concatenated gzip streams. |
 | `DEVINX_RELAY_READ_TIMEOUT` | 0 | Relay read inactivity limit in seconds; 0 keeps the previous unlimited read wait. |
 | `DEVINX_COMPACT_STRICT` | 0 | Set to 1 for the strict compaction policy below. |
+| `DEVINX_MAX_BODY` | 134217728 (128 MiB) | Maximum accepted request body size in bytes. |
+| `DEVINX_KEEPALIVE` | 25 | Seconds between keepalive heartbeats on a silent stream; the client's own idle timeout otherwise reports "the response stopped arriving" on a turn that is still in progress. 0 disables it. |
+| `DEVINX_PACE` | 4 | How many turns may be in flight at once on a credential that refused something recently. 0 disables the cap. |
+| `DEVINX_PACE_WINDOW` | 120 | Seconds after a refusal that `DEVINX_PACE` applies to that credential. |
+| `DEVINX_NETWORK_RETRIES` | 2 | Retries for a connection that breaks mid-response (reset, truncated stream) rather than being refused outright; these are not caught by the rate-limit/classifier retry loop. |
+| `DEVINX_LEAD_CAP` | 8000 | Token threshold above which the blocks leading into a flattened (collapsed) run of tool calls give way to text instead of replayed thinking, when unflattening a legacy history shape. |
+| `DEVINX_SUMMARY_TOKENS` | 16384 | `max_tokens` budget for the compaction summary call itself. |
+| `DEVINX_MID_CONV_REFUSALS` | 3 | How many times one conversation is told a mid-conversation system turn is not accepted before the proxy gives up and carries it through anyway. |
+| `DEVINX_DRAIN` | 300 | Seconds a shutting-down process gives the turns it is already carrying before cutting them short. |
+| `DEVINX_MAX_SWE_INFLIGHT` | *(added separately from this pass — see devinx.py for the current default)* | A cap on concurrent SWE-2 turns independent from `DEVINX_MAX_INFLIGHT`, so a burst of held rate-limit waits on the SWE side cannot starve `claude-*`/`gpt-*` relays of the same shared POST-handler budget. |
 
 Other existing settings, including the 128 MiB request body limit and drain
 budget, keep their defaults. Body framing now requires exactly one non-negative

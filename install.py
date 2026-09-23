@@ -624,7 +624,8 @@ def smoke(py, have_credential):
 def main():
     ap = argparse.ArgumentParser(description="Install devinx.")
     ap.add_argument("--force", action="store_true",
-                    help="overwrite an existing launcher, agents and virtualenv")
+                    help="overwrite an existing launcher, agents, virtualenv "
+                         "and devinx.config.toml (the Codex profile)")
     ap.add_argument("--port", type=int, default=8316, help="service port")
     ap.add_argument("--bin", default=default_bin(), help="where to put the launcher")
     ap.add_argument("--no-smoke", action="store_true", help="skip the smoke test")
