@@ -10,6 +10,7 @@ only a temp file.
     .venv/bin/python tests/test_regressions.py
 """
 
+import contextlib
 import copy
 import io
 import json
@@ -718,6 +719,22 @@ class PacingTests(unittest.TestCase):
         with devinx.paced(acct):
             pass
         self.assertIsNone(acct.get("pace"), "a semaphore was created for nothing")
+
+    def test_the_cap_holds_when_a_long_block_ends(self):
+        # Refused 30 minutes ago, blocked until 10 seconds ago: every turn held
+        # for the block is released now, and that is when the cap matters.
+        import time
+        now = time.time()
+        acct = {"name": "t", "refused_at": now - 1800, "blocked_until": now - 10}
+        self.assertIsNot(type(devinx.paced(acct)), type(contextlib.nullcontext()),
+                         "the cap had lapsed by the end of the block")
+
+    def test_the_cap_lapses_once_the_credential_has_been_back_a_while(self):
+        import time
+        now = time.time()
+        acct = {"name": "t", "refused_at": now - 1800,
+                "blocked_until": now - devinx.PACE_WINDOW - 5}
+        self.assertIs(type(devinx.paced(acct)), type(contextlib.nullcontext()))
 
     def test_a_credential_that_just_refused_is_capped(self):
         import threading, time

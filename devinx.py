@@ -598,10 +598,17 @@ def paced(acct):
     So the cap applies only where it costs nothing: for a while after a
     credential has actually refused something. While a credential is serving
     normally, every turn goes straight through and this does nothing at all.
+
+    "A while" is counted from when the credential comes back, not from when it
+    refused. Counted from the refusal, the two minutes had long lapsed by the
+    end of a 10-to-35-minute block — precisely the moment every turn held for
+    that block is released at once. Measured on 2026-09-23: after a long block
+    the median number of requests served before the next refusal was zero.
     """
     if not acct or PACE_CONCURRENCY <= 0:
         return contextlib.nullcontext()
-    if time.time() - acct.get("refused_at", 0) > PACE_WINDOW:
+    back = max(acct.get("refused_at", 0), acct.get("blocked_until", 0))
+    if time.time() - back > PACE_WINDOW:
         return contextlib.nullcontext()
     sem = acct.get("pace")
     if sem is None:
