@@ -215,7 +215,9 @@ def packaged_agents():
     out = {}
     for path in sorted(glob.glob(os.path.join(HERE, "agents", "*.md"))):
         try:
-            with open(path, encoding="utf-8") as fh:
+            # utf-8-sig: a UTF-8 BOM before "---" otherwise fails the very next
+            # check below, silently dropping that one agent file entirely.
+            with open(path, encoding="utf-8-sig") as fh:
                 text = fh.read()
         except OSError:
             continue
@@ -233,10 +235,24 @@ def packaged_agents():
         name = meta.get("name")
         if not name:
             continue
+        # Only whitespace is stripped here: the previous lstrip("-\n") also
+        # stripped the character '-' itself from the start of the prompt body,
+        # eating a leading "- " off a prompt that opened with a markdown list.
         agent = {"description": meta.get("description", ""),
-                 "prompt": prompt.lstrip("-\n").strip()}
+                 "prompt": prompt.strip()}
         if meta.get("model"):
             agent["model"] = meta["model"]
+        if meta.get("permissionMode"):
+            agent["permissionMode"] = meta["permissionMode"]
+        if meta.get("maxTurns"):
+            try:
+                agent["maxTurns"] = int(meta["maxTurns"])
+            except ValueError:
+                sys.stderr.write(f"devinx: agent {name!r} has a non-numeric "
+                                 f"maxTurns ({meta['maxTurns']!r}); ignoring it\n")
+        tools = [t.strip() for t in meta.get("tools", "").split(",") if t.strip()]
+        if tools:
+            agent["tools"] = tools
         # A read-only role (explorer, researcher, reviewer) denies the editing
         # tools by name. Bash can still write, so the prompt says so too; this
         # closes the accidental path, not a determined one.
@@ -391,7 +407,51 @@ def codex_args(orchestrate, add_profile=True):
     if add_profile and os.path.exists(
             os.path.join(codex_home(), "devinx.config.toml")):
         args += ["-p", "devinx"]
+    _warn_stale_codex_cache()
     return args
+
+
+def _warn_stale_codex_cache():
+    """`codex plugin add` materialises the skill into a version-keyed cache
+    directory and never re-copies an already-cached version, even when its
+    content changed underneath it (a package upgrade with no version bump
+    used to be exactly that). This compares content, not just a version
+    string, so drift is caught even if a future bump is again forgotten.
+
+    The exact cache layout is observed, not documented, so both plausible
+    shapes are checked rather than assumed.
+    """
+    packaged = os.path.join(HERE, "codex", "marketplace", "plugins",
+                            "swe-orchestrator", "skills", "swe-orchestrator",
+                            "SKILL.md")
+    try:
+        with open(packaged, "rb") as fh:
+            packaged_hash = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return
+    cache_root = os.path.join(codex_home(), "plugins", "cache", "devinx",
+                              "swe-orchestrator")
+    try:
+        versions = os.listdir(cache_root)
+    except OSError:
+        return
+    for version in versions:
+        version_dir = os.path.join(cache_root, version)
+        for candidate in (os.path.join(version_dir, "SKILL.md"),
+                         os.path.join(version_dir, "skills",
+                                      "swe-orchestrator", "SKILL.md")):
+            try:
+                with open(candidate, "rb") as fh:
+                    cached_hash = hashlib.sha256(fh.read()).hexdigest()
+            except OSError:
+                continue
+            if cached_hash != packaged_hash:
+                sys.stderr.write(
+                    f"devinx: the cached Codex skill at {candidate} does not "
+                    f"match the one in this package - `codex plugin add` does "
+                    f"not refresh an already-cached version on its own. Run "
+                    f"`python3 install.py --force` to refresh it.\n")
+            break
 
 
 def _has_profile_flag(args):

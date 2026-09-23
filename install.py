@@ -309,21 +309,25 @@ def report_agents():
     """
     names = sorted(os.path.splitext(n)[0] for n in agent_files())
     say(OK, f"agents injected per session: {', '.join(names)}")
+    agents_dir = os.path.join(claude_config_dir(), "agents")
     stale = [n for n in agent_files()
-             if os.path.exists(os.path.expanduser(f"~/.claude/agents/{n}"))]
+             if os.path.exists(os.path.join(agents_dir, n))]
     if stale:
         say(WARN, f"{len(stale)} agent file(s) from an older install are still "
-                  f"in ~/.claude/agents:")
+                  f"in {agents_dir}:")
         print("        " + ", ".join(stale))
-        print("        They shadow the session-scoped ones and stay visible "
-              "outside devin mode.\n"
-              "        Remove them by hand once you are happy with this "
-              "install.")
+        print("        A file on disk there is a plain project/user agent, no "
+              "different to one you wrote yourself, so it stays visible in "
+              "every session, devin mode or not - the opposite of what "
+              "session-scoped injection is for. Remove it by hand once you "
+              "are happy with this install.")
 
 
 def report_skill():
-    """The orchestrator skill rides on the launcher's --plugin-dir, so like the
-    agents it exists in --devin sessions and nowhere else."""
+    """The orchestrator skill rides on the launcher's --plugin-dir, which is
+    added only for --or (plugin_args() is called with use_orch, not
+    use_devin) - unlike the agents, it does not exist in a plain --devin
+    session, only one that also asked for --or."""
     skills = sorted(glob.glob(os.path.join(HERE, "plugin", "skills", "*",
                                            "SKILL.md")))
     if not skills:
@@ -343,8 +347,34 @@ def report_skill():
     say(OK, f"skill available with --or: {names}")
 
 
+def _with_mcp_deny(text):
+    """Match launcher.packaged_agents(): a session-injected agent gets
+    disallowedTools: [..., "mcp__*"] unless DEVINX_SUBAGENT_MCP=1, but a
+    globally-installed one was a byte-for-byte copy of the source file and
+    never got it, silently weaker than the README says it is.
+    """
+    if os.environ.get("DEVINX_SUBAGENT_MCP") == "1" or not text.startswith("---"):
+        return text
+    _, _, rest = text.partition("---")
+    front, sep, body = rest.partition("\n---")
+    if not sep:
+        return text
+    lines = front.splitlines()
+    for i, line in enumerate(lines):
+        key, colon, value = line.partition(":")
+        if colon and key.strip() == "disallowedTools":
+            tools = [t.strip() for t in value.split(",") if t.strip()]
+            if "mcp__*" not in tools:
+                tools.append("mcp__*")
+            lines[i] = "disallowedTools: " + ", ".join(tools)
+            break
+    else:
+        lines.append("disallowedTools: mcp__*")
+    return "---" + "\n".join(lines) + "\n---" + body
+
+
 def install_agents(force):
-    dest = os.path.expanduser("~/.claude/agents")
+    dest = os.path.join(claude_config_dir(), "agents")
     os.makedirs(dest, exist_ok=True)
     installed, kept = [], []
     for name in agent_files():
@@ -356,12 +386,25 @@ def install_agents(force):
         if os.path.exists(target) and not force:
             kept.append(name)
             continue
-        shutil.copyfile(src, target)
+        # A UTF-8 BOM (utf-8-sig) at the start of the file would make the
+        # "---" frontmatter check below fail to match, silently skipping the
+        # deny-list patch for that one file.
+        with open(src, encoding="utf-8-sig") as fh:
+            text = fh.read()
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(_with_mcp_deny(text))
         installed.append(name)
     if installed:
         say(OK, f"agents installed: {', '.join(installed)}")
     if kept:
         say(WARN, f"agents already present, left untouched: {', '.join(kept)}")
+
+
+def claude_config_dir():
+    """Claude Code itself honours CLAUDE_CONFIG_DIR to relocate ~/.claude;
+    hard-coding the default here meant --global-agents (and the stale-file
+    check) looked in the wrong place for anyone who has moved it."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 
 
 def codex_home():

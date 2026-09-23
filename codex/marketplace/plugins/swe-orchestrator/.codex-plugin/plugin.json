@@ -1,6 +1,6 @@
 {
   "name": "swe-orchestrator",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Delegate bounded execution to SWE-2 Max subagents while the root model keeps architecture, decomposition and verification.",
   "author": { "name": "devinx" },
   "license": "MIT",

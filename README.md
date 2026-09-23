@@ -348,9 +348,11 @@ With those in place, `agents.default_subagent_model` puts every spawned agent on
 
 One difference remains. Codex has no per-agent prompt: everything under
 `[agents]` is parsed as a role except a short list of recognised scalars, and an
-unrecognised one fails config loading outright. The executor brief in
-`codex/executor.md` therefore has nowhere to hang; the roles carry the tier, and
-the orchestrator doctrine reaches the root through the skill.
+unrecognised one fails config loading outright. An executor brief therefore has
+nowhere to hang; the roles carry the tier (each `-c agents.<role>.description=`
+in `launcher.py`'s `CODEX_ROLES`), and the orchestrator doctrine reaches the
+root through the Codex skill in `codex/marketplace/`, kept in step with the
+Claude Code one in `plugin/skills/`.
 
 ### Why the SWE-2 route refuses browsers
 
