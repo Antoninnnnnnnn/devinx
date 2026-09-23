@@ -22,6 +22,7 @@ to sit in the middle. Two consequences worth knowing:
     the middle discarded unsigned thinking blocks on their way back up.
 """
 import base64
+import collections
 import contextlib
 import glob
 import gzip
@@ -688,15 +689,42 @@ def reset_key():
 _turn = {"n": 0}
 
 
+# How long a refusal keeps steering turns away from the account that refused,
+# and how many attempts one refusal weighs against. An account that is being
+# refused is near a ceiling; every turn sent to it anyway is likely one more
+# refusal, and a refusal is a request spent for nothing.
+REFUSAL_MEMORY = 900
+REFUSAL_WEIGHT = 20
+
+
+def _load(acct, now):
+    """Attempts in the last hour, plus a heavy weight per recent refusal."""
+    att = acct.setdefault("attempts", collections.deque())
+    refs = acct.setdefault("refusals", collections.deque())
+    while att and att[0] < now - 3600:
+        att.popleft()
+    while refs and refs[0] < now - REFUSAL_MEMORY:
+        refs.popleft()
+    return len(att) + REFUSAL_WEIGHT * len(refs)
+
+
 def claim_account(avoid=None):
     """A credential that is not rate limited, and when the earliest one frees up
     if none is.
 
-    Round robin rather than first-fit. The limits are per credential, so always
+    Least loaded rather than first-fit. The limits are per credential, so always
     starting at the same one keeps that one permanently at its ceiling while the
     others idle — the short limit would still be hit on every burst, merely
-    followed by a switch. Spreading the turns halves the rate each account sees,
+    followed by a switch. Spreading the turns divides the rate each account sees,
     which is the difference between switching constantly and not being limited.
+
+    It was a strict round robin, which spreads turns evenly but blindly: an
+    account being refused kept its full share, and each of those turns was
+    likely one more refusal. Measured over 24 hours on 2026-09-23, the work
+    served was even (12 089 against 12 295) while the refusals were not (901
+    against 2 712). The pick now weighs each account's attempts in the last hour
+    and, far more heavily, its refusals in the last fifteen minutes, so turns
+    drift toward the credential with headroom and back once the refusals age.
     """
     _maybe_rescan()
     now = time.time()
@@ -709,7 +737,13 @@ def claim_account(avoid=None):
                   if a["blocked_until"] <= now and a is not avoid]
         if usable:
             _turn["n"] += 1
-            return usable[_turn["n"] % len(usable)], 0.0
+            # Rotate the starting point so equal loads still alternate, then
+            # take the least loaded: min() keeps the first of equal values.
+            k = _turn["n"] % len(usable)
+            order = usable[k:] + usable[:k]
+            pick = min(order, key=lambda a: _load(a, now))
+            pick.setdefault("attempts", collections.deque()).append(now)
+            return pick, 0.0
         soonest = min((a["blocked_until"] for a in live
                        if a is not avoid), default=now)
         return None, max(0.0, soonest - now)
@@ -718,6 +752,7 @@ def claim_account(avoid=None):
 def block_account(acct, seconds):
     with _acct_lock:
         acct["blocked_until"] = time.time() + seconds
+        acct.setdefault("refusals", collections.deque()).append(time.time())
         acct["refused_at"] = time.time()
 
 

@@ -1159,6 +1159,35 @@ class FreePlanExclusionTests(unittest.TestCase):
 FreePlanExclusionTests.real_rescan = staticmethod(devinx._maybe_rescan)
 
 
+class BalancingTests(unittest.TestCase):
+    """Turns go where there is headroom, and still spread when loads are equal."""
+
+    def setUp(self):
+        self.a = {"name": "a", "key": "ka", "blocked_until": 0.0}
+        self.b = {"name": "b", "key": "kb", "blocked_until": 0.0}
+        for patcher in (mock.patch.object(devinx, "_accounts", [self.a, self.b]),
+                        mock.patch.object(devinx, "_maybe_rescan", lambda: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_equal_loads_alternate(self):
+        picks = [devinx.claim_account()[0]["name"] for _ in range(10)]
+        self.assertEqual(picks.count("a"), 5)
+        self.assertEqual(picks.count("b"), 5)
+
+    def test_an_account_being_refused_is_avoided(self):
+        devinx.block_account(self.a, 0)       # refused, block already over
+        picks = [devinx.claim_account()[0]["name"] for _ in range(10)]
+        self.assertGreaterEqual(picks.count("b"), 9,
+                                f"the refusing account kept its share: {picks}")
+
+    def test_the_refusal_ages_out(self):
+        devinx.block_account(self.a, 0)
+        self.a["refusals"][0] -= devinx.REFUSAL_MEMORY + 1
+        picks = [devinx.claim_account()[0]["name"] for _ in range(10)]
+        self.assertEqual(picks.count("a"), 5)
+
+
 class MessageIdTests(unittest.TestCase):
     """The constant that collapsed every run into three messages.
 
