@@ -272,11 +272,12 @@ expensive reviewer on something that looks routine and is not.
 session-scoped way it loads the skill: `--devin` alone does not, and neither
 does Codex, which has no equivalent hook mechanism.
 
-- **`edit_loop_guard.py`** refuses the 4th identical Edit/Write/NotebookEdit
-  attempt at the same file with the same content — the same failing call
-  retried forever instead of the agent reading the file and adjusting. A
-  successful edit, or re-reading the file, forgives the attempts recorded
-  against it; a new session starts clean.
+- **`edit_loop_guard.py`** refuses an Edit/Write/NotebookEdit identical to one
+  that has already run and failed three times — the same failing call retried
+  forever instead of the agent reading the file and adjusting. Only real
+  failures count (a call denied by a prompt or another hook never ran); a
+  successful edit, or re-reading the file, forgives them; a new session
+  starts clean.
 - **`ownership_guard.py`** refuses an Edit/Write/NotebookEdit outside the
   files a subagent owns — the wall behind the skill's file ownership, since a
   prompt alone is a request an agent can talk itself out of. Ownership is

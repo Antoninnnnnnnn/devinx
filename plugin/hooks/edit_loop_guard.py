@@ -14,11 +14,12 @@ The only thing that ends it is something outside the agent that counts.
 
 So this counts, but only a run of the SAME attempt going nowhere:
 
+- PostToolUseFailure counts: the call ran and failed. Nothing else does — a
+  call denied by a permission prompt, by ownership_guard or by this hook
+  never runs, so it never fails, and it is never held against the agent.
 - PreToolUse (also the default when hook_event_name is absent, for an older
-  Claude Code or a direct call): refuse an attempt already at ALLOWED, without
-  incrementing it — a call this hook itself denies is never counted, and a
-  call something else denies never reaches PostToolUse at all, so it is never
-  counted either.
+  Claude Code or a direct call) refuses an attempt that has already failed
+  ALLOWED times, and changes nothing.
 - PostToolUse on a successful Edit/Write/NotebookEdit forgives that exact
   attempt: a legitimate repeat (a revert, redoing the same fix twice) is never
   penalised once it has actually worked.
@@ -29,12 +30,6 @@ So this counts, but only a run of the SAME attempt going nowhere:
   compact or fork: a long session auto-compacting repeatedly must not hand
   itself three fresh attempts on every compaction, which would let the exact
   loop this hook exists to stop keep going, just slower.
-
-One acknowledged gap: a call denied by a *different* hook (ownership_guard,
-or the interactive permission prompt) still increments here, because the
-increment happens at PreToolUse time, before it is known whether anything
-downstream will refuse it. Undoing that would need this hook to know the
-final permission outcome, which PreToolUse alone does not carry.
 
 Threshold is deliberately loose: two or three identical failing attempts
 happen for honest reasons — a racing writer, a retry after an interruption —
@@ -320,6 +315,22 @@ def _run():
                 _save(path, state)
             return 0
 
+        if hook_event == "PostToolUseFailure":
+            # Counted only once the call has actually run and failed. An
+            # interrupt is the user stopping it, not the edit going nowhere.
+            if event.get("is_interrupt"):
+                return 0
+            entry = state.get(key, {"file": target, "n": 0})
+            entry["n"] = entry.get("n", 0) + 1
+            entry["file"] = target
+            state[key] = entry
+            if len(state) > 2000:
+                state = {key: entry}
+            _save(path, state)
+            return 0
+
+        if hook_event != "PreToolUse":
+            return 0
         entry = state.get(key, {"file": target, "n": 0})
         if entry.get("n", 0) >= ALLOWED:
             sys.stderr.write(
@@ -337,13 +348,6 @@ def _run():
                 f"  - If you have already tried both, the task is blocked. "
                 f"Say so and stop; a loop is not progress.\n")
             return 2
-
-        entry["n"] = entry.get("n", 0) + 1
-        entry["file"] = target
-        state[key] = entry
-        if len(state) > 2000:
-            state = {key: entry}
-        _save(path, state)
     return 0
 
 

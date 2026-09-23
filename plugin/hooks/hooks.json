@@ -50,6 +50,17 @@
           }
         ]
       }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null || echo python3)\" \"${CLAUDE_PLUGIN_ROOT}/hooks/edit_loop_guard.py\""
+          }
+        ]
+      }
     ]
   }
 }

@@ -39,12 +39,18 @@ class HermeticHookCase(unittest.TestCase):
         self.session = "test-" + os.urandom(6).hex()
 
     def _call(self, tool, args, hook_event=None, session=None):
+        """With no hook_event: one attempt that ran and failed — the
+        PreToolUse check, then, if it let the call through, the
+        PostToolUseFailure that counts it."""
         event = {"session_id": session or self.session, "tool_name": tool,
                  "tool_input": args}
         if hook_event:
             event["hook_event_name"] = hook_event
-        return subprocess.run([sys.executable, EDIT_GUARD], input=json.dumps(event),
-                              capture_output=True, text=True, env=self.env)
+        result = subprocess.run([sys.executable, EDIT_GUARD], input=json.dumps(event),
+                                capture_output=True, text=True, env=self.env)
+        if hook_event is None and result.returncode == 0:
+            self._call(tool, args, "PostToolUseFailure", session)
+        return result
 
 
 class SessionStartClearsStateTests(HermeticHookCase):
@@ -106,17 +112,27 @@ class SuccessResetsTheCounterTests(HermeticHookCase):
             self._call("Read", {"file_path": "/a/b.py"}, "PostToolUse").returncode, 0)
         self.assertEqual(self._call("Edit", args, "PreToolUse").returncode, 0)
 
-    def test_a_pretooluse_denial_does_not_itself_increment(self):
+    def test_a_call_that_never_ran_is_never_counted(self):
+        # Denied by a permission prompt or by ownership_guard: PreToolUse
+        # fires, the tool never runs, no PostToolUseFailure follows.
+        args = {"file_path": "/a/b.py", "old_string": "X", "new_string": "Y"}
+        for _ in range(10):
+            self.assertEqual(self._call("Edit", args, "PreToolUse").returncode, 0)
+
+    def test_an_interrupt_is_not_a_failure(self):
+        args = {"file_path": "/a/b.py", "old_string": "X", "new_string": "Y"}
+        for _ in range(5):
+            event = {"session_id": self.session, "tool_name": "Edit", "tool_input": args,
+                     "hook_event_name": "PostToolUseFailure", "is_interrupt": True}
+            subprocess.run([sys.executable, EDIT_GUARD], input=json.dumps(event),
+                           capture_output=True, text=True, env=self.env)
+        self.assertEqual(self._call("Edit", args, "PreToolUse").returncode, 0)
+
+    def test_blocked_until_a_success_forgives_it(self):
         args = {"file_path": "/a/b.py", "old_string": "X", "new_string": "Y"}
         for _ in range(3):
-            self.assertEqual(self._call("Edit", args, "PreToolUse").returncode, 0)
-        blocked = self._call("Edit", args, "PreToolUse")
-        self.assertEqual(blocked.returncode, 2)
-        # Retrying the *blocked* call more times must not need to be undone by
-        # more than one success - it never actually ran, so it was never
-        # counted again past the first block.
-        self._call("Edit", args, "PreToolUse")
-        self._call("Edit", args, "PreToolUse")
+            self.assertEqual(self._call("Edit", args).returncode, 0)
+        self.assertEqual(self._call("Edit", args, "PreToolUse").returncode, 2)
         self.assertEqual(self._call("Edit", args, "PostToolUse").returncode, 0)
         self.assertEqual(self._call("Edit", args, "PreToolUse").returncode, 0)
 
@@ -161,16 +177,21 @@ class ConcurrentAttemptsAreCountedAccuratelyTests(HermeticHookCase):
     """H3: the read-modify-write must be atomic and locked, or parallel
     agents hitting the same edit race each other's counts."""
 
-    def test_exactly_allowed_calls_pass_under_forty_parallel_attempts(self):
+    def test_forty_parallel_failures_are_all_counted(self):
         args = {"file_path": "/race.py", "old_string": "X", "new_string": "Y"}
 
-        def attempt(_):
-            return self._call("Edit", args).returncode
+        def fail(_):
+            return self._call("Edit", args, "PostToolUseFailure").returncode
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
-            results = list(pool.map(attempt, range(40)))
-        self.assertEqual(results.count(0), edit_loop_guard.ALLOWED)
-        self.assertEqual(results.count(2), 40 - edit_loop_guard.ALLOWED)
+            self.assertEqual(set(pool.map(fail, range(40))), {0})
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"DEVINX_DATA": self._tmp.name}):
+            state = edit_loop_guard.state_path(self.session)
+        with open(state) as fh:
+            counts = [v["n"] for v in json.load(fh).values()]
+        self.assertEqual(counts, [40])
+        self.assertEqual(self._call("Edit", args, "PreToolUse").returncode, 2)
 
 
 class StatePathIsPrivateTests(HermeticHookCase):

@@ -634,8 +634,15 @@ class EditLoopGuardTests(unittest.TestCase):
                             "tool_input": {"file_path": target,
                                            "old_string": old,
                                            "new_string": new}})
-        return subprocess.run([sys.executable, self.GUARD], input=event,
-                              capture_output=True, text=True)
+        result = subprocess.run([sys.executable, self.GUARD], input=event,
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            # The attempt ran and failed: that is what the guard counts.
+            failed = json.loads(event)
+            failed["hook_event_name"] = "PostToolUseFailure"
+            subprocess.run([sys.executable, self.GUARD], input=json.dumps(failed),
+                           capture_output=True, text=True)
+        return result
 
     def setUp(self):
         self.session = "test-" + os.urandom(6).hex()
