@@ -10,6 +10,7 @@ written into ~/.claude unless you ask for it with --global-agents. Uses the
 standard library only, so it runs before any dependency exists.
 """
 import argparse
+import contextlib
 import glob
 import hashlib
 import json
@@ -482,9 +483,31 @@ def strip_plugin_entry(path, entry):
     return removed
 
 
-def _refresh_stale_codex_cache(home):
-    """Clear a cached copy of *our own* packaged version if it does not match
-    what we are about to install.
+def _packaged_skill_hash():
+    packaged = os.path.join(HERE, "codex", "marketplace", "plugins",
+                            "swe-orchestrator", "skills", "swe-orchestrator",
+                            "SKILL.md")
+    try:
+        with open(packaged, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _cached_skill_hash(cache_root, version):
+    for candidate in launcher.codex_cache_paths(cache_root, version):
+        try:
+            with open(candidate, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue
+    return None
+
+
+def _set_aside_stale_codex_cache(home):
+    """Move a stale cached copy of *our own* packaged version out of the way
+    before `codex plugin add` runs, returning the aside path to finalise
+    afterwards (or None if nothing needed moving).
 
     `codex plugin add` never re-copies an already-cached version on its own
     (H6), so simply running it again after a content change with no version
@@ -492,30 +515,53 @@ def _refresh_stale_codex_cache(home):
     install.py was not actually true until this existed. Only the exact
     version directory this package declares is ever touched; an unrelated
     version some other install put there is left alone.
+
+    Moved aside rather than deleted outright: whether `add` recreates a
+    directory it did not have to make room for has not been verified, so the
+    recoverable order is to keep the old copy until a fresh one is confirmed
+    (finalise below), and restore it if `add` does nothing.
     """
     version = launcher.codex_plugin_version()
-    packaged = os.path.join(HERE, "codex", "marketplace", "plugins",
-                            "swe-orchestrator", "skills", "swe-orchestrator",
-                            "SKILL.md")
-    if not version:
-        return
-    try:
-        with open(packaged, "rb") as fh:
-            packaged_hash = hashlib.sha256(fh.read()).hexdigest()
-    except OSError:
-        return
+    packaged_hash = _packaged_skill_hash()
+    if not version or not packaged_hash:
+        return None
     cache_root = os.path.join(home, "plugins", "cache", "devinx", "swe-orchestrator")
     version_dir = os.path.join(cache_root, version)
-    for candidate in launcher.codex_cache_paths(cache_root, version):
-        try:
-            with open(candidate, "rb") as fh:
-                cached_hash = hashlib.sha256(fh.read()).hexdigest()
-        except OSError:
-            continue
-        if cached_hash != packaged_hash:
-            shutil.rmtree(version_dir, ignore_errors=True)
-            say(OK, f"cleared stale cached Codex skill: {version_dir}")
+    cached_hash = _cached_skill_hash(cache_root, version)
+    if cached_hash is None or cached_hash == packaged_hash:
+        return None  # not cached yet, or already fresh: nothing to do
+    aside = version_dir + ".stale"
+    with contextlib.suppress(OSError):
+        shutil.rmtree(aside)  # a leftover from an interrupted previous run
+    try:
+        os.replace(version_dir, aside)
+    except OSError:
+        return None
+    return aside
+
+
+def _finalise_codex_cache_refresh(aside, home):
+    """After `codex plugin add`: if a fresh copy showed up, drop the old one
+    we moved aside; otherwise restore it and say plainly that the cache is
+    still stale, rather than leaving no skill installed at all."""
+    if aside is None:
         return
+    version = launcher.codex_plugin_version()
+    packaged_hash = _packaged_skill_hash()
+    cache_root = os.path.join(home, "plugins", "cache", "devinx", "swe-orchestrator")
+    version_dir = aside[:-len(".stale")]
+    cached_hash = _cached_skill_hash(cache_root, version) if version else None
+    if cached_hash is not None and cached_hash == packaged_hash:
+        shutil.rmtree(aside, ignore_errors=True)
+        say(OK, f"refreshed the cached Codex skill: {version_dir}")
+        return
+    with contextlib.suppress(OSError):
+        if os.path.exists(version_dir):
+            shutil.rmtree(version_dir)
+        os.replace(aside, version_dir)
+    say(WARN, f"the cached Codex skill at {version_dir} is still stale - "
+              f"`codex plugin add` did not refresh it; remove that directory "
+              f"by hand and run install.py again")
 
 
 def install_codex(force):
@@ -555,7 +601,7 @@ def install_codex(force):
                      "enabled = true\n")
         say(OK, f"codex profile written: {profile}")
 
-    _refresh_stale_codex_cache(home)
+    aside = _set_aside_stale_codex_cache(home)
 
     # The plugin has to be materialised into the cache; a profile alone leaves
     # it "not installed" and the skill never loads. Same escaping concern as
@@ -568,8 +614,10 @@ def install_codex(force):
     if r.returncode:
         say(WARN, "could not install the Codex plugin:\n        "
                   + (r.stderr or r.stdout).strip()[:300])
+        _finalise_codex_cache_refresh(aside, home)
         return
     say(OK, "codex plugin installed: swe-orchestrator@devinx")
+    _finalise_codex_cache_refresh(aside, home)
     if strip_plugin_entry(os.path.join(home, "config.toml"),
                           "swe-orchestrator@devinx"):
         say(OK, "removed the global enable it wrote; the profile decides instead")

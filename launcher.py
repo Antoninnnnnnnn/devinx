@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from runtime_support import CONFIG_FIELDS, build_id, startup_lock
+from runtime_support import build_id, startup_lock
 
 def _port_env(name, default):
     """A bad DEVINX_PORT must not crash the launcher before main() ever runs
@@ -429,12 +429,19 @@ def codex_plugin_version():
 
 
 def codex_cache_paths(cache_root, version):
-    """Where SKILL.md might live under one cached plugin version - the exact
-    cache layout is observed, not documented, so both plausible shapes are
-    checked rather than assumed."""
+    """Where SKILL.md lives under one cached plugin version.
+
+    <version>/skills/swe-orchestrator/SKILL.md is the real, verified layout
+    (checked against an actual `codex plugin add` cache: same directory
+    structure, and the cached file's sha256 matched this repository's own
+    pre-edit revision of SKILL.md byte for byte - `codex plugin add` copies
+    the file verbatim, so content comparison is sound). The flat
+    <version>/SKILL.md form is not real on the installation checked, but
+    costs nothing to also try, in case a future Codex release changes this.
+    """
     version_dir = os.path.join(cache_root, version)
-    return (os.path.join(version_dir, "SKILL.md"),
-            os.path.join(version_dir, "skills", "swe-orchestrator", "SKILL.md"))
+    return (os.path.join(version_dir, "skills", "swe-orchestrator", "SKILL.md"),
+            os.path.join(version_dir, "SKILL.md"))
 
 
 def _warn_stale_codex_cache():
@@ -706,6 +713,13 @@ _DAEMON_ENV_EXACT = {
     "LC_NUMERIC", "LC_MESSAGES",
     "TMPDIR", "TMP", "TEMP",
     "LOCALAPPDATA", "APPDATA", "USERPROFILE", "SYSTEMROOT", "SystemRoot",
+    # Unverified on real Windows, but cheap to include: WINDIR/PATHEXT/
+    # COMSPEC/PROGRAMDATA are other Windows-side basics a Python subprocess
+    # can end up depending on, and USERNAME (Windows has no $USER/$LOGNAME,
+    # and getpass.getuser() falls back to it there with no pwd module to ask
+    # instead).
+    "WINDIR", "PATHEXT", "COMSPEC", "PROGRAMDATA",
+    "USERNAME", "USER", "LOGNAME",
     # requests/urllib3 read these for outbound calls to the real upstreams; an
     # allowlist that dropped them would silently break every relay behind a
     # corporate proxy or a private CA.

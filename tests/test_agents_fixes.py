@@ -233,8 +233,10 @@ class StaleCodexCacheTests(unittest.TestCase):
 
 
 class RefreshStaleCodexCacheTests(unittest.TestCase):
-    """H6: install.py must make its own "rerun install.py" remedy true by
-    actually clearing a stale cached version before `codex plugin add`."""
+    """H6: install.py must make its own "rerun install.py" remedy true, and
+    do it recoverably - moved aside and confirmed, not deleted outright,
+    since whether `codex plugin add` recreates a directory it did not have
+    to make room for is unverified."""
 
     def _package(self, here, version):
         skill_dir = os.path.join(here, "codex", "marketplace", "plugins",
@@ -249,35 +251,78 @@ class RefreshStaleCodexCacheTests(unittest.TestCase):
             import json as _json
             _json.dump({"name": "swe-orchestrator", "version": version}, fh)
 
-    def test_a_stale_version_directory_is_removed(self):
+    def _cache_dir(self, codex_home, version):
+        return os.path.join(codex_home, "plugins", "cache", "devinx",
+                            "swe-orchestrator", version)
+
+    def test_a_stale_version_is_moved_aside_then_dropped_after_success(self):
         with tempfile.TemporaryDirectory() as here, \
              tempfile.TemporaryDirectory() as codex_home:
             self._package(here, "1.1.0")
-            stale_dir = os.path.join(codex_home, "plugins", "cache", "devinx",
-                                     "swe-orchestrator", "1.1.0")
-            os.makedirs(stale_dir)
-            with open(os.path.join(stale_dir, "SKILL.md"), "w") as fh:
+            version_dir = self._cache_dir(codex_home, "1.1.0")
+            os.makedirs(version_dir)
+            with open(os.path.join(version_dir, "SKILL.md"), "w") as fh:
                 fh.write("stale content")
             with mock.patch.object(install, "HERE", here), \
                  mock.patch.object(launcher, "HERE", here), \
                  contextlib.redirect_stdout(io.StringIO()):
-                install._refresh_stale_codex_cache(codex_home)
-            self.assertFalse(os.path.exists(stale_dir))
+                aside = install._set_aside_stale_codex_cache(codex_home)
+                self.assertIsNotNone(aside)
+                self.assertFalse(os.path.exists(version_dir))
+                self.assertTrue(os.path.exists(aside))
+                # Simulate `codex plugin add` materialising a fresh copy.
+                os.makedirs(version_dir)
+                with open(os.path.join(version_dir, "SKILL.md"), "w") as fh:
+                    fh.write("current content")
+                install._finalise_codex_cache_refresh(aside, codex_home)
+            self.assertFalse(os.path.exists(aside))
+            with open(os.path.join(version_dir, "SKILL.md")) as fh:
+                self.assertEqual(fh.read(), "current content")
 
-    def test_a_fresh_version_directory_is_left_alone(self):
+    def test_a_failed_add_restores_the_old_copy_and_warns(self):
         with tempfile.TemporaryDirectory() as here, \
              tempfile.TemporaryDirectory() as codex_home:
             self._package(here, "1.1.0")
-            fresh_dir = os.path.join(codex_home, "plugins", "cache", "devinx",
-                                     "swe-orchestrator", "1.1.0")
+            version_dir = self._cache_dir(codex_home, "1.1.0")
+            os.makedirs(version_dir)
+            with open(os.path.join(version_dir, "SKILL.md"), "w") as fh:
+                fh.write("stale content")
+            stdout = io.StringIO()
+            with mock.patch.object(install, "HERE", here), \
+                 mock.patch.object(launcher, "HERE", here), \
+                 contextlib.redirect_stdout(stdout):
+                aside = install._set_aside_stale_codex_cache(codex_home)
+                # `codex plugin add` did nothing: no fresh copy shows up.
+                install._finalise_codex_cache_refresh(aside, codex_home)
+            # Recoverable: the old (stale) copy is back, not gone outright.
+            with open(os.path.join(version_dir, "SKILL.md")) as fh:
+                self.assertEqual(fh.read(), "stale content")
+            self.assertIn("still stale", stdout.getvalue())
+
+    def test_a_fresh_version_directory_is_never_moved(self):
+        with tempfile.TemporaryDirectory() as here, \
+             tempfile.TemporaryDirectory() as codex_home:
+            self._package(here, "1.1.0")
+            fresh_dir = self._cache_dir(codex_home, "1.1.0")
             os.makedirs(fresh_dir)
             with open(os.path.join(fresh_dir, "SKILL.md"), "w") as fh:
                 fh.write("current content")
             with mock.patch.object(install, "HERE", here), \
                  mock.patch.object(launcher, "HERE", here), \
                  contextlib.redirect_stdout(io.StringIO()):
-                install._refresh_stale_codex_cache(codex_home)
+                aside = install._set_aside_stale_codex_cache(codex_home)
+            self.assertIsNone(aside)
             self.assertTrue(os.path.exists(fresh_dir))
+
+    def test_no_cache_yet_is_never_moved(self):
+        with tempfile.TemporaryDirectory() as here, \
+             tempfile.TemporaryDirectory() as codex_home:
+            self._package(here, "1.1.0")
+            with mock.patch.object(install, "HERE", here), \
+                 mock.patch.object(launcher, "HERE", here), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                aside = install._set_aside_stale_codex_cache(codex_home)
+            self.assertIsNone(aside)
 
 
 if __name__ == "__main__":
