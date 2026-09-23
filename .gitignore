@@ -10,3 +10,6 @@ install-smoke.log
 # TLS material for the tailnet mount: a private key never belongs in the repo
 *.crt
 *.key
+
+# Worktrees created by agents; never part of the repo
+.claude/worktrees/
