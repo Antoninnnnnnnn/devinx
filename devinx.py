@@ -568,6 +568,13 @@ def claim_account(avoid=None):
     followed by a switch. Spreading the turns halves the rate each account sees,
     which is the difference between switching constantly and not being limited.
     """
+    if not _accounts:
+        # Nothing loaded yet, or a reload found nothing: an empty list would
+        # read as "wait for nobody" rather than as the missing credential.
+        try:
+            accounts()
+        except RuntimeError:
+            pass
     now = time.time()
     with _acct_lock:
         usable = [a for a in _accounts
@@ -575,14 +582,25 @@ def claim_account(avoid=None):
         if usable:
             _turn["n"] += 1
             return usable[_turn["n"] % len(usable)], 0.0
-        soonest = min((a["blocked_until"] for a in _accounts
-                       if a is not avoid), default=now)
+        # The avoided account counts here. Leaving it out made the answer
+        # "nothing to wait for" with a single credential — the turn was handed
+        # back at once — and with two it waited out the other one's thirty
+        # minutes when the one that just refused was back in five seconds.
+        soonest = min((a["blocked_until"] for a in _accounts), default=now)
         return None, max(0.0, soonest - now)
 
 
 def block_account(acct, seconds):
+    """Take a credential out of rotation for at least RATE_FLOOR seconds.
+
+    The upstream does say "reset in 0 seconds" — 129 times in one log — and
+    taken literally that blocks nothing: the next claim hands the same
+    credential straight back and the retry goes out on the next round trip,
+    for as long as the budget lasts. The floor is what makes every refusal
+    cost a pause.
+    """
     with _acct_lock:
-        acct["blocked_until"] = time.time() + seconds
+        acct["blocked_until"] = time.time() + max(seconds, RATE_FLOOR)
         acct["refused_at"] = time.time()
 
 
@@ -861,6 +879,8 @@ TOOL_DESC_CAPS = (None, 6000, 2500)
 # handed back as errors after waiting the full ten. A held turn is a paused
 # agent; a handed-back turn is usually a dead one.
 RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "1800"))
+# The shortest a refused credential is left alone, whatever the upstream says.
+RATE_FLOOR = float(os.environ.get("DEVINX_RATE_FLOOR", "3"))
 # The upstream's own words when the model behind it is down, as opposed to
 # refusing this account. Switching credential cannot help; waiting can.
 _OUTAGE = ("experiencing issues", "currently not available",
@@ -1390,8 +1410,17 @@ def _summarise_once(messages, model, system, previous, deadline):
     req, _ = build_request(_summary_body(messages, model, system, previous))
     t0 = time.time()
     acct, empties, outages, drops, others = None, 0, 0, 0, 0
+    # The waits are counted as well as timed, so the budget is spent by
+    # waiting even where the clock says otherwise.
+    budget, slept = deadline - t0, 0.0
+
+    def pause(seconds):
+        nonlocal slept
+        time.sleep(seconds)
+        slept += seconds
+
     while True:
-        left = deadline - time.time()
+        left = min(deadline - time.time(), budget - slept)
         if left <= 0:
             print(f"summary: {time.time() - t0:.0f}s of waiting spent without "
                   f"an answer", flush=True)
@@ -1404,7 +1433,7 @@ def _summarise_once(messages, model, system, previous, deadline):
                 print(f"summary: every credential rate limited, waiting "
                       f"{wait:.0f}s ({time.time() - t0:.0f}s so far)", flush=True)
                 _request_phase("waiting_rate_limit")
-                time.sleep(wait)
+                pause(wait)
                 continue
         texts, thinks, err = [], [], None
         for msg, e in chat_stream(req, acct, purpose="summary"):
@@ -1446,20 +1475,20 @@ def _summarise_once(messages, model, system, previous, deadline):
             print(f"summary: provider unavailable, waiting {wait:.0f}s",
                   flush=True)
             _request_phase("waiting_outage")
-            time.sleep(wait)
+            pause(wait)
             continue
         if any(t in err for t in _TRANSIENT):
             drops += 1
             wait = min(2 ** drops, 30, left)
             print(f"summary: {err[:60]}, retrying in {wait:.0f}s", flush=True)
-            time.sleep(wait)
+            pause(wait)
             continue
         if "too long" in err.lower():
             return _TOO_LONG
         others += 1
         if others <= 3:
             print(f"summary: {err[:80]}, retrying ({others}/3)", flush=True)
-            time.sleep(5 * others)
+            pause(min(5 * others, max(left, 0)))
             continue
         print(f"summary: giving up on {err[:80]}", flush=True)
         return None
@@ -2397,7 +2426,11 @@ def _run_swe(body, out):
             # Both of Cognition's limits are per account, so another credential
             # is a switch rather than a wait. Only when every one of them is
             # spent does the turn actually have to be held.
-            delay = reset_delay(err)
+            # Floored: "reset in 0 seconds" is a real answer, and read
+            # literally it made this a loop with no pause in it — two
+            # credentials handed the turn back and forth on every round trip,
+            # and a single one handed it back to the client at once.
+            delay = max(reset_delay(err), RATE_FLOOR)
             if acct is not None:
                 block_account(acct, delay)
             other, until = claim_account(avoid=acct)
@@ -2407,7 +2440,7 @@ def _run_swe(body, out):
                 acct = other
                 continue
             # Every account is blocked; wait for the first one to come back.
-            wait = min(until or delay, RATE_WAIT_BUDGET - waited)
+            wait = min(max(until, RATE_FLOOR), RATE_WAIT_BUDGET - waited)
             if wait > 0:
                 wait += random.uniform(0, min(5.0, wait * 0.1))
                 print(f"upstream rate limited on every credential, holding "
