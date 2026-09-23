@@ -4429,10 +4429,13 @@ def drain_and_exit(srv, extra_servers=(), on_closed=None):
     Repeated SIGTERM/SIGINT requests do not start competing shutdown workers.
     """
     requested = False
-    servers = (srv,) + tuple(s for s in extra_servers if s is not None)
 
     def drain():
         deadline = time.monotonic() + DRAIN_SECONDS
+        # Read at shutdown, not at setup: a listener opened late — the
+        # dashboard port waiting for a predecessor to let go of it — is in the
+        # list by then and gets closed like the others.
+        servers = (srv,) + tuple(s for s in extra_servers if s is not None)
         for server in servers:
             try:
                 server.shutdown()
@@ -4507,17 +4510,40 @@ def serve_dashboard_port(port):
               f"unset, and an unauthenticated port is not worth publishing",
               flush=True)
         return
-    try:
+    def open_it():
         srv = Server((HOST, port), DashboardHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"dashboard also on http://{HOST}:{port}/dashboard (token "
+              f"required, no API routes)", flush=True)
+        return srv
+
+    try:
+        return open_it()
     except OSError as e:
         # A port already taken must not take the proxy down with it: the
-        # dashboard is the optional half of this process.
-        print(f"dashboard port {port} not opened: {e}", flush=True)
-        return
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    print(f"dashboard also on http://{HOST}:{port}/dashboard (token required, "
-          f"no API routes)", flush=True)
-    return srv
+        # dashboard is the optional half of this process. During a deploy the
+        # predecessor still holds it for a moment — it releases the API port
+        # first — and giving up then left the published dashboard dark until
+        # the next restart. So keep trying for a minute in the background.
+        print(f"dashboard port {port} busy ({e}); retrying in the background",
+              flush=True)
+
+    def retry():
+        for _ in range(60):
+            time.sleep(1)
+            try:
+                _late_listeners.append(open_it())
+                return
+            except OSError:
+                continue
+        print(f"dashboard port {port} not opened after 60s", flush=True)
+
+    threading.Thread(target=retry, daemon=True).start()
+    return None
+
+
+# Listeners opened after startup, closed by the drain like the others.
+_late_listeners = []
 
 
 if __name__ == "__main__":
@@ -4533,7 +4559,9 @@ if __name__ == "__main__":
     print(f"devinx listening on http://{HOST}:{PORT}  "
           f"(build {BUILD}, pid {os.getpid()}, data: {DATA_DIR})", flush=True)
     _dashboard_srv = serve_dashboard_port(DASHBOARD_PORT) if DASHBOARD_PORT else None
-    drain_and_exit(_srv, (_dashboard_srv,), on_closed=_port_lock.release)
+    if _dashboard_srv is not None:
+        _late_listeners.append(_dashboard_srv)
+    drain_and_exit(_srv, _late_listeners, on_closed=_port_lock.release)
     if os.environ.get("DEVINX_DUMP"):
         print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
               f"conversation and any credentials the client sends, is being "
