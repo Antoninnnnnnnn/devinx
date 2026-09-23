@@ -1343,20 +1343,12 @@ def _render_turns(messages):
     return rendered
 
 
-def summarise_turns(messages, model, system, previous=None):
-    """Summarise dropped turns with one extra upstream call.
-
-    This is the pause. It costs a request and a few seconds, against an agent
-    that otherwise stops mid-task with nothing to show for the work it did.
-    """
-    body = {
+def _summary_body(messages, model, system, previous):
+    return {
         "model": model,
         # Room for the model to think *and* answer. At 4096 it was spending the
         # whole budget reasoning and emitting no text at all: 12 of the first
-        # 21 summary calls came back with zero characters, each one costing an
-        # agent the middle of its run, and the successful ones produced between
-        # 333 and 8167 characters. The failure was invisible until the call
-        # started logging what it returned.
+        # 21 summary calls came back with zero characters.
         "max_tokens": int(os.environ.get("DEVINX_SUMMARY_TOKENS", "16384")),
         "system": "You are summarising a coding agent's conversation so it can "
                   "continue working after its context was compacted.",
@@ -1367,15 +1359,46 @@ def summarise_turns(messages, model, system, previous=None):
             f"The agent's own instructions began: {system[:2000]}\n\n"
             + (COMPACT_PROMPT_MORE if previous else COMPACT_PROMPT)}]}],
     }
-    req, _ = build_request(body)
-    acct, _ = claim_account()
-    if acct is None:
-        # Every credential is already blocked. Try one anyway: the block is a
-        # local estimate of when a limit resets, not a fact.
-        acct = accounts()[0] if accounts() else None
-    tries = 0
+
+
+_TOO_LONG = object()
+
+
+def _summarise_once(messages, model, system, previous, deadline):
+    """One summary, waited for rather than given up on.
+
+    Every way this call used to fail is something that passes: a credential
+    refusing (another one may not), every credential refusing (they come back —
+    and on 2026-09-23 this was the whole story: 39 agents lost the middle of
+    their run because both accounts refused at the same instant and this
+    function returned None without a word), the provider being down, a dropped
+    connection, an empty answer. So each of them is waited out, up to the same
+    budget a turn gets. The client does not see the wait as silence: the
+    keepalive is armed before compaction starts.
+
+    Returns the text, None when the budget is spent or the error is not one
+    that passes, or _TOO_LONG when the transcript itself is too big to be read
+    in one call — which the caller answers by splitting it.
+    """
+    req, _ = build_request(_summary_body(messages, model, system, previous))
     t0 = time.time()
-    for _ in range(len(accounts()) + NETWORK_RETRIES + 1):
+    acct, empties, outages, drops, others = None, 0, 0, 0, 0
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            print(f"summary: {time.time() - t0:.0f}s of waiting spent without "
+                  f"an answer", flush=True)
+            return None
+        if acct is None:
+            acct, until = claim_account()
+            if acct is None:
+                wait = min(max(until or 5.0, 1.0), left)
+                wait += random.uniform(0, min(5.0, wait * 0.1))
+                print(f"summary: every credential rate limited, waiting "
+                      f"{wait:.0f}s ({time.time() - t0:.0f}s so far)", flush=True)
+                _request_phase("waiting_rate_limit")
+                time.sleep(wait)
+                continue
         texts, thinks, err = [], [], None
         for msg, e in chat_stream(req, acct, purpose="summary"):
             if e:
@@ -1392,49 +1415,136 @@ def summarise_turns(messages, model, system, previous=None):
             got = "".join(texts).strip()
             if got:
                 return got
-            if tries < NETWORK_RETRIES:
-                tries += 1
-                print(f"summary: came back empty, retrying "
-                      f"({tries}/{NETWORK_RETRIES})", flush=True)
+            empties += 1
+            if empties < 3:
+                print(f"summary: came back empty, retrying ({empties}/3)",
+                      flush=True)
                 continue
-            # Still nothing. The reasoning is not the summary the prompt asked
-            # for, but it is an account of the same turns — and the choice here
-            # is against losing them entirely.
+            # The reasoning is not the summary the prompt asked for, but it is
+            # an account of the same turns.
             fallback = "".join(thinks).strip()
             if fallback:
                 print(f"summary: falling back to the reasoning "
                       f"({len(fallback)} chars)", flush=True)
                 return fallback
             return None
-        if any(t in err for t in _TRANSIENT) and tries < NETWORK_RETRIES:
-            # The turn path retries a dropped connection; this one did not, and
-            # gave up on the first reset. Measured live: three agents in a row
-            # lost 232 blocks apiece to "no summary available" while the log
-            # showed nothing but ConnectionResetError beside it. A summary
-            # abandoned costs the agent the middle of its run; a second attempt
-            # costs a second.
-            tries += 1
-            print(f"summary: {err[:60]}, retrying ({tries}/{NETWORK_RETRIES})",
-                  flush=True)
-            time.sleep(1.0 * tries)
-            continue
-        if "resource_exhausted" not in err:
-            print(f"summary: giving up on {err[:80]}", flush=True)
-            return None
-        # Both limits are per account, so another credential is a switch and
-        # not a wait — and this call must never wait: it is already the pause
-        # the agent is paying before its own turn goes out. When every
-        # credential refuses, the summary is given up on and the turn is
-        # handled by the caller, which does know how to hold.
-        if acct is not None:
+        if "resource_exhausted" in err:
             block_account(acct, reset_delay(err))
-        other, _until = claim_account(avoid=acct)
-        if other is None:
-            return None
-        print(f"summary: rate limited on {acct['name'] if acct else '?'}, "
-              f"retrying on {other['name']}", flush=True)
-        acct = other
-    return None
+            print(f"summary: rate limited on {acct['name']}", flush=True)
+            acct = None          # claim again: another account, or a wait
+            continue
+        if any(t in err for t in _OUTAGE):
+            outages += 1
+            wait = min(15 * 2 ** (outages - 1), 120, left)
+            print(f"summary: provider unavailable, waiting {wait:.0f}s",
+                  flush=True)
+            _request_phase("waiting_outage")
+            time.sleep(wait)
+            continue
+        if any(t in err for t in _TRANSIENT):
+            drops += 1
+            wait = min(2 ** drops, 30, left)
+            print(f"summary: {err[:60]}, retrying in {wait:.0f}s", flush=True)
+            time.sleep(wait)
+            continue
+        if "too long" in err.lower():
+            return _TOO_LONG
+        others += 1
+        if others <= 3:
+            print(f"summary: {err[:80]}, retrying ({others}/3)", flush=True)
+            time.sleep(5 * others)
+            continue
+        print(f"summary: giving up on {err[:80]}", flush=True)
+        return None
+
+
+def _digest_turns(messages, cap=48000):
+    """What the dropped turns did, written by the proxy itself.
+
+    The last resort, used only when the summariser could not be reached within
+    the whole wait budget. It is not a summary — it says what was done and not
+    why — but it is a record, and a record is what the agent needs to avoid
+    redoing its own work. Dropping the turns with nothing in their place is the
+    one outcome this exists to rule out.
+    """
+    lines = []
+    for m in messages:
+        for b in _blocks(m.get("content")):
+            kind = b.get("type")
+            if kind == "text" and b.get("text", "").strip():
+                who = "agent" if m.get("role") == "assistant" else "input"
+                lines.append(f"[{who}] {b['text'].strip()[:400]}")
+            elif kind == "tool_use":
+                args = b.get("input") or {}
+                key = next((str(args[k]) for k in ("file_path", "command",
+                            "pattern", "path", "url", "description")
+                            if args.get(k)), json.dumps(args)[:160])
+                lines.append(f"[call {b.get('name')}] {key[:240]}")
+            elif kind == "tool_result":
+                text = _tool_result_text(b).strip().splitlines()
+                head = text[0][:160] if text else ""
+                flag = " (error)" if b.get("is_error") else ""
+                lines.append(f"  -> {head}{flag}")
+    out = "\n".join(lines)
+    if len(out) > cap:
+        # Keep both ends: how the span started and, above all, how it ended.
+        keep = cap // 2
+        out = (out[:keep] + f"\n… [{len(out) - cap} characters of the record "
+               f"omitted] …\n" + out[-keep:])
+    return ("Mechanical record of the compacted turns — the summariser could "
+            "not be reached, so this lists what was done rather than why. "
+            "Check the working tree before relying on it.\n\n" + out)
+
+
+def _chunks(messages, cap):
+    """Consecutive runs of messages whose transcript fits in one summary call."""
+    out, cur, size = [], [], 0
+    for m in messages:
+        n = len(_render_turns([m]))
+        if cur and size + n > cap:
+            out.append(cur)
+            cur, size = [], 0
+        cur.append(m)
+        size += n
+    if cur:
+        out.append(cur)
+    return out
+
+
+def summarise_turns(messages, model, system, previous=None, never_empty=True):
+    """Summarise dropped turns. With never_empty, this always returns a text.
+
+    A span too big for one call is summarised in pieces, each one extending the
+    summary of the pieces before it, rather than having its beginning cut off
+    to fit. A piece the summariser cannot be reached for within the wait budget
+    gets the proxy's own mechanical record instead of nothing. The fold of an
+    existing summary passes never_empty=False: there, keeping the summary as it
+    is beats replacing it with a record of it.
+    """
+    if not messages:
+        return None
+    deadline = time.time() + RATE_WAIT_BUDGET
+    summary, added = previous, []
+    pending = _chunks(messages, SUMMARY_INPUT_CAP)
+    if len(pending) > 1:
+        print(f"summary: {len(messages)} turns in {len(pending)} pieces",
+              flush=True)
+    while pending:
+        piece = pending.pop(0)
+        got = _summarise_once(piece, model, system, summary, deadline)
+        if got is _TOO_LONG and len(piece) > 1:
+            half = len(piece) // 2
+            pending[:0] = [piece[:half], piece[half:]]
+            continue
+        if got is _TOO_LONG or not got:
+            if not never_empty:
+                return None
+            got = _digest_turns(piece)
+            print(f"summary: using a mechanical record for {len(piece)} turns",
+                  flush=True)
+        added.append(got)
+        summary = f"{summary}\n\n{got}" if summary else got
+    return "\n\n".join(added)
 
 
 # Below this many calls collapsed into one message the shape is just an agent
@@ -1730,7 +1840,7 @@ def _compact_body(body):
             # short call against a record that would otherwise never stop.
             folded = summarise_turns(
                 [{"role": "user", "content": [{"type": "text", "text": summary}]}],
-                model, _system_text(body), None)
+                model, _system_text(body), None, never_empty=False)
             if folded:
                 print(f"compaction: summary folded, {len(summary) // 4} -> "
                       f"{len(folded) // 4} tokens", flush=True)

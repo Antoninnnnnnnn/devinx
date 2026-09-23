@@ -932,6 +932,95 @@ class HoldTests(unittest.TestCase):
         self.assertGreaterEqual(devinx.RATE_WAIT_BUDGET, 1800)
 
 
+class SummaryNeverAbandonedTests(unittest.TestCase):
+    """The summary is waited for, split if too big, and never replaced by nothing.
+
+    On 2026-09-23, 39 agents lost the middle of their run because both accounts
+    refused the summary call at the same instant and the summariser returned
+    None without a log line.
+    """
+
+    class Msg:
+        def __init__(self, text):
+            self.delta_text = text
+            self.delta_thinking = None
+
+    TURNS = [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read",
+                 "input": {"file_path": "/src/app.py"}}]},
+             {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1",
+                 "content": "def main(): pass"}]}]
+
+    def _run(self, errors, claims=None, **kw):
+        calls = []
+
+        def fake(req, acct=None, purpose="turn"):
+            calls.append(acct)
+            if len(calls) <= len(errors):
+                yield None, errors[len(calls) - 1]
+                return
+            yield self.Msg("SUMMARY"), None
+
+        claims = list(claims or [])
+        acct = {"name": "a", "blocked_until": 0}
+
+        def claim(avoid=None):
+            return claims.pop(0) if claims else (acct, 0.0)
+
+        with mock.patch.object(devinx, "chat_stream", fake), \
+             mock.patch.object(devinx, "build_request", lambda b, **k: (None, None)), \
+             mock.patch.object(devinx, "claim_account", claim), \
+             mock.patch.object(devinx, "block_account", lambda a, s: None), \
+             mock.patch.object(devinx.time, "sleep", lambda s: None):
+            out = devinx.summarise_turns(self.TURNS, "swe-2-max", "sys", **kw)
+        return out, calls
+
+    def test_every_credential_refusing_is_waited_out(self):
+        # Both accounts blocked when the summary starts: before, None at once.
+        out, calls = self._run([], claims=[(None, 20.0), (None, 5.0)])
+        self.assertEqual(out, "SUMMARY")
+
+    def test_a_refusal_then_every_credential_blocked_is_waited_out(self):
+        out, calls = self._run(["resource_exhausted: reset in 30 seconds"],
+                               claims=[({"name": "a"}, 0.0), (None, 30.0)])
+        self.assertEqual(out, "SUMMARY")
+
+    def test_a_provider_outage_is_waited_out(self):
+        out, _ = self._run(["unimplemented: The third-party model provider is "
+                            "experiencing issues and is currently not available."] * 3)
+        self.assertEqual(out, "SUMMARY")
+
+    def test_dropped_connections_are_retried_past_two(self):
+        out, _ = self._run(["upstream ConnectionResetError: reset"] * 5)
+        self.assertEqual(out, "SUMMARY")
+
+    def test_a_spent_budget_gives_a_record_not_nothing(self):
+        with mock.patch.object(devinx, "RATE_WAIT_BUDGET", 0):
+            out, _ = self._run([])
+        self.assertIn("Mechanical record", out)
+        self.assertIn("/src/app.py", out, "the record lost what was done")
+
+    def test_the_fold_keeps_its_summary_rather_than_a_record(self):
+        with mock.patch.object(devinx, "RATE_WAIT_BUDGET", 0):
+            out, _ = self._run([], never_empty=False)
+        self.assertIsNone(out)
+
+    def test_a_transcript_too_long_is_split_not_cut(self):
+        seen = []
+
+        def once(piece, model, system, previous, deadline):
+            seen.append(len(piece))
+            return devinx._TOO_LONG if len(piece) > 1 else f"S{len(seen)}"
+
+        turns = self.TURNS * 2
+        with mock.patch.object(devinx, "_summarise_once", once):
+            out = devinx.summarise_turns(turns, "swe-2-max", "sys")
+        self.assertNotIn("Mechanical record", out)
+        self.assertEqual(sum(1 for n in seen if n == 1), len(turns),
+                         "some turns were never summarised")
+
+
 class MessageIdTests(unittest.TestCase):
     """The constant that collapsed every run into three messages.
 
