@@ -1605,6 +1605,10 @@ COMPACT_PROMPT_MORE = """Your task is to create a detailed summary of the RECENT
 
 _summary_lock = threading.Lock()
 _summaries = {}
+# Summaries kept per conversation key: enough for a few runs sharing one key
+# (parallel subagents with the same prompt and task, a resume) not to evict
+# each other's.
+SUMMARIES_PER_KEY = 4
 _summary_flights = {}
 COMPACT_STRICT = os.environ.get("DEVINX_COMPACT_STRICT") == "1"
 
@@ -1634,7 +1638,7 @@ def _block_hashes(span):
                  for pair in span)
 
 
-def _uncovered_blocks(span, previous, flattened=False):
+def _uncovered_blocks(span, previous, flattened=False, hashes=None):
     """Return new blocks, or None if previously summarised content changed.
 
     Ordinary histories must extend a prefix. Legacy flattened histories insert
@@ -1642,7 +1646,8 @@ def _uncovered_blocks(span, previous, flattened=False):
     and every inserted block must still be carried or summarised (not skipped
     using the old block count).
     """
-    hashes = _block_hashes(span)
+    if hashes is None:
+        hashes = _block_hashes(span)
     if not flattened:
         if hashes[:len(previous)] != previous:
             return None
@@ -2106,27 +2111,36 @@ def _compact_body(body):
     key = _conv_key(body)
     span = _span_blocks(messages, start)
     total_blocks = _count_blocks(messages)
-    with _summary_lock:
-        covered, summary, built_at, covered_hashes = _summaries.get(
-            key, (0, None, 0, ()))
+    # Several summaries per key, each good for exactly the history it covers.
     # A resumed agent is the same task under the same system prompt in the same
-    # session, so it hashes to the same key — and would inherit the summary of
-    # the run that failed, then extend it rather than rebuild it, so each resume
-    # starts further from the truth than the last. A conversation that is
-    # suddenly shorter than when the summary was built is a new run, not a
-    # continuation: the summary is dropped and rebuilt from what is actually
-    # there. Only the summary is reset; the cascade id stays, because that is
-    # what keeps the upstream prefix cache and it is worth about 60% of the
-    # input tokens.
-    if summary is not None and total_blocks < built_at:
-        print(f"compaction: conversation restarted ({total_blocks} blocks, was "
-              f"{built_at}); dropping the summary from the previous run",
-              flush=True)
-        covered, summary, covered_hashes = 0, None, ()
-    fresh = _uncovered_blocks(span, covered_hashes, _is_flattened(messages))
-    if fresh is None:
-        print("compaction: covered content changed; rebuilding the summary", flush=True)
+    # session, so it hashes to the same key — and so do two subagents launched
+    # in parallel with the same prompt and the same first task. With one
+    # summary per key, a resume inherited the failed run's summary, and the
+    # two parallel runs took turns throwing each other's away ("conversation
+    # restarted") and rebuilding their own, on every turn. A summary is now
+    # used only when the blocks it covers are still, unchanged, the start of
+    # this history; each run finds its own and a restarted one finds none.
+    # Only the summary is chosen this way; the cascade id stays the key's,
+    # because that is what keeps the upstream prefix cache and it is worth
+    # about 60% of the input tokens.
+    flattened = _is_flattened(messages)
+    span_hashes = _block_hashes(span)
+    with _summary_lock:
+        stored = list(_summaries.get(key) or ())
+    entry, fresh = None, None
+    for candidate in sorted(stored, key=lambda e: len(e[3]), reverse=True):
+        got = _uncovered_blocks(span, candidate[3], flattened, span_hashes)
+        if got is not None:
+            entry, fresh = candidate, got
+            break
+    if entry is None:
+        if stored:
+            print(f"compaction: none of the {len(stored)} summaries kept for "
+                  f"this conversation covers its history; building a new one",
+                  flush=True)
         covered, summary, covered_hashes, fresh = 0, None, (), span
+    else:
+        covered, summary, _, covered_hashes = entry
     retained = ""
     if COMPACT_STRICT:
         user_text = [b.get("text", "") for role, b in span
@@ -2194,13 +2208,15 @@ def _compact_body(body):
                 summary = folded
         if new:
             covered = len(span)
-            covered_hashes = _block_hashes(span)
+            covered_hashes = span_hashes
             fresh = []
         with _summary_lock:
             # Bounded insertion-order eviction, not a fleet-wide cache wipe.
             if key not in _summaries and len(_summaries) >= 64:
                 _summaries.pop(next(iter(_summaries)))
-            _summaries[key] = (covered, summary, total_blocks, covered_hashes)
+            kept = [e for e in (_summaries.get(key) or ()) if e is not entry]
+            _summaries[key] = (kept + [(covered, summary, total_blocks,
+                                        covered_hashes)])[-SUMMARIES_PER_KEY:]
         if new:
             print(f"compaction: {fresh_count} more blocks summarised "
                   f"({covered} of {len(span)} covered, {before} tokens "

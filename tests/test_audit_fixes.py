@@ -801,5 +801,57 @@ class DocumentBlockTests(unittest.TestCase):
         self.assertGreater(devinx.estimate_tokens(body), 9000)
 
 
+class SharedKeySummaryTests(unittest.TestCase):
+    """P12: two runs sharing a conversation key keep a summary each."""
+
+    @staticmethod
+    def run_body(tag, turns):
+        messages = [{'role': 'user', 'content': 'Same first task.'}]
+        for i in range(turns):
+            messages.append({'role': 'assistant', 'content': f'{tag} step {i}: ' + 'x' * 600})
+            messages.append({'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': f'{tag}{i}', 'content': 'y' * 600}]})
+        messages.append({'role': 'assistant', 'content': f'{tag} continues.'})
+        return {'model': 'swe-2-max', 'system': 'same agent',
+                'metadata': {'user_id': 'same-session'}, 'messages': messages}
+
+    def test_parallel_runs_do_not_rebuild_each_others_summary(self):
+        calls = []
+
+        def summarise(messages, model, system, previous=None, never_empty=True):
+            calls.append(previous)
+            return f'summary {len(calls)}'
+
+        self.assertEqual(devinx._conv_key(self.run_body('A', 10)),
+                         devinx._conv_key(self.run_body('B', 10)))
+        log = io.StringIO()
+        with mock.patch.object(devinx, '_summaries', {}), \
+             mock.patch.object(devinx, '_summary_flights', {}), \
+             mock.patch.object(devinx, 'COMPACT_AT', 1200), \
+             mock.patch.object(devinx, 'COMPACT_STRICT', False), \
+             mock.patch.object(devinx, 'summarise_turns', side_effect=summarise), \
+             contextlib.redirect_stdout(log):
+            devinx.compact_body(self.run_body('A', 10))
+            devinx.compact_body(self.run_body('B', 10))
+            first_round = len(calls)
+            for turns in (14, 18):
+                for tag in ('A', 'B'):
+                    out = devinx.compact_body(self.run_body(tag, turns))
+                    other = 'B' if tag == 'A' else 'A'
+                    self.assertNotIn(f'{other} step', json.dumps(out['messages'][1]))
+        self.assertEqual(first_round, 2)
+        self.assertGreater(len(calls), first_round, 'the fixture never grew')
+        self.assertTrue(all(p is not None for p in calls[first_round:]),
+                        f'a run rebuilt its summary from scratch: {calls}')
+        # Only B's first compaction found nothing of its own (A's was there).
+        self.assertEqual(log.getvalue().count('none of the'), 1)
+
+    def test_cascade_id_stays_stable_for_one_agent(self):
+        with mock.patch.object(devinx, 'api_key', return_value='test-only'):
+            a = devinx.build_request(self.run_body('A', 3))[0].cascade_id
+            b = devinx.build_request(self.run_body('A', 9))[0].cascade_id
+        self.assertEqual(a, b)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
