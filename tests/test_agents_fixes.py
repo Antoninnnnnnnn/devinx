@@ -147,19 +147,29 @@ class ClaudeConfigDirTests(unittest.TestCase):
 
 
 class StaleCodexCacheTests(unittest.TestCase):
-    """H6: a cached Codex skill that no longer matches the packaged one
-    should be detected and reported, not silently served stale."""
+    """H6: a cached Codex skill that no longer matches the *packaged version's
+    own* cache directory should be detected and reported - and only that
+    version, so upgrading does not keep warning about an old, unrelated one."""
 
-    def test_a_mismatched_cache_warns(self):
+    def _package(self, here, version):
+        skill_dir = os.path.join(here, "codex", "marketplace", "plugins",
+                                 "swe-orchestrator", "skills", "swe-orchestrator")
+        os.makedirs(skill_dir)
+        with open(os.path.join(skill_dir, "SKILL.md"), "w") as fh:
+            fh.write("current content")
+        manifest_dir = os.path.join(here, "codex", "marketplace", "plugins",
+                                    "swe-orchestrator", ".codex-plugin")
+        os.makedirs(manifest_dir)
+        with open(os.path.join(manifest_dir, "plugin.json"), "w") as fh:
+            import json as _json
+            _json.dump({"name": "swe-orchestrator", "version": version}, fh)
+
+    def test_a_mismatched_cache_for_the_packaged_version_warns(self):
         with tempfile.TemporaryDirectory() as here, \
              tempfile.TemporaryDirectory() as codex_home:
-            skill_dir = os.path.join(here, "codex", "marketplace", "plugins",
-                                     "swe-orchestrator", "skills", "swe-orchestrator")
-            os.makedirs(skill_dir)
-            with open(os.path.join(skill_dir, "SKILL.md"), "w") as fh:
-                fh.write("current content")
+            self._package(here, "1.1.0")
             cache_dir = os.path.join(codex_home, "plugins", "cache", "devinx",
-                                     "swe-orchestrator", "1.0.0")
+                                     "swe-orchestrator", "1.1.0")
             os.makedirs(cache_dir)
             with open(os.path.join(cache_dir, "SKILL.md"), "w") as fh:
                 fh.write("stale content")
@@ -173,22 +183,101 @@ class StaleCodexCacheTests(unittest.TestCase):
     def test_a_matching_cache_is_silent(self):
         with tempfile.TemporaryDirectory() as here, \
              tempfile.TemporaryDirectory() as codex_home:
-            skill_dir = os.path.join(here, "codex", "marketplace", "plugins",
-                                     "swe-orchestrator", "skills", "swe-orchestrator")
-            os.makedirs(skill_dir)
-            with open(os.path.join(skill_dir, "SKILL.md"), "w") as fh:
-                fh.write("same content")
+            self._package(here, "1.1.0")
             cache_dir = os.path.join(codex_home, "plugins", "cache", "devinx",
                                      "swe-orchestrator", "1.1.0")
             os.makedirs(cache_dir)
             with open(os.path.join(cache_dir, "SKILL.md"), "w") as fh:
-                fh.write("same content")
+                fh.write("current content")
             stderr = io.StringIO()
             with mock.patch.object(launcher, "HERE", here), \
                  mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}, clear=False), \
                  contextlib.redirect_stderr(stderr):
                 launcher._warn_stale_codex_cache()
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_an_unrelated_older_version_does_not_warn_after_upgrading(self):
+        """The bug this replaces: comparing every cached version meant a
+        leftover 1.0.0 directory kept warning forever after upgrading to
+        1.1.0, even once 1.1.0's own cache was perfectly fresh."""
+        with tempfile.TemporaryDirectory() as here, \
+             tempfile.TemporaryDirectory() as codex_home:
+            self._package(here, "1.1.0")
+            fresh = os.path.join(codex_home, "plugins", "cache", "devinx",
+                                 "swe-orchestrator", "1.1.0")
+            os.makedirs(fresh)
+            with open(os.path.join(fresh, "SKILL.md"), "w") as fh:
+                fh.write("current content")
+            stale = os.path.join(codex_home, "plugins", "cache", "devinx",
+                                 "swe-orchestrator", "1.0.0")
+            os.makedirs(stale)
+            with open(os.path.join(stale, "SKILL.md"), "w") as fh:
+                fh.write("old content, from before the version bump")
+            stderr = io.StringIO()
+            with mock.patch.object(launcher, "HERE", here), \
+                 mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}, clear=False), \
+                 contextlib.redirect_stderr(stderr):
+                launcher._warn_stale_codex_cache()
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_missing_for_the_packaged_version_says_not_installed(self):
+        with tempfile.TemporaryDirectory() as here, \
+             tempfile.TemporaryDirectory() as codex_home:
+            self._package(here, "1.1.0")
+            stderr = io.StringIO()
+            with mock.patch.object(launcher, "HERE", here), \
+                 mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}, clear=False), \
+                 contextlib.redirect_stderr(stderr):
+                launcher._warn_stale_codex_cache()
+        self.assertIn("nothing for version 1.1.0", stderr.getvalue())
+
+
+class RefreshStaleCodexCacheTests(unittest.TestCase):
+    """H6: install.py must make its own "rerun install.py" remedy true by
+    actually clearing a stale cached version before `codex plugin add`."""
+
+    def _package(self, here, version):
+        skill_dir = os.path.join(here, "codex", "marketplace", "plugins",
+                                 "swe-orchestrator", "skills", "swe-orchestrator")
+        os.makedirs(skill_dir)
+        with open(os.path.join(skill_dir, "SKILL.md"), "w") as fh:
+            fh.write("current content")
+        manifest_dir = os.path.join(here, "codex", "marketplace", "plugins",
+                                    "swe-orchestrator", ".codex-plugin")
+        os.makedirs(manifest_dir)
+        with open(os.path.join(manifest_dir, "plugin.json"), "w") as fh:
+            import json as _json
+            _json.dump({"name": "swe-orchestrator", "version": version}, fh)
+
+    def test_a_stale_version_directory_is_removed(self):
+        with tempfile.TemporaryDirectory() as here, \
+             tempfile.TemporaryDirectory() as codex_home:
+            self._package(here, "1.1.0")
+            stale_dir = os.path.join(codex_home, "plugins", "cache", "devinx",
+                                     "swe-orchestrator", "1.1.0")
+            os.makedirs(stale_dir)
+            with open(os.path.join(stale_dir, "SKILL.md"), "w") as fh:
+                fh.write("stale content")
+            with mock.patch.object(install, "HERE", here), \
+                 mock.patch.object(launcher, "HERE", here), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                install._refresh_stale_codex_cache(codex_home)
+            self.assertFalse(os.path.exists(stale_dir))
+
+    def test_a_fresh_version_directory_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as here, \
+             tempfile.TemporaryDirectory() as codex_home:
+            self._package(here, "1.1.0")
+            fresh_dir = os.path.join(codex_home, "plugins", "cache", "devinx",
+                                     "swe-orchestrator", "1.1.0")
+            os.makedirs(fresh_dir)
+            with open(os.path.join(fresh_dir, "SKILL.md"), "w") as fh:
+                fh.write("current content")
+            with mock.patch.object(install, "HERE", here), \
+                 mock.patch.object(launcher, "HERE", here), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                install._refresh_stale_codex_cache(codex_home)
+            self.assertTrue(os.path.exists(fresh_dir))
 
 
 if __name__ == "__main__":

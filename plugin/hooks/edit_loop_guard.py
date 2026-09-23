@@ -24,8 +24,11 @@ So this counts, but only a run of the SAME attempt going nowhere:
   penalised once it has actually worked.
 - PostToolUse on a Read forgives every attempt recorded against that file: the
   refusal's own remedy ("read it again") is what un-blocks it.
-- SessionStart clears this session's state outright, --resume included: a
-  loop from a previous run is not evidence about this one.
+- SessionStart clears this session's state on startup, --resume and --clear
+  (a loop from a previous run is not evidence about this one), but not on
+  compact or fork: a long session auto-compacting repeatedly must not hand
+  itself three fresh attempts on every compaction, which would let the exact
+  loop this hook exists to stop keep going, just slower.
 
 One acknowledged gap: a call denied by a *different* hook (ownership_guard,
 or the interactive permission prompt) still increments here, because the
@@ -98,6 +101,14 @@ def _cleanup_old(directory, max_age=MAX_AGE_SECONDS):
     except OSError:
         return
     for name in names:
+        # A lock file's mtime is set once, at creation, and flock() never
+        # touches it again - judging a *lock* file's age this way would
+        # remove one still guarding a long-lived session's state file, and a
+        # concurrent holder would keep the old inode while a newcomer
+        # creates a fresh one, landing two processes in the same critical
+        # section at once.
+        if name.endswith(".lock"):
+            continue
         path = os.path.join(directory, name)
         try:
             if os.path.getmtime(path) < cutoff:
@@ -216,10 +227,28 @@ def _clear_file(path, target):
 
 
 def _clear_session(session):
-    with contextlib.suppress(OSError):
-        os.remove(state_path(session))
-    with contextlib.suppress(OSError):
-        os.remove(state_path(session) + ".lock")
+    """Empty the state, but never unlink the lock file itself.
+
+    runtime_support.startup_lock's own comment says why: a concurrent holder
+    keeps the old inode open regardless of what the directory entry now
+    points to, so unlinking it lets a newcomer create a fresh inode and lock
+    it while the original holder still believes it holds the only lock -
+    two processes end up in the critical section at once. Clearing the
+    *content* under the existing lock has none of that problem.
+    """
+    path = state_path(session)
+    with _locked(path):
+        _save(path, {})
+
+
+# SessionStart fires for more than "a genuinely new run": Claude Code's own
+# settings.json shows `source` distinguishing startup/resume/clear/compact/
+# fork, and a long main session auto-compacting repeatedly must not hand
+# itself three fresh attempts on every compaction - that would let exactly
+# the loop this hook exists to stop keep going, just slower. Resuming a
+# previous run, or clearing/starting fresh, are the cases state should not
+# survive; mid-session compaction is not one of them.
+_SESSION_CLEARING_SOURCES = frozenset({"startup", "resume", "clear"})
 
 
 def main():
@@ -234,7 +263,8 @@ def main():
     session = event.get("session_id")
 
     if hook_event == "SessionStart":
-        _clear_session(session)
+        if event.get("source") in _SESSION_CLEARING_SOURCES:
+            _clear_session(session)
         return 0
 
     tool = event.get("tool_name")

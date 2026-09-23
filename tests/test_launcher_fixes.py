@@ -71,6 +71,20 @@ class PlainFlagTests(unittest.TestCase):
         self.assertFalse(use_devin)
         self.assertEqual(out, [])
 
+    def test_plain_also_cancels_the_orchestrator_default(self):
+        # Otherwise --explain would report the orchestrator on while the
+        # proxy it depends on is off.
+        with mock.patch.dict(os.environ, {"DEVINX_ORCHESTRATOR": "1"}, clear=False):
+            use_devin, use_orch, _, _ = launcher.split_args(["--plain"])
+        self.assertFalse(use_devin)
+        self.assertFalse(use_orch)
+
+    def test_an_explicit_or_flag_still_wins_over_plain(self):
+        with mock.patch.dict(os.environ, {"DEVINX_ORCHESTRATOR": "1"}, clear=False):
+            use_devin, use_orch, _, _ = launcher.split_args(["--plain", "--or"])
+        self.assertTrue(use_devin)
+        self.assertTrue(use_orch)
+
 
 class OrchestratorImpliesDevinTests(unittest.TestCase):
     """L5: DEVINX_ORCHESTRATOR=1 alone must act like --or."""
@@ -303,13 +317,30 @@ class ValidateEnvTests(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             self.assertEqual(launcher._port_env("DEVINX_PORT", 8316), 8316)
 
+    def test_a_fractional_value_is_rejected_for_an_int_only_setting(self):
+        # devinx.py parses DEVINX_RATE_WAIT with int(), not float(): a value
+        # that passes float() but not int() must still be caught here, or the
+        # launcher says "valid" and the daemon dies on import right after.
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"DEVINX_RATE_WAIT": "1.5"}, clear=False), \
+             contextlib.redirect_stderr(stderr):
+            self.assertFalse(launcher._validate_devinx_env())
+        self.assertIn("DEVINX_RATE_WAIT", stderr.getvalue())
+
+    def test_previously_unvalidated_variables_are_now_checked(self):
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"DEVINX_PACE": "x"}, clear=False), \
+             contextlib.redirect_stderr(stderr):
+            self.assertFalse(launcher._validate_devinx_env())
+        self.assertIn("DEVINX_PACE", stderr.getvalue())
+
 
 class LockTimeoutTests(unittest.TestCase):
     """L9: a waiting launcher must outlast the holder's own worst case."""
 
     def test_lock_wait_exceeds_the_single_start_timeout(self):
         source = __import__("inspect").getsource(launcher.ensure_service)
-        self.assertIn("START_TIMEOUT + 25", source)
+        self.assertIn("START_TIMEOUT + 35", source)
 
 
 class DaemonEnvAllowlistTests(unittest.TestCase):

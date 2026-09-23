@@ -287,11 +287,12 @@ Both fail open on anything they cannot parse: a hook erroring out must never
 be the reason a legitimate edit is blocked.
 
 `hooks.json`'s commands resolve `python3`, then `python`, then `py` at
-invocation time through a POSIX shell (`command -v`); on Windows, where hook
-commands are not run through a POSIX shell, this resolution does not apply,
-so a `python` reachable exactly that way on PATH is required for the hooks to
-run there at all. A missing interpreter means the hooks silently do not load
-— not that anything is refused wrongly.
+invocation time using `command -v`, which needs a POSIX shell. **Untested**
+on Windows: if Claude Code runs hook commands through Git Bash there, this
+resolves the same way it does on Linux/macOS; if it uses `cmd.exe` instead,
+`command -v` is not a command it understands and the hooks do not run at
+all. Either way, a missing or unusable interpreter means the hooks silently
+do not load — not that anything is refused wrongly.
 
 ## Choosing a tier by hand
 

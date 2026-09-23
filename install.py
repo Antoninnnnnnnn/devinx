@@ -11,6 +11,7 @@ standard library only, so it runs before any dependency exists.
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -170,7 +171,17 @@ def make_venv(force, port=None):
     uv = shutil.which("uv")
 
     if force and port is not None:
-        running = _running_service(port)
+        # DEVINX_PORT in the environment (what launcher.PORT reads) may
+        # differ from --port (what a *new* wrapper script would be given):
+        # a service already running under the former is just as much at risk
+        # from clearing this venv as one on the latter.
+        ports = {port, launcher.PORT}
+        running = None
+        for candidate in ports:
+            running = _running_service(candidate)
+            if running:
+                port = candidate
+                break
         if running:
             pid = running.get("pid")
             hint = f" ({launcher._kill_hint(pid)})" if isinstance(pid, int) else ""
@@ -471,6 +482,42 @@ def strip_plugin_entry(path, entry):
     return removed
 
 
+def _refresh_stale_codex_cache(home):
+    """Clear a cached copy of *our own* packaged version if it does not match
+    what we are about to install.
+
+    `codex plugin add` never re-copies an already-cached version on its own
+    (H6), so simply running it again after a content change with no version
+    bump does nothing - the launcher's warning that told the user to rerun
+    install.py was not actually true until this existed. Only the exact
+    version directory this package declares is ever touched; an unrelated
+    version some other install put there is left alone.
+    """
+    version = launcher.codex_plugin_version()
+    packaged = os.path.join(HERE, "codex", "marketplace", "plugins",
+                            "swe-orchestrator", "skills", "swe-orchestrator",
+                            "SKILL.md")
+    if not version:
+        return
+    try:
+        with open(packaged, "rb") as fh:
+            packaged_hash = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return
+    cache_root = os.path.join(home, "plugins", "cache", "devinx", "swe-orchestrator")
+    version_dir = os.path.join(cache_root, version)
+    for candidate in launcher.codex_cache_paths(cache_root, version):
+        try:
+            with open(candidate, "rb") as fh:
+                cached_hash = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue
+        if cached_hash != packaged_hash:
+            shutil.rmtree(version_dir, ignore_errors=True)
+            say(OK, f"cleared stale cached Codex skill: {version_dir}")
+        return
+
+
 def install_codex(force):
     """Install the Codex side: a profile file, and the plugin cache it needs.
 
@@ -507,6 +554,8 @@ def install_codex(force):
                      '[plugins."swe-orchestrator@devinx"]\n'
                      "enabled = true\n")
         say(OK, f"codex profile written: {profile}")
+
+    _refresh_stale_codex_cache(home)
 
     # The plugin has to be materialised into the cache; a profile alone leaves
     # it "not installed" and the skill never loads. Same escaping concern as

@@ -198,7 +198,12 @@ def split_args(argv):
             continue
         out.append(a)
     if plain and not explicit:
+        # Cancel the orchestrator default too: DEVINX_ORCHESTRATOR=1 turning
+        # use_orch on above is exactly the same kind of ambient default
+        # DEVINX_ALWAYS is, and leaving it set here would report the
+        # orchestrator as enabled while the proxy it depends on is off.
         use_devin = False
+        use_orch = False
     return use_devin, use_orch, use_codex, out
 
 
@@ -407,20 +412,42 @@ def codex_args(orchestrate, add_profile=True):
     if add_profile and os.path.exists(
             os.path.join(codex_home(), "devinx.config.toml")):
         args += ["-p", "devinx"]
-    _warn_stale_codex_cache()
+        _warn_stale_codex_cache()
     return args
+
+
+def codex_plugin_version():
+    """The version this package's Codex plugin manifest declares - the same
+    string `codex plugin add` uses to key its cache directory."""
+    manifest = os.path.join(HERE, "codex", "marketplace", "plugins",
+                            "swe-orchestrator", ".codex-plugin", "plugin.json")
+    try:
+        with open(manifest, encoding="utf-8") as fh:
+            return json.load(fh).get("version")
+    except (OSError, ValueError):
+        return None
+
+
+def codex_cache_paths(cache_root, version):
+    """Where SKILL.md might live under one cached plugin version - the exact
+    cache layout is observed, not documented, so both plausible shapes are
+    checked rather than assumed."""
+    version_dir = os.path.join(cache_root, version)
+    return (os.path.join(version_dir, "SKILL.md"),
+            os.path.join(version_dir, "skills", "swe-orchestrator", "SKILL.md"))
 
 
 def _warn_stale_codex_cache():
     """`codex plugin add` materialises the skill into a version-keyed cache
-    directory and never re-copies an already-cached version, even when its
-    content changed underneath it (a package upgrade with no version bump
-    used to be exactly that). This compares content, not just a version
-    string, so drift is caught even if a future bump is again forgotten.
-
-    The exact cache layout is observed, not documented, so both plausible
-    shapes are checked rather than assumed.
+    directory and does not re-copy an already-cached version, even when its
+    content changed underneath it with no version bump. Comparing only the
+    *packaged* version's own directory (not every version ever cached) means
+    upgrading to a new version, which gets its own fresh directory, does not
+    keep warning about an old one nothing refers to any more.
     """
+    version = codex_plugin_version()
+    if not version:
+        return
     packaged = os.path.join(HERE, "codex", "marketplace", "plugins",
                             "swe-orchestrator", "skills", "swe-orchestrator",
                             "SKILL.md")
@@ -431,27 +458,23 @@ def _warn_stale_codex_cache():
         return
     cache_root = os.path.join(codex_home(), "plugins", "cache", "devinx",
                               "swe-orchestrator")
-    try:
-        versions = os.listdir(cache_root)
-    except OSError:
+    for candidate in codex_cache_paths(cache_root, version):
+        try:
+            with open(candidate, "rb") as fh:
+                cached_hash = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue
+        if cached_hash != packaged_hash:
+            sys.stderr.write(
+                f"devinx: the cached Codex skill at {candidate} does not "
+                f"match version {version} of this package. Run "
+                f"`python3 install.py` again to refresh it.\n")
         return
-    for version in versions:
-        version_dir = os.path.join(cache_root, version)
-        for candidate in (os.path.join(version_dir, "SKILL.md"),
-                         os.path.join(version_dir, "skills",
-                                      "swe-orchestrator", "SKILL.md")):
-            try:
-                with open(candidate, "rb") as fh:
-                    cached_hash = hashlib.sha256(fh.read()).hexdigest()
-            except OSError:
-                continue
-            if cached_hash != packaged_hash:
-                sys.stderr.write(
-                    f"devinx: the cached Codex skill at {candidate} does not "
-                    f"match the one in this package - `codex plugin add` does "
-                    f"not refresh an already-cached version on its own. Run "
-                    f"`python3 install.py --force` to refresh it.\n")
-            break
+    # Neither shape exists under this version: not materialised yet for the
+    # version this package declares.
+    sys.stderr.write(
+        f"devinx: the Codex skill cache has nothing for version {version} "
+        f"of this package yet. Run `python3 install.py` to install it.\n")
 
 
 def _has_profile_flag(args):
@@ -749,20 +772,39 @@ def _log_tail(path, lines=20):
         return "(no log available)"
 
 
+# devinx.py's own parser for each variable it reads with int()/float() at
+# import time, with nothing catching a bad value there. diagnostics.py's
+# parse_config_value() uses float() for everything (fine for comparing
+# against a running service's reported value - 12.0 == 12 either way) but
+# is the wrong check to gate a start with: DEVINX_RATE_WAIT=1.5 passes
+# float() and then devinx.py dies on `int("1.5")` before ever binding the
+# port. This map has to match devinx.py's actual parser per variable, not
+# diagnostics.py's.
+_DEVINX_ENV_PARSERS = {
+    'DEVINX_PORT': int, 'DEVINX_CONTEXT_TOKENS': int, 'DEVINX_MAX_BODY': int,
+    'DEVINX_DRAIN': int, 'DEVINX_DASHBOARD_PORT': int,
+    'DEVINX_MID_CONV_REFUSALS': int, 'DEVINX_MAX_INFLIGHT': int,
+    'DEVINX_RATE_WAIT': int, 'DEVINX_KEEPALIVE': int, 'DEVINX_PACE': int,
+    'DEVINX_PACE_WINDOW': int, 'DEVINX_NETWORK_RETRIES': int,
+    'DEVINX_MAX_FRAME': int, 'DEVINX_SUMMARY_TOKENS': int,
+    'DEVINX_LEAD_CAP': int, 'DEVINX_MAX_INFLATED_FRAME': int,
+    'DEVINX_COMPACT_AT': int, 'DEVINX_STATS_TTL': float,
+    'DEVINX_HTTP_READ_TIMEOUT': float, 'DEVINX_CLIENT_WRITE_TIMEOUT': float,
+    'DEVINX_RELAY_READ_TIMEOUT': float,
+}
+
+
 def _validate_devinx_env():
     """Reject an unparsable DEVINX_* runtime setting before spawning a service
-    that would otherwise start with a silently wrong default, or not at all.
-
-    Uses the same parser diagnostics.py compares the running configuration
-    with, so "valid" means the same thing in both places.
+    that would otherwise start with a silently wrong default, or not at all -
+    devinx.py parses each of these with nothing catching a bad value.
     """
-    import diagnostics
     bad = []
-    for name in CONFIG_FIELDS:
+    for name, parser in _DEVINX_ENV_PARSERS.items():
         if name not in os.environ:
             continue
         try:
-            diagnostics.parse_config_value(name, os.environ[name])
+            parser(os.environ[name])
         except ValueError:
             bad.append(name)
     if bad:
@@ -776,13 +818,17 @@ def _validate_devinx_env():
 def ensure_service():
     """Perform the readiness/start sequence once across concurrent launchers."""
     try:
-        # A launcher that is already holding the lock can itself take roughly:
-        # a stale-service check (a few seconds), an attempted graceful stop
-        # (up to 10s), then its own start-and-wait (START_TIMEOUT) - about 53s
-        # worst case. A second launcher merely waiting for the lock has to
-        # outlast that, or it gives up on a start that was always going to
-        # succeed a few seconds later.
-        with startup_lock(data_dir(), PORT, START_TIMEOUT + 25):
+        # A launcher already holding the lock can itself take roughly: a
+        # stale-service check (connect + urlopen, up to ~3.5s), an attempted
+        # stop (up to 10s waiting for the port to close, plus - on Windows -
+        # up to 3s more for the graceful attempt before falling back to
+        # /F), then its own start-and-wait: the loop's own deadline is
+        # START_TIMEOUT, but the last iteration's listening() call can still
+        # run up to ~3.5s past it before the loop notices. Summed worst case
+        # is close to START_TIMEOUT + 20; a second launcher merely waiting
+        # for the lock has to clear that with real margin, or it gives up on
+        # a start that was always going to succeed a few seconds later.
+        with startup_lock(data_dir(), PORT, START_TIMEOUT + 35):
             state, info = service_state()
             if state == "foreign":
                 sys.stderr.write(f"devinx: another service owns {HOST}:{PORT}; not starting or stopping it\n")
@@ -899,7 +945,10 @@ def main():
         return 1
 
     if use_codex:
-        has_profile = _has_profile_flag(passthrough)
+        # Only the part before a bare `--`: a literal "-p" in a prompt past
+        # the separator is not a profile flag, and split_args() leaves the
+        # separator itself in `passthrough` for exec() to pass through whole.
+        has_profile = _has_profile_flag(split_at_separator(passthrough)[0])
         if has_profile and use_orch:
             sys.stderr.write(
                 "devinx: -p/--profile was already given; the orchestrator "

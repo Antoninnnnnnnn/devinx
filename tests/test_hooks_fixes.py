@@ -48,19 +48,42 @@ class HermeticHookCase(unittest.TestCase):
 
 
 class SessionStartClearsStateTests(HermeticHookCase):
-    """H2: state must not survive into a new session; --resume is separate."""
+    """H2: state must not survive into a new session; --resume is separate;
+    mid-session compaction is not "a new session" and must not reset it."""
 
-    def test_session_start_clears_this_sessions_state(self):
+    def _session_start(self, source):
+        return subprocess.run(
+            [sys.executable, EDIT_GUARD],
+            input=json.dumps({"session_id": self.session,
+                              "hook_event_name": "SessionStart", "source": source}),
+            capture_output=True, text=True, env=self.env)
+
+    def test_resume_clears_this_sessions_state(self):
         args = {"file_path": "/a/b.py", "old_string": "X", "new_string": "Y"}
         for _ in range(3):
             self.assertEqual(self._call("Edit", args).returncode, 0)
-        r = subprocess.run([sys.executable, EDIT_GUARD],
-                           input=json.dumps({"session_id": self.session,
-                                             "hook_event_name": "SessionStart"}),
-                           capture_output=True, text=True, env=self.env)
-        self.assertEqual(r.returncode, 0)
+        self.assertEqual(self._session_start("resume").returncode, 0)
         # Without the clear, this would be the blocked 4th attempt.
         self.assertEqual(self._call("Edit", args).returncode, 0)
+
+    def test_compact_does_not_clear_state(self):
+        # A long session auto-compacting repeatedly must not hand itself
+        # three fresh attempts on every compaction - that would let the exact
+        # loop this hook exists to stop keep going, just slower.
+        args = {"file_path": "/a/b.py", "old_string": "X", "new_string": "Y"}
+        for _ in range(3):
+            self.assertEqual(self._call("Edit", args).returncode, 0)
+        self.assertEqual(self._session_start("compact").returncode, 0)
+        self.assertEqual(self._call("Edit", args).returncode, 2)
+
+    def test_the_lock_file_itself_is_never_removed_by_a_clear(self):
+        args = {"file_path": "/a/b.py", "old_string": "X", "new_string": "Y"}
+        self.assertEqual(self._call("Edit", args).returncode, 0)
+        with mock.patch.dict(os.environ, {"DEVINX_DATA": self._tmp.name}):
+            lock_path = edit_loop_guard.state_path(self.session) + ".lock"
+        self.assertTrue(os.path.exists(lock_path))
+        self.assertEqual(self._session_start("resume").returncode, 0)
+        self.assertTrue(os.path.exists(lock_path))
 
 
 class SuccessResetsTheCounterTests(HermeticHookCase):
