@@ -571,5 +571,187 @@ class SweCapacityTests(unittest.TestCase):
         self.assertEqual(devinx._inflight['swe'], 0)
 
 
+class CredentialFiles:
+    """Temporary credentials.toml files, the only ones devinx gets to see."""
+
+    def __init__(self, test):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        test.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.paths = []
+        env = {k: v for k, v in os.environ.items()
+               if k not in ('DEVINX_API_KEYS', 'DEVINX_API_KEY')}
+        for patcher in (mock.patch.object(devinx, '_accounts', []),
+                        mock.patch.object(devinx, '_jwt_locks', {}),
+                        mock.patch.object(devinx, '_credential_files',
+                                          lambda: [str(p) for p in self.paths]),
+                        mock.patch.dict(os.environ, env, clear=True)):
+            patcher.start()
+            test.addCleanup(patcher.stop)
+
+    def write(self, name, text):
+        path = self.root / name / 'devin' / 'credentials.toml'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding='utf-8')
+        if path not in self.paths:
+            self.paths.append(path)
+        return path
+
+
+class ReadKeyTests(unittest.TestCase):
+    """P10: any valid TOML quoting, and one bad file never breaks the rest."""
+
+    def setUp(self):
+        self.files = CredentialFiles(self)
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+
+    CASES = [
+        ('windsurf_api_key = "double"\n', 'double'),
+        ("windsurf_api_key = 'single'\n", 'single'),
+        ('other = 1\nwindsurf_api_key="tight"\n', 'tight'),
+        ('[auth]\nwindsurf_api_key = "nested"\n', 'nested'),
+        ('windsurf_api_key = \'broken\'\nthis is = = not toml\n', 'broken'),
+    ]
+
+    def test_every_quoting_style_with_and_without_a_toml_parser(self):
+        for parser in (devinx.tomllib, None):
+            for text, expected in self.CASES:
+                with self.subTest(parser=bool(parser), text=text), \
+                     mock.patch.object(devinx, 'tomllib', parser):
+                    path = self.files.write('case', text)
+                    self.assertEqual(devinx._read_key(str(path)), expected)
+
+    def test_unreadable_files_give_none(self):
+        path = self.files.write('empty', 'nothing = "here"\n')
+        self.assertIsNone(devinx._read_key(str(path)))
+        (self.files.root / 'bin').write_bytes(b'\xff\xfe\x00windsurf')
+        self.assertIsNone(devinx._read_key(str(self.files.root / 'bin')))
+        self.assertIsNone(devinx._read_key(str(self.files.root / 'missing')))
+
+    def test_one_bad_file_does_not_break_the_others(self):
+        self.files.write('bad', 'windsurf_api_key = \n[[[\n')
+        self.files.write('good', "windsurf_api_key = 'good-key'\n")
+        loaded = devinx._load_accounts()
+        self.assertEqual([a['name'] for a in loaded], ['good'])
+        self.assertEqual(loaded[0]['key'], devinx.SESSION_PREFIX + 'good-key')
+        with mock.patch.object(devinx, '_read_key', side_effect=[IndexError('x'), 'k2']):
+            self.assertEqual(len(devinx._load_accounts()), 1)
+
+
+class ReloadTests(unittest.TestCase):
+    """P6 / P7 / P9: re-authentication without forgetting or blocking others."""
+
+    def setUp(self):
+        self.files = CredentialFiles(self)
+        self.a = self.files.write('acct-a', 'windsurf_api_key = "old-a"\n')
+        self.files.write('acct-b', 'windsurf_api_key = "key-b"\n')
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+
+    def test_reset_key_keeps_every_accounts_state_and_updates_in_place(self):
+        a, b = devinx.accounts()
+        now = time.time()
+        devinx.block_account(b, 600)
+        b_block, b_refused = b['blocked_until'], b['refused_at']
+        a['pace'] = 'sentinel'
+        a['jwt'], a['exp'] = 'stale.jwt', now + 3600
+        self.a.write_text('windsurf_api_key = "new-a"\n')
+        devinx.reset_key()
+        a2, b2 = devinx.accounts()
+        self.assertIs(a2, a, 'the caller holding the dict would retry stale')
+        self.assertEqual(a['key'], devinx.SESSION_PREFIX + 'new-a')
+        self.assertIsNone(a['jwt'], 'a JWT for the old key was kept')
+        self.assertEqual(a['pace'], 'sentinel')
+        self.assertIs(b2, b)
+        self.assertEqual((b['blocked_until'], b['refused_at']), (b_block, b_refused))
+        self.assertIsNone(devinx.claim_account(avoid=a)[0], 'b was unblocked')
+
+    def test_a_reload_that_finds_nothing_keeps_the_current_accounts(self):
+        before = devinx.accounts()
+        for p in list(self.files.paths):
+            p.unlink()
+        devinx.reset_key()
+        self.assertEqual(devinx.accounts(), before)
+
+    def _auth_response(self, status, jwt=None):
+        import requests
+        r = mock.Mock(status_code=status)
+        if status == 200:
+            r.content = devinx.protos()['GetUserJwtResponse'](
+                user_jwt=jwt).SerializeToString()
+            r.raise_for_status.return_value = None
+        else:
+            r.raise_for_status.side_effect = requests.HTTPError(
+                f'{status} Client Error', response=r)
+        return r
+
+    def _sent_key(self, call):
+        req = devinx.protos()['GetUserJwtRequest']()
+        req.ParseFromString(call.kwargs['data'])
+        return req.metadata.api_key
+
+    def _req(self):
+        return SimpleNamespace(metadata=SimpleNamespace(), chat_message_prompts=[],
+                               chat_model_uid='swe-2-max', cascade_id='test',
+                               SerializeToString=lambda: b'test')
+
+    def test_a_refused_jwt_reloads_and_retries_with_the_new_key(self):
+        a, _ = devinx.accounts()
+        self.a.write_text("windsurf_api_key = 'new-a'\n")
+        chat = mock.Mock(status_code=500, text='stop here')
+        responses = [self._auth_response(401), self._auth_response(200, 'x.eyJ9.y'), chat]
+        with mock.patch.object(devinx.SESSION, 'post', side_effect=responses) as post:
+            out = list(devinx.chat_stream(self._req(), a))
+        self.assertEqual(out, [(None, 'upstream 500: stop here')])
+        auth = [c for c in post.call_args_list if c.args[0].endswith(devinx.AUTH_PATH)]
+        self.assertEqual([self._sent_key(c) for c in auth],
+                         [devinx.SESSION_PREFIX + 'old-a', devinx.SESSION_PREFIX + 'new-a'])
+
+    def test_a_persistent_jwt_refusal_is_an_authentication_error(self):
+        a, _ = devinx.accounts()
+        with mock.patch.object(devinx.SESSION, 'post', side_effect=[
+                self._auth_response(401), self._auth_response(403)]) as post:
+            out = list(devinx.chat_stream(self._req(), a))
+        self.assertEqual(post.call_count, 2, 'the chat endpoint was called anyway')
+        (msg, err), = out
+        self.assertIsNone(msg)
+        self.assertEqual(devinx.anthropic_error(err)[:2], ('authentication_error', 401))
+
+    def test_a_persistent_chat_refusal_is_an_authentication_error(self):
+        a, _ = devinx.accounts()
+        refused = mock.Mock(status_code=401, text='expired')
+        with mock.patch.object(devinx, 'get_jwt', return_value=('jwt', None)), \
+             mock.patch.object(devinx.SESSION, 'post', side_effect=[refused, refused]):
+            (_, err), = list(devinx.chat_stream(self._req(), a))
+        self.assertEqual(devinx.anthropic_error(err)[:2], ('authentication_error', 401))
+
+    def test_a_slow_auth_call_for_one_account_does_not_hold_another(self):
+        a, b = devinx.accounts()
+        gate, entered = threading.Event(), threading.Event()
+        fast = self._auth_response(200, 'x.eyJ9.y')
+
+        def post(url, data=None, **kwargs):
+            req = devinx.protos()['GetUserJwtRequest']()
+            req.ParseFromString(data)
+            if req.metadata.api_key == a['key']:
+                entered.set()
+                gate.wait(5)
+            return fast
+
+        with mock.patch.object(devinx.SESSION, 'post', side_effect=post):
+            slow = threading.Thread(target=devinx.get_jwt, args=(a,))
+            slow.start()
+            self.assertTrue(entered.wait(3))
+            t0 = time.time()
+            self.assertEqual(devinx.get_jwt(b)[0], 'x.eyJ9.y')
+            self.assertLess(time.time() - t0, 1, 'b waited behind a')
+            gate.set()
+            slow.join(5)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

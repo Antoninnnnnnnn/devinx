@@ -49,6 +49,13 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 from urllib3.util.retry import Retry
+try:
+    import tomllib
+except ImportError:          # Python < 3.11
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None       # _read_key falls back to a pattern
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf import timestamp_pb2, duration_pb2, any_pb2, struct_pb2
 from google.protobuf import wrappers_pb2, empty_pb2, field_mask_pb2, type_pb2
@@ -576,15 +583,52 @@ def _credential_files():
     return found
 
 
-def _read_key(path):
-    try:
-        with open(path) as fh:
-            for line in fh:
-                if line.startswith("windsurf_api_key"):
-                    return line.split('"')[1]
-    except OSError:
-        pass
+# Only for when no TOML parser is importable (Python < 3.11 without tomli):
+# the one line that matters, in either quoting style TOML allows.
+_KEY_LINE = re.compile(r"""^[ \t]*windsurf_api_key[ \t]*=[ \t]*"""
+                       r"""(?:"((?:[^"\\\n]|\\.)*)"|'([^'\n]*)')""", re.M)
+
+
+def _find_key(table):
+    """windsurf_api_key at the top level, or in a table one level down."""
+    value = table.get("windsurf_api_key")
+    if isinstance(value, str):
+        return value
+    for sub in table.values():
+        if isinstance(sub, dict) and isinstance(sub.get("windsurf_api_key"), str):
+            return sub["windsurf_api_key"]
     return None
+
+
+def _read_key(path):
+    """The key in one credentials.toml, or None — never an exception.
+
+    Split on double quotes, a file written with single quotes (valid TOML)
+    raised IndexError, and since every credential is read on the same pass
+    one such file made every SWE-2 request fail with "list index out of
+    range". Each file now stands or falls on its own.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    key = None
+    if tomllib is not None:
+        try:
+            key = _find_key(tomllib.loads(raw))
+        except Exception:
+            key = None
+    if key is None:
+        found = _KEY_LINE.search(raw)
+        if found:
+            key = (found.group(1).replace('\\"', '"').replace("\\\\", "\\")
+                   if found.group(1) is not None else found.group(2))
+    if key is None or not key.strip():
+        if os.path.exists(path):
+            print(f"warning: no windsurf_api_key readable in {path}", flush=True)
+        return None
+    return key.strip()
 
 
 # Every credentials.toml sits in a directory called "devin", so naming an
@@ -621,7 +665,12 @@ def _load_accounts():
                 names.append(f"env[{i}]")
     else:
         for path in _credential_files():
-            key = _read_key(path)
+            try:
+                key = _read_key(path)
+            except Exception as e:
+                # One unreadable file must not take the others down with it.
+                print(f"warning: skipping {path}: {type(e).__name__}", flush=True)
+                key = None
             if key and key not in keys:
                 keys.append(key)
                 names.append(_credential_name(path))
@@ -671,14 +720,51 @@ def api_key():
 
 
 def reset_key():
-    """Forget the memoised credentials so the next use re-reads the files.
+    """Re-read the credential files now, keeping what is known per account.
 
     Called when the upstream rejects our auth: the usual cause is that the user
     just ran `devin auth login` again, which rewrites credentials.toml while this
     process happily keeps using the string it read at startup.
+
+    It used to empty the list and let the next use reload it. That also wiped
+    every account's block and pacing state — one 401 on one account released
+    a burst at accounts that were rate limited — and the retry right after it
+    still went out with the old key, the reload only happening on the next
+    request. Now the reload happens here and updates the existing account
+    dicts in place, matched by key and then by name, so a caller holding one
+    retries with the new key and nothing else forgets it was blocked.
     """
+    try:
+        fresh = _load_accounts()
+    except RuntimeError as e:
+        # Nothing readable right now (a login mid-write, say): keep what is in
+        # use rather than leave nothing to use at all.
+        print(f"devinx: credential reload found nothing ({e}); keeping the "
+              f"current ones", flush=True)
+        return
+    fresh_keys = {a["key"] for a in fresh}
     with _acct_lock:
-        _accounts.clear()
+        by_key = {a["key"]: a for a in _accounts}
+        by_name = {a["name"]: a for a in _accounts}
+        merged = []
+        for new in fresh:
+            old = by_key.get(new["key"])
+            if old is None:
+                old = by_name.get(new["name"])
+                if old is not None and old["key"] not in fresh_keys:
+                    # The same credential file with a new key written into it.
+                    old.update(key=new["key"], jwt=None, exp=0.0, base=None)
+                else:
+                    old = None
+            if old is None or any(old is m for m in merged):
+                merged.append(new)
+            else:
+                merged.append(old)
+        changed = {a["key"] for a in merged} != set(by_key)
+        _accounts[:] = merged
+    if changed:
+        print(f"devinx: credentials reloaded "
+              f"({', '.join(a['name'] for a in merged)})", flush=True)
 
 
 _turn = {"n": 0}
@@ -761,7 +847,15 @@ def paced(acct):
     return sem
 
 
-_jwt_lock = threading.Lock()
+# One lock per credential, not one for the process: the lock is held across
+# a network call of up to 30s, and a slow auth endpoint for one account used
+# to hold up the turns of every other account behind it.
+_jwt_locks = {}
+
+
+def _jwt_lock_for(acct):
+    with _acct_lock:
+        return _jwt_locks.setdefault(acct["key"], threading.Lock())
 
 
 def _metadata(jwt="", key=None):
@@ -790,7 +884,7 @@ def get_jwt(acct=None, force=False):
     """A JWT for one account, cached on that account rather than globally."""
     if acct is None:
         acct = accounts()[0]
-    with _jwt_lock:
+    with _jwt_lock_for(acct):
         now = time.time()
         if not force and acct["jwt"] and acct["exp"] - 60 > now:
             return acct["jwt"], acct["base"]
@@ -811,6 +905,40 @@ def get_jwt(acct=None, force=False):
         acct["exp"] = _jwt_expiry(resp.user_jwt) or now + 3300
         acct["base"] = resp.custom_api_server_url.strip() or None
         return acct["jwt"], acct["base"]
+
+
+def _auth_refused(error):
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) in (401, 403)
+
+
+def _jwt_or_reload(acct, force=False):
+    """(jwt, base, None), or (None, None, error) when the credential is refused.
+
+    The JWT endpoint is where an expired or replaced key is refused first,
+    and a refusal there never reached reset_key(): SWE-2 stayed broken until
+    a restart, and the turn failed as a 502 api_error the client cannot act
+    on. Refused once, the credentials are re-read and the call tried again;
+    refused twice, it is an authentication_error.
+    """
+    for attempt in range(2):
+        try:
+            jwt, base = get_jwt(acct, force=force or attempt > 0)
+            return jwt, base, None
+        except requests.HTTPError as e:
+            if not _auth_refused(e):
+                raise
+            status = e.response.status_code
+            if attempt == 0:
+                print(f"auth endpoint refused {acct['name']} (HTTP {status}); "
+                      f"re-reading the credentials", flush=True)
+                reset_key()
+                continue
+            print(f"auth endpoint refused {acct['name']} again (HTTP {status})",
+                  flush=True)
+            return None, None, (
+                f"unauthenticated: the Devin credential {acct['name']} was "
+                f"refused (HTTP {status}); run `devin auth login`")
 
 
 # --------------------------------------------------------------------------- #
@@ -1258,7 +1386,10 @@ def chat_stream(req, acct=None, purpose="turn"):
     if acct is None:
         acct = accounts()[0]
     _request_phase("summarizing" if purpose == "summary" else "authenticating")
-    jwt, base = get_jwt(acct)
+    jwt, base, err = _jwt_or_reload(acct)
+    if err:
+        yield None, err
+        return
     req.metadata.api_key = acct["key"]
     req.metadata.user_jwt = jwt
     body = req.SerializeToString()
@@ -1288,16 +1419,23 @@ def chat_stream(req, acct=None, purpose="turn"):
             if status in (401, 403) and attempt == 0:
                 # Re-read the credential file too: after `devin auth login` the
                 # process would otherwise keep retrying with the stale key it
-                # memoised at first use.
+                # memoised at first use. reset_key() updates this very dict,
+                # so acct["key"] below is the reloaded one.
                 reset_key()
-                jwt, base = get_jwt(acct, force=True)
+                jwt, base, err = _jwt_or_reload(acct, force=True)
+                if err:
+                    yield None, err
+                    return
                 req.metadata.api_key = acct["key"]
                 req.metadata.user_jwt = jwt
                 body = req.SerializeToString()
                 continue
             print(f"upstream HTTP {status} on {acct['name']}: {detail}",
                   flush=True)
-            yield None, f"upstream {status}: {detail}"
+            if status in (401, 403):
+                yield None, f"unauthenticated: upstream {status}: {detail}"
+            else:
+                yield None, f"upstream {status}: {detail}"
             return
         # conv= is the cascade id, which is derived from the conversation and
         # stable across its turns: the join key the log never had. Without one,
