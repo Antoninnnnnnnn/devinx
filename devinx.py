@@ -2938,6 +2938,20 @@ for _scheme in ("http://", "https://"):
         pool_connections=8, pool_maxsize=32, max_retries=_RETRY))
 
 
+# What Codex's own catalog request carries, and nothing else: the ChatGPT
+# login, the workspace it belongs to, and how the client names itself.
+_CODEX_CATALOG_HEADERS = {"authorization", "chatgpt-account-id", "originator",
+                          "user-agent", "version", "accept",
+                          "openai-organization", "openai-project"}
+_CODEX_CATALOG_PREFIXES = ("x-openai-", "x-codex-", "openai-")
+
+
+def _codex_catalog_header(name):
+    name = name.lower()
+    return (name in _CODEX_CATALOG_HEADERS
+            or name.startswith(_CODEX_CATALOG_PREFIXES))
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = HTTP_READ_TIMEOUT  # header/body inactivity, not model latency
@@ -3043,16 +3057,24 @@ class Handler(BaseHTTPRequestHandler):
         """
         rows = [self.catalog_row(mid, name, i)
                 for i, (mid, name) in enumerate(SWE_MODELS)]
-        auth = self.headers.get("authorization")
-        if not auth:
+        query = urlsplit(self.path).query
+        # Only a request that is identifiably Codex goes to chatgpt.com. Claude
+        # Code's gateway discovery asks this same path (/v1/models?limit=1000)
+        # with its own Anthropic credential, and forwarding every header of
+        # every caller sent that credential to OpenAI. Codex always names its
+        # version in the query and never speaks the anthropic-* dialect.
+        names = {name.lower() for name in self.headers.keys()}
+        if (not self.headers.get("authorization")
+                or "client_version" not in parse_qs(query)
+                or "x-api-key" in names
+                or any(n.startswith("anthropic-") for n in names)):
             return rows
         try:
             headers = {name: value for name, value in self.headers.items()
-                       if name.lower() not in REQUEST_EXCLUDED}
+                       if _codex_catalog_header(name)}
             # Forward the query verbatim: Codex asks for
             # /v1/models?client_version=…, and the upstream answers differently
             # — or not at all — without it.
-            query = urlsplit(self.path).query
             r = SESSION.get(CODEX_UPSTREAM + "/models"
                             + (f"?{query}" if query else ""),
                             headers=headers, timeout=(10, 20))

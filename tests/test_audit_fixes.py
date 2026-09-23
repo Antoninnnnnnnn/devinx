@@ -163,5 +163,78 @@ class ResetInZeroSecondsTests(unittest.TestCase):
             'resource_exhausted: reset in 0 seconds')[3], 0)
 
 
+class LiveServer:
+    """devinx's real Handler on an ephemeral loopback port."""
+
+    def __init__(self, handler=None):
+        self.server = devinx.Server(('127.0.0.1', 0), handler or devinx.Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={'poll_interval': 0.02}, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(2)
+
+    def get(self, path, headers):
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=5)
+        try:
+            conn.request('GET', path, headers=headers)
+            r = conn.getresponse()
+            return r.status, json.loads(r.read())
+        finally:
+            conn.close()
+
+
+class CodexCatalogTests(unittest.TestCase):
+    """S1: /v1/models must not hand a Claude credential to chatgpt.com."""
+
+    def setUp(self):
+        self.live = LiveServer()
+        self.addCleanup(self.live.close)
+        upstream = mock.Mock(status_code=200)
+        upstream.json.return_value = {'models': [{'slug': 'gpt-test'}]}
+        patcher = mock.patch.object(devinx.SESSION, 'get', return_value=upstream)
+        self.get = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_claude_code_gateway_discovery_never_reaches_chatgpt(self):
+        for headers in (
+                {'Authorization': 'Bearer claude-secret', 'anthropic-version': '2023-06-01'},
+                {'Authorization': 'Bearer claude-secret'},
+                {'x-api-key': 'sk-ant-secret'}):
+            with self.subTest(headers=list(headers)):
+                status, body = self.live.get('/v1/models?limit=1000', headers)
+                self.assertEqual(status, 200)
+                self.assertIn('swe-2', [m['id'] for m in body['data']])
+        self.get.assert_not_called()
+
+    def test_codex_like_request_with_claude_headers_is_not_forwarded(self):
+        self.live.get('/v1/models?client_version=0.154.0',
+                      {'Authorization': 'Bearer x', 'anthropic-beta': 'y'})
+        self.live.get('/v1/models?client_version=0.154.0',
+                      {'Authorization': 'Bearer x', 'x-api-key': 'sk-ant-secret'})
+        self.get.assert_not_called()
+
+    def test_codex_gets_its_catalog_with_only_the_headers_it_needs(self):
+        status, body = self.live.get('/v1/models?client_version=0.154.0', {
+            'Authorization': 'Bearer chatgpt-token', 'ChatGPT-Account-ID': 'acct',
+            'originator': 'codex_cli_rs', 'Cookie': 'session=secret',
+            'X-Unrelated': 'private'})
+        self.assertEqual(status, 200)
+        self.assertIn('gpt-test', [m.get('slug') for m in body['models']])
+        self.get.assert_called_once()
+        url = self.get.call_args.args[0]
+        self.assertTrue(url.startswith(devinx.CODEX_UPSTREAM + '/models?client_version='))
+        sent = {k.lower(): v for k, v in self.get.call_args.kwargs['headers'].items()}
+        self.assertEqual(sent['authorization'], 'Bearer chatgpt-token')
+        self.assertEqual(sent['chatgpt-account-id'], 'acct')
+        for private in ('cookie', 'x-unrelated', 'host', 'x-api-key'):
+            self.assertNotIn(private, sent)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
