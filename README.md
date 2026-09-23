@@ -136,7 +136,7 @@ whatever your Codex config already says; only what it delegates changes.
 | `DEVINX_DATA` | override the data directory (logs, lock file, Devin credentials); defaults to the platform data dir |
 | `DEVINX_LOG` | override the log file path; defaults to `devinx.log` in the data directory |
 | `DEVINX_API_KEYS` / `DEVINX_API_KEY` | comma-separated Devin credentials (or a single one), instead of every `credentials.toml` under the data directory |
-| `DEVINX_OWNED_PATHS` | `os.pathsep`-separated paths/globs the `--or` hooks enforce as owned files (see [hooks](#hooks) below); unset means unenforced |
+| `DEVINX_OWNED_PATHS` | `os.pathsep`-separated paths/globs the `--or` hooks enforce as owned files when a subagent's brief declares no `<owned-paths>` block, and for the main thread (see [hooks](#hooks) below); unset means unenforced |
 | `DEVINX_DESCRIPTORS` | an extra directory of protobuf `*.fdp` descriptors to load, ahead of the packaged ones |
 
 `--or` is separate from the client flags on purpose: the SWE-2 layer changes
@@ -277,11 +277,13 @@ does Codex, which has no equivalent hook mechanism.
   retried forever instead of the agent reading the file and adjusting. A
   successful edit, or re-reading the file, forgives the attempts recorded
   against it; a new session starts clean.
-- **`ownership_guard.py`** enforces `DEVINX_OWNED_PATHS` (see the variable
-  table above) by refusing an Edit/Write/NotebookEdit outside the declared
-  list — the wall the skill tells you to set alongside a subagent's file
-  ownership, since a prompt alone is a request an agent can talk itself out
-  of. It is a session-wide setting, not a per-agent one, today.
+- **`ownership_guard.py`** refuses an Edit/Write/NotebookEdit outside the
+  files a subagent owns — the wall behind the skill's file ownership, since a
+  prompt alone is a request an agent can talk itself out of. Ownership is
+  declared per agent, in its brief, as an `<owned-paths>` block (one path or
+  glob per line); the hook reads it back from that agent's own transcript, so
+  parallel workers each get their own boundary. `DEVINX_OWNED_PATHS` is the
+  session-wide fallback for the main thread and for briefs that declare none.
 
 Both fail open on anything they cannot parse: a hook erroring out must never
 be the reason a legitimate edit is blocked.

@@ -301,8 +301,19 @@ def _build_id():
     return build_id(HERE)
 
 
+RISKY_FLAGS = {
+    "DEVINX_DUMP": lambda: bool(os.environ.get("DEVINX_DUMP")),
+    "DEVINX_ALLOW_BROWSER": lambda: os.environ.get("DEVINX_ALLOW_BROWSER") == "1",
+}
+
+
 def effective_configuration():
-    return {env: globals().get(name) for env, name in CONFIG_FIELDS.items()}
+    out = {env: globals().get(name) for env, name in CONFIG_FIELDS.items()}
+    # Whether, never what: the dump path and the browser switch persist for
+    # every later session of a daemon started from one shell that set them,
+    # and a launcher can only warn about that if the service says so.
+    out.update({name: flag() for name, flag in RISKY_FLAGS.items()})
+    return out
 
 
 BUILD = _build_id()

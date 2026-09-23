@@ -109,21 +109,29 @@ validation". If you do not specify, it will pick something, and you will be
 reviewing that choice instead of the code.
 
 **Name the files it owns.** List them. State that everything else is
-off-limits, including formatting. One writer per file, always. `DEVINX_OWNED_PATHS`
-(the same list, `os.pathsep`-separated) is the enforced form of that boundary,
-checked by a hook on every Edit/Write/NotebookEdit: prose is a request, that
-variable is a wall. Measured on this fleet, an agent read "you own exactly
+off-limits, including formatting. One writer per file, always. Put the list
+in the brief as a block the hooks enforce on every Edit/Write/NotebookEdit
+that agent makes:
+
+```
+<owned-paths>
+src/export/currency.py
+tests/export/**
+</owned-paths>
+```
+
+One path or glob per line (`*` stays inside a directory, `**` crosses them;
+relative paths are relative to the working directory). Prose is a request,
+that block is a wall: measured on this fleet, an agent read "you own exactly
 these five files" and "stop and report rather than reaching for `apps/`",
 agreed to both, and then spent twelve and a half hours editing a file under
 `apps/`. The wall is not distrust of the model; it is what turns a boundary
-into one.
-
-Today this is a **session-wide** setting, not a per-agent one: the Agent tool
-has no way to set an environment variable for one spawned agent only, so
-`DEVINX_OWNED_PATHS` has to be exported before you start delegating, and it
-then applies to every agent in the session equally. If two tasks in flight at
-once need different owned files, that is not yet enforceable this way — say
-so rather than implying a per-agent wall that is not actually there.
+into one. It is per agent — two workers in flight at once each get their own
+— and a brief without the block is unenforced. `DEVINX_OWNED_PATHS`
+(`os.pathsep`-separated), exported before the session starts, is the
+session-wide fallback for the main thread and for briefs that declare
+nothing. The hooks cover the edit tools, not `Bash`: say in the brief that
+writing an unowned file through the shell is the same boundary crossed.
 
 **Give acceptance criteria a machine can settle.** "`pytest
 tests/test_export.py -k currency` passes and nothing else in that file breaks"

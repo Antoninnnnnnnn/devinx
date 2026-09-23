@@ -77,6 +77,19 @@ def configuration_mismatches(env, service_config):
         elif wanted != actual:
             warnings.append(
                 f'{name} differs from the running service; session flags do not reconfigure a daemon.')
+    # The two switches that outlive the shell that set them. Reported as
+    # booleans only; a service too old to report them says nothing here.
+    for name in ('DEVINX_DUMP', 'DEVINX_ALLOW_BROWSER'):
+        running = (service_config or {}).get(name)
+        if not isinstance(running, bool):
+            continue
+        wanted = bool(env.get(name)) if name == 'DEVINX_DUMP' else env.get(name) == '1'
+        if running and not wanted:
+            warnings.append(
+                f'{name} is active in the running service (inherited from the shell that started it); '
+                'restart the service to turn it off.')
+        elif wanted and not running:
+            warnings.append(f'{name} is requested but the running service does not have it.')
     return warnings
 
 

@@ -10,20 +10,28 @@ it, and crossed it anyway — not once, as a slip, but continuously for a night.
 An instruction the model can reconsider is not a boundary. This is the same
 instruction expressed where it cannot be reconsidered.
 
-The orchestrator states ownership in the subagent's prompt. A prompt is text,
-so the boundary is read back out of it: DEVINX_OWNED_PATHS is a
-os.pathsep-separated list of paths (or glob patterns - '*' stays inside one
-path segment, '**' crosses any number of them) that may be written. With it
-unset this hook does nothing at all — no fleet-wide default, because a
-boundary nobody declared is not a boundary and guessing one would break every
-agent that legitimately writes anywhere.
+The orchestrator states ownership in the subagent's prompt, and the
+boundary is read back out of that prompt: a block
 
-It is a session-wide setting, not a per-agent one: the Agent tool has no
-environment parameter, and the launcher does not set this variable itself, so
-today every subagent in a session sees the same DEVINX_OWNED_PATHS the root
-happened to have when it started. A real per-agent boundary needs an
-agent_id in the hook's own event plus a SubagentStart hook, which this pass
-does not add.
+    <owned-paths>
+    src/api/**
+    tests/api/test_limits.py
+    </owned-paths>
+
+anywhere in the brief lists the paths (or glob patterns - '*' stays inside
+one path segment, '**' crosses any number of them) that agent may write.
+A call made inside a subagent carries its agent_id, and Claude Code keeps
+that agent's transcript at <session>/subagents/agent-<agent_id>.jsonl beside
+the session's own, its first record being the brief exactly as the root
+wrote it. So the declaration is found from the agent itself, with nothing
+to correlate and nothing for the root to configure: two parallel workers of
+the same type each get their own boundary.
+
+DEVINX_OWNED_PATHS (os.pathsep-separated) is the session-wide fallback: it
+applies to the main thread and to any subagent whose brief declares nothing.
+With neither, this hook does nothing at all — no fleet-wide default, because
+a boundary nobody declared is not a boundary and guessing one would break
+every agent that legitimately writes anywhere.
 
 Hook contract: PreToolUse on stdin, exit 0 allows, exit 2 blocks with stderr
 put in front of the model.
@@ -32,6 +40,7 @@ put in front of the model.
 import fnmatch
 import json
 import os
+import re
 import sys
 
 WRITERS = ("Edit", "Write", "NotebookEdit")
@@ -108,17 +117,55 @@ def main():
         return 0
 
 
+_DECLARED = re.compile(r"<owned-paths>(.*?)</owned-paths>", re.S)
+
+
+def declared_patterns(event):
+    """The paths the subagent's own brief declared, or None if it declared none
+    (or this is the main thread, or its transcript cannot be read)."""
+    agent_id, transcript = event.get("agent_id"), event.get("transcript_path")
+    if not isinstance(agent_id, str) or not isinstance(transcript, str) or not transcript:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", agent_id):
+        return None
+    path = os.path.join(os.path.splitext(transcript)[0], "subagents",
+                        f"agent-{agent_id}.jsonl")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            first = json.loads(fh.readline())
+    except (OSError, ValueError):
+        return None
+    content = (first.get("message") or {}).get("content") if isinstance(first, dict) else None
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str):
+        return None
+    found = _DECLARED.findall(content)
+    if not found:
+        return None
+    out = []
+    for block in found:
+        for item in re.split(r"[\n,]", block):
+            item = item.strip().lstrip("-*").strip().strip("`")
+            if item:
+                out.append(item)
+    return out
+
+
 def _run():
-    # os.pathsep, not a literal ':': on Windows that splits "C:\..." in half.
-    patterns = [p for p in os.environ.get("DEVINX_OWNED_PATHS", "").split(os.pathsep) if p]
-    if not patterns:
-        return 0
     try:
         event = json.load(sys.stdin)
     except (ValueError, OSError):
         return 0
     if not isinstance(event, dict):
         return 0     # Valid JSON, unexpected shape (e.g. a bare list): fail open.
+    patterns = declared_patterns(event)
+    if patterns is None:
+        # os.pathsep, not a literal ':': on Windows that splits "C:\..." in half.
+        patterns = [p for p in os.environ.get("DEVINX_OWNED_PATHS", "").split(os.pathsep) if p]
+    if not patterns:
+        return 0
     if event.get("tool_name") not in WRITERS:
         return 0
     args = event.get("tool_input")

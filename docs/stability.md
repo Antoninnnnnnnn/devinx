@@ -70,7 +70,7 @@ Settings are read when the **service starts**:
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `DEVINX_MAX_INFLIGHT` | 64 | Maximum accepted active POST handlers; 0 disables the cap. Excess receives 503 with Retry-After. |
+| `DEVINX_MAX_INFLIGHT` | 64 | Maximum concurrent requests other than SWE-2 turns (claude-*/gpt-* relays, count_tokens, requests still being read); 0 disables the cap. Excess receives 503 with Retry-After. |
 | `DEVINX_HTTP_READ_TIMEOUT` | 30 | Socket inactivity limit in seconds while receiving HTTP headers/body. |
 | `DEVINX_CLIENT_WRITE_TIMEOUT` | 120 | Socket inactivity limit in seconds while writing to the client. |
 | `DEVINX_MAX_FRAME` | 16777216 | Maximum encoded upstream Connect frame bytes. |
@@ -78,7 +78,7 @@ Settings are read when the **service starts**:
 | `DEVINX_RELAY_READ_TIMEOUT` | 0 | Relay read inactivity limit in seconds; 0 keeps the previous unlimited read wait. |
 | `DEVINX_COMPACT_STRICT` | 0 | Set to 1 for the strict compaction policy below. |
 | `DEVINX_MAX_BODY` | 134217728 (128 MiB) | Maximum accepted request body size in bytes. |
-| `DEVINX_KEEPALIVE` | 25 | Seconds between keepalive heartbeats on a silent stream; the client's own idle timeout otherwise reports "the response stopped arriving" on a turn that is still in progress. 0 disables it. |
+| `DEVINX_KEEPALIVE` | 25 | Seconds between keepalive heartbeats on a silent stream (Messages `ping`; on the Codex route, a repeated `response.in_progress`); the client's own idle timeout otherwise reports "the response stopped arriving" on a turn that is still in progress. 0 disables it. |
 | `DEVINX_PACE` | 4 | How many turns may be in flight at once on a credential that refused something recently. 0 disables the cap. |
 | `DEVINX_PACE_WINDOW` | 120 | Seconds after a refusal that `DEVINX_PACE` applies to that credential. |
 | `DEVINX_NETWORK_RETRIES` | 2 | Retries for a connection that breaks mid-response (reset, truncated stream) rather than being refused outright; these are not caught by the rate-limit/classifier retry loop. |
@@ -86,7 +86,8 @@ Settings are read when the **service starts**:
 | `DEVINX_SUMMARY_TOKENS` | 16384 | `max_tokens` budget for the compaction summary call itself. |
 | `DEVINX_MID_CONV_REFUSALS` | 3 | How many times one conversation is told a mid-conversation system turn is not accepted before the proxy gives up and carries it through anyway. |
 | `DEVINX_DRAIN` | 300 | Seconds a shutting-down process gives the turns it is already carrying before cutting them short. |
-| `DEVINX_MAX_SWE_INFLIGHT` | *(added separately from this pass — see devinx.py for the current default)* | A cap on concurrent SWE-2 turns independent from `DEVINX_MAX_INFLIGHT`, so a burst of held rate-limit waits on the SWE side cannot starve `claude-*`/`gpt-*` relays of the same shared POST-handler budget. |
+| `DEVINX_MAX_SWE_INFLIGHT` | 64 | Maximum SWE-2 turns handled at once, counted apart from `DEVINX_MAX_INFLIGHT`, so held subagent turns never take capacity from the main session. Excess receives 503 `overloaded_error` with Retry-After 1. |
+| `DEVINX_RATE_FLOOR` | 3 | Minimum seconds a credential leaves rotation after a rate-limit refusal, even when the upstream says "reset in 0 seconds". |
 
 Other existing settings, including the 128 MiB request body limit and drain
 budget, keep their defaults. Body framing now requires exactly one non-negative
@@ -147,3 +148,28 @@ large protocol/module rewrite are intentionally **not** bundled into this update
 They need separate acceptance tests and, for client integration, real client
 compatibility validation. No real-provider end-to-end or production-load test is
 implied by the offline CI.
+
+## Audit fixes (2026-09-23)
+
+- A turn has one wait budget (`DEVINX_RATE_WAIT`, 1800s), measured from its
+  arrival and shared by compaction summaries, the summary fold and its own
+  rate-limit and outage waits.
+- If the client disconnects while a turn is held (rate limit, outage,
+  summary, pacing), the turn is dropped within about half a second and no
+  further upstream call is made. Logged as `status=client_disconnected`.
+- A 401/403 from Cognition's auth endpoint re-reads the credential files
+  without a restart; a credential still refused is reported as
+  `authentication_error` (401). A reload keeps every account's block and
+  pacing state.
+- `credentials.toml` accepts single- or double-quoted values; one unreadable
+  file no longer disables the others.
+- PDF and other non-text documents cannot be sent to SWE-2: they are replaced
+  by a note saying they were omitted. Text documents are sent as text.
+- Codex's catalog is fetched from chatgpt.com only for requests carrying
+  `client_version`, and only Codex's own headers are forwarded; a Claude
+  credential never leaves for chatgpt.com.
+- `/api/hello` also reports, as booleans only, whether `DEVINX_DUMP` and
+  `DEVINX_ALLOW_BROWSER` are active, and the launcher warns when a running
+  daemon inherited one the current shell did not ask for.
+- The build id now covers dependency versions, and a missing file no longer
+  turns it into "unknown".
