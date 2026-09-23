@@ -867,6 +867,71 @@ class KeepaliveTests(unittest.TestCase):
         self.assertIn("message_stop", text)
 
 
+class HoldTests(unittest.TestCase):
+    """A turn is held through what the upstream says will pass, not handed back."""
+
+    class Msg:
+        def __init__(self, text=None, stop=0):
+            self.delta_thinking = None
+            self.delta_signature = None
+            self.delta_text = text
+            self.delta_tool_calls = []
+            self.stop_reason = stop
+            self.latency = 0.1
+            self.usage = mock.Mock(input_tokens=1, output_tokens=1,
+                                   cache_read_tokens=0, cache_write_tokens=0)
+
+    def _run(self, errors, stream=True):
+        calls = []
+
+        def fake(req, acct=None, purpose="turn"):
+            calls.append(1)
+            if len(calls) <= len(errors):
+                yield None, errors[len(calls) - 1]
+                return
+            yield self.Msg("ok"), None
+            yield self.Msg(stop=devinx.STOP_END_TURN if hasattr(devinx, "STOP_END_TURN") else 1), None
+
+        body = {"model": "swe-2-max", "stream": stream, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]}
+        sock = KeepaliveTests.Sock()
+        with mock.patch.object(devinx, "chat_stream", fake), \
+             mock.patch.object(devinx.time, "sleep", lambda s: None):
+            result = devinx.run_swe(body, sock if stream else None)
+        return calls, result, sock.buf.decode()
+
+    OUTAGE = ("upstream trailer error: unimplemented: The third-party model "
+              "provider is experiencing issues and is currently not available. "
+              "Please try this model again later.")
+
+    def test_a_provider_outage_is_waited_out(self):
+        calls, (_, err), wire = self._run([self.OUTAGE, self.OUTAGE])
+        self.assertEqual(len(calls), 3, "the outage was not retried")
+        self.assertIsNone(err)
+        self.assertIn("ok", wire)
+
+    def test_retrying_survives_the_stream_being_opened_by_a_keepalive(self):
+        # A hold longer than the keepalive interval opens the response with a
+        # message_start before any content. That must not switch retrying off.
+        started = []
+        real_start = devinx.AnthropicStream.start
+
+        def start_early(self, usage=None):
+            started.append(1)
+            return real_start(self, usage)
+
+        with mock.patch.object(devinx.AnthropicStream, "arm",
+                               lambda self: self.start()):
+            calls, (_, err), wire = self._run([self.OUTAGE, self.OUTAGE])
+        self.assertEqual(len(calls), 3, "retry stopped once the stream was open")
+        self.assertEqual(wire.count("event: message_start"), 1)
+        self.assertIn("ok", wire)
+
+    def test_the_wait_budget_covers_the_long_blocks(self):
+        # Blocks of up to 35 minutes were announced on 2026-09-23.
+        self.assertGreaterEqual(devinx.RATE_WAIT_BUDGET, 1800)
+
+
 class MessageIdTests(unittest.TestCase):
     """The constant that collapsed every run into three messages.
 

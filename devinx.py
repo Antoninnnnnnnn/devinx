@@ -848,7 +848,16 @@ TOOL_DESC_CAPS = (None, 6000, 2500)
 # sees a request that took longer, the agent never stops, and nobody is
 # notified of anything. Bounded, because the client has its own timeout and an
 # answer that never comes is worse than one that says to try later.
-RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "600"))
+# How long one turn may be held for the upstream to come back, rate limit or
+# outage. It was 600s; on 2026-09-23 the upstream started announcing blocks of
+# 10 to 35 minutes once an account had carried a heavy day, and 64 turns were
+# handed back as errors after waiting the full ten. A held turn is a paused
+# agent; a handed-back turn is usually a dead one.
+RATE_WAIT_BUDGET = int(os.environ.get("DEVINX_RATE_WAIT", "1800"))
+# The upstream's own words when the model behind it is down, as opposed to
+# refusing this account. Switching credential cannot help; waiting can.
+_OUTAGE = ("experiencing issues", "currently not available",
+           "try this model again later")
 # Seconds of silence on a streaming response before a keepalive goes out. The
 # client abandons a stream that has sent nothing for five minutes — read out of
 # its own binary: max(CLAUDE_STREAM_IDLE_TIMEOUT_MS, 300000) — and reports it as
@@ -2165,7 +2174,7 @@ def _run_swe(body, out):
     # Cognition's input classifier denies borderline payloads nondeterministically
     # (the same body has been observed to pass and to fail). Retry while nothing
     # has reached the client yet.
-    attempt, waited, retries = 0, 0.0, 0
+    attempt, waited, retries, outages = 0, 0.0, 0, 0
     acct = None
     while attempt < 3:
         try:
@@ -2293,6 +2302,24 @@ def _run_swe(body, out):
                 acct, _ = claim_account()
                 continue
             print(f"upstream rate limited and {RATE_WAIT_BUDGET}s of waiting is "
+                  f"spent; handing it back", flush=True)
+            break
+        if err and not emitted and any(t in err for t in _OUTAGE):
+            # 93 turns died this way in twenty minutes on 2026-09-23: the
+            # provider behind Cognition went down, the error came back in under
+            # a second, and it was handed straight to the agent as a 502. The
+            # outage cleared by itself; a turn that had waited would have lived.
+            outages += 1
+            wait = min(15 * 2 ** (outages - 1), 120, RATE_WAIT_BUDGET - waited)
+            if wait > 0:
+                print(f"upstream unavailable (provider outage), holding the "
+                      f"turn for {wait:.0f}s ({waited:.0f}s waited so far)",
+                      flush=True)
+                _request_phase("waiting_outage")
+                time.sleep(wait)
+                waited += wait
+                continue
+            print(f"upstream unavailable and {RATE_WAIT_BUDGET}s of waiting is "
                   f"spent; handing it back", flush=True)
             break
         if err and not emitted and attempt < 2 and "permission_denied" in err:

@@ -443,7 +443,8 @@ function renderActiveRequests(items){
     preparing:"Préparation", waiting_capacity:"Attente de capacité",
     authenticating:"Authentification", connecting:"Connexion au fournisseur",
     waiting_first_frame:"Attente du fournisseur", streaming:"Réception",
-    waiting_rate_limit:"Attente après limitation", relaying:"Relais en cours"};
+    waiting_rate_limit:"Attente après limitation",
+    waiting_outage:"Attente : fournisseur indisponible", relaying:"Relais en cours"};
   if (!Array.isArray(items) || items.length === 0){
     const tr = document.createElement("tr"), td = document.createElement("td");
     td.colSpan = 5;
