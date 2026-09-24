@@ -1228,6 +1228,15 @@ class BalancingTests(unittest.TestCase):
         self.assertGreater(sh["a"], sh["b"],
                            "a 60s reset weighed as long as a 30 min one")
 
+    def test_an_account_back_from_a_long_block_gets_its_share_back_quickly(self):
+        now = time.time()
+        self._history(self.a, 100, 0)
+        self._history(self.b, 100, 0)
+        # b was locked for 24 minutes, and came back five minutes ago.
+        self.b["refusals"] = collections.deque(
+            (now - 29 * 60, 1440, now - 300) for _ in range(5))
+        self.assertGreater(devinx.shares(now)["b"], 0.4)
+
     def test_a_new_account_starts_with_a_fair_share(self):
         self._history(self.a, 200, 0)
         share = self._picks(100).count("b") / 100   # b has no history at all

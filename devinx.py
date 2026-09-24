@@ -931,6 +931,8 @@ _turn = {"n": 0}
 # announced in that refusal, so "reset in 20 seconds" is forgotten in about a
 # minute and "reset in 30 minutes" weighs for about half an hour.
 SUCCESS_MEMORY = float(os.environ.get("DEVINX_SUCCESS_MEMORY", "900"))
+# How long a refusal still weighs once its block is over, in seconds.
+REFUSAL_AFTERGLOW = float(os.environ.get("DEVINX_REFUSAL_AFTERGLOW", "120"))
 
 
 def _success_rate(acct, now):
@@ -946,14 +948,30 @@ def _success_rate(acct, now):
     refs = acct.setdefault("refusals", collections.deque())
     while att and now - att[0] > 6 * SUCCESS_MEMORY:
         att.popleft()
-    while refs and now - refs[0][0] > 6 * refs[0][1]:
+
+    def fade(ref):
+        # A refusal is forgotten from the moment its block ends, and fast.
+        # The block already made the account pay for it; remembering it for
+        # the length of the announced reset *after* the block as well kept a
+        # credential that had just come back from a 24-minute lock at the
+        # 2% floor for another half hour — every turn landing on the one
+        # account left, which was then locked in turn. Measured 2026-09-24:
+        # 522 turns on compte3 against 104 and 26 on the other two.
+        if len(ref) < 3:          # no block end recorded: the old reading
+            return ref[0], ref[1]
+        return ref[2], min(ref[1], REFUSAL_AFTERGLOW)
+
+    while refs and now - fade(refs[0])[0] > 6 * fade(refs[0])[1]:
         refs.popleft()
     a = sum(math.exp(-(now - t) / SUCCESS_MEMORY) for t in att)
-    r = sum(math.exp(-(now - t) / tau) for t, tau in refs)
+    r = 0.0
+    for ref in refs:
+        back, tau = fade(ref)
+        r += math.exp(-max(0.0, now - back) / tau)
     rate = (max(a - r, 0.0) + 1.0) / (a + 2.0)
-    # Never exactly zero: a refusing account keeps a sliver of traffic, which
-    # is how the fleet notices that its limit has freed up again.
-    return max(rate, 0.02)
+    # Never close to zero: a recovering account needs real traffic to show
+    # it has recovered, and a sliver of 2% was too thin to ever prove it.
+    return max(rate, 0.08)
 
 
 def shares(now=None):
@@ -1039,10 +1057,10 @@ def block_account(acct, seconds):
     """
     with _acct_lock:
         acct["blocked_until"] = time.time() + max(seconds, RATE_FLOOR)
-        # The refusal is remembered for as long as the upstream said the
-        # limit would last, within a minute and half an hour.
+        # Remembered from the end of the block, briefly: see _success_rate.
         acct.setdefault("refusals", collections.deque()).append(
-            (time.time(), min(max(float(seconds), 60.0), 1800.0)))
+            (time.time(), min(max(float(seconds), 60.0), 1800.0),
+             acct["blocked_until"]))
         acct["refused_at"] = time.time()
 
 
