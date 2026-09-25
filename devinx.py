@@ -974,13 +974,54 @@ def _success_rate(acct, now):
     return max(rate, 0.08)
 
 
+# Most of the new turns any one credential may take while others are usable.
+# A fresh account refuses least, so the success weighting alone hands it the
+# bulk of the traffic — 17 582 turns on compte3 against 7 827 and 7 620 on
+# 2026-09-24 — and wears it down as fast as the others were. The limits
+# appear to remember days of volume, not minutes, so spreading the load is
+# what keeps every account usable. Applies among three or more usable
+# accounts; when the others are blocked, the ones left take everything.
+MAX_SHARE = float(os.environ.get("DEVINX_MAX_SHARE", "0.5"))
+
+
+def _capped(weights):
+    """Weights with no entry above MAX_SHARE of the total, the excess spread
+    over the others in proportion to their own weights.
+
+    From three usable accounts up: with two, a cap at one half is a forced
+    50/50 that would send turns back to the account that keeps refusing."""
+    if len(weights) < 3 or not 0 < MAX_SHARE < 1:
+        return weights
+    w = dict(weights)
+    capped = set()
+    for _ in range(len(w)):
+        total = sum(w.values())
+        over = {k for k, v in w.items() if k not in capped and v > MAX_SHARE * total}
+        if not over:
+            break
+        free = [k for k in w if k not in capped and k not in over]
+        if not free:
+            break
+        fixed = sum(w[k] for k in capped | over)
+        # Solve so each capped entry is exactly MAX_SHARE of the new total.
+        rest = sum(w[k] for k in free)
+        n_cap = len(capped | over)
+        if MAX_SHARE * n_cap >= 1:
+            break
+        new_total = rest / (1 - MAX_SHARE * n_cap)
+        for k in capped | over:
+            w[k] = MAX_SHARE * new_total
+        capped |= over
+    return w
+
+
 def shares(now=None):
     """Each usable account's share of new turns, as the picker sees it now."""
     now = now or time.time()
     with _acct_lock:
         live = [a for a in _accounts
                 if not a.get("excluded") and a["blocked_until"] <= now]
-        w = {a["name"]: _success_rate(a, now) for a in live}
+        w = _capped({a["name"]: _success_rate(a, now) for a in live})
     total = sum(w.values()) or 1.0
     return {k: v / total for k, v in w.items()}
 
@@ -1030,7 +1071,7 @@ def claim_account(avoid=None):
             # sum. Over any run of picks each account gets exactly its share,
             # interleaved rather than in streaks, with no randomness to make a
             # small fleet lurch.
-            weights = {id(a): _success_rate(a, now) for a in usable}
+            weights = _capped({id(a): _success_rate(a, now) for a in usable})
             total = sum(weights.values())
             for a in usable:
                 a["credit"] = a.get("credit", 0.0) + weights[id(a)]

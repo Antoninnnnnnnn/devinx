@@ -1237,6 +1237,21 @@ class BalancingTests(unittest.TestCase):
             (now - 29 * 60, 1440, now - 300) for _ in range(5))
         self.assertGreater(devinx.shares(now)["b"], 0.4)
 
+    def test_no_account_takes_more_than_the_cap_while_others_serve(self):
+        c = {"name": "c", "key": "kc", "blocked_until": 0.0}
+        self._history(self.a, 100, 60)
+        self._history(self.b, 100, 60)
+        self._history(c, 100, 0)
+        with mock.patch.object(devinx, "_accounts", [self.a, self.b, c]):
+            sh = devinx.shares()
+            self.assertLessEqual(sh["c"], devinx.MAX_SHARE + 1e-9)
+            picks = [devinx.claim_account()[0]["name"] for _ in range(100)]
+        self.assertLessEqual(picks.count("c"), 52)
+
+    def test_the_cap_does_not_hold_back_the_last_account_standing(self):
+        self.b["blocked_until"] = time.time() + 600
+        self.assertEqual(set(self._picks(10)), {"a"})
+
     def test_a_new_account_starts_with_a_fair_share(self):
         self._history(self.a, 200, 0)
         share = self._picks(100).count("b") / 100   # b has no history at all
