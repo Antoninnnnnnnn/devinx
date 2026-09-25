@@ -3669,6 +3669,56 @@ def _codex_catalog_header(name):
             or name.startswith(_CODEX_CATALOG_PREFIXES))
 
 
+def _stats_pass(key, window, slot):
+    data, err = None, None
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(HERE, "tools", "log_stats.py")] + window,
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, DEVINX_LOG=os.environ.get(
+                "DEVINX_LOG", os.path.join(DATA_DIR, "devinx.log"))))
+        data = json.loads(r.stdout) if r.returncode == 0 else None
+        if data is None:
+            err = (r.stderr or "stats failed").strip()[:200]
+    except Exception as e:
+        data, err = None, f"{type(e).__name__}: {e}"
+    with _stats_lock:
+        slot["at"], slot["error"], slot["running"] = time.time(), err, False
+        # A failed pass keeps the last good figures rather than replacing
+        # them with zeros that read as a healthy idle service.
+        if data is not None:
+            slot["data"] = data
+        if len(_stats) > 16:
+            # Windows are user-chosen; a page that asked for a hundred of
+            # them must not leave a hundred snapshots behind.
+            for k in sorted(_stats, key=lambda k: _stats[k]["at"])[:8]:
+                if k != key:
+                    _stats.pop(k, None)
+    slot["ready"].set()
+
+
+def _stats_slot(key, window):
+    """The snapshot for one window, refreshed in the background.
+
+    Parsing the whole log takes seconds (2.2s at 97MB), and it ran inside
+    the request: every poll that found the snapshot stale waited for it,
+    and one that arrived while another poll's pass was running got an empty
+    answer. Now a stale snapshot is served as it is and a pass starts
+    behind it, so a poll only ever waits for the very first pass.
+    """
+    with _stats_lock:
+        slot = _stats.setdefault(key, {"at": 0.0, "data": None, "error": None,
+                                       "running": False,
+                                       "ready": threading.Event()})
+        start = slot["at"] <= time.time() - STATS_TTL and not slot["running"]
+        if start:
+            slot["running"] = True
+    if start:
+        threading.Thread(target=_stats_pass, args=(key, window, slot),
+                         daemon=True).start()
+    return slot
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = HTTP_READ_TIMEOUT  # header/body inactivity, not model latency
@@ -3850,43 +3900,12 @@ class Handler(BaseHTTPRequestHandler):
                                  "since/until must look like 2026-09-18T18:00")
             return
         key = " ".join(window)
-        now = time.time()
-        with _stats_lock:
-            slot = _stats.setdefault(key, {"at": 0.0, "data": None,
-                                           "error": None, "running": False})
-            fresh = slot["at"] > now - STATS_TTL
-            mine = not fresh and not slot["running"]
-            if mine:
-                slot["running"] = True
-        if mine:
-            # One pass at a time per window. Ten tabs on the same range cost
-            # one pass over the log, not ten; two different ranges are two
-            # different questions and cost one each.
-            data, err = None, None
-            try:
-                r = subprocess.run(
-                    [sys.executable, os.path.join(HERE, "tools", "log_stats.py")]
-                    + window,
-                    capture_output=True, text=True, timeout=60,
-                    env=dict(os.environ, DEVINX_LOG=os.environ.get(
-                        "DEVINX_LOG", os.path.join(DATA_DIR, "devinx.log"))))
-                data = json.loads(r.stdout) if r.returncode == 0 else None
-                if data is None:
-                    err = (r.stderr or "stats failed").strip()[:200]
-            except Exception as e:
-                data, err = None, f"{type(e).__name__}: {e}"
-            with _stats_lock:
-                slot["at"], slot["error"], slot["running"] = time.time(), err, False
-                # A failed pass keeps the last good figures rather than
-                # replacing them with zeros that read as a healthy idle service.
-                if data is not None:
-                    slot["data"] = data
-                if len(_stats) > 16:
-                    # Windows are user-chosen; a page that asked for a hundred
-                    # of them must not leave a hundred snapshots behind.
-                    for k in sorted(_stats, key=lambda k: _stats[k]["at"])[:8]:
-                        if k != key:
-                            _stats.pop(k, None)
+        slot = _stats_slot(key, window)
+        # Never answered empty: a page opened while the first pass for its
+        # window is still running used to get zeros and dashes back and had
+        # to be reloaded. It waits for that pass instead — once per window,
+        # since every later request is served the last figures at once.
+        slot["ready"].wait(60)
         with _stats_lock:
             payload = dict(slot["data"] or {})
             payload["error"] = slot["error"]
