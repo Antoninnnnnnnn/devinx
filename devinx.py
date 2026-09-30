@@ -4658,6 +4658,14 @@ if __name__ == "__main__":
     if _dashboard_srv is not None:
         _late_listeners.append(_dashboard_srv)
     drain_and_exit(_srv, _late_listeners, on_closed=_port_lock.release)
+    # Warm every period the dashboard offers, one after the other, so the
+    # first page opened after a restart (and restarts are frequent) finds
+    # its figures ready instead of waiting for the log to be parsed.
+    def _warm():
+        for query in ("", "hours=1", "hours=24", "hours=168", "hours=720"):
+            window, key = Handler.stats_window(query)
+            _stats_slot(key, window)["ready"].wait(120)
+    threading.Thread(target=_warm, daemon=True).start()
     if os.environ.get("DEVINX_DUMP"):
         print(f"WARNING: DEVINX_DUMP is set. Every request, including the full "
               f"conversation and any credentials the client sends, is being "
