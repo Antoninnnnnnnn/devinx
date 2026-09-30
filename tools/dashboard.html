@@ -6,7 +6,9 @@
 <title>devinx — télémétrie</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<!-- Not render-blocking: on a phone the page used to wait for Google before
+     drawing anything. It draws at once in the system font and swaps in. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
 <style>
 :root{
   --ground:#f4f6f8; --surface:#ffffff; --surface-2:#eef1f5; --line:#dfe4ea;
