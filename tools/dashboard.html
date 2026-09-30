@@ -875,7 +875,7 @@ function rangeParams(){
   }
   const preset = PRESETS.find(p => p.id === range.id);
   if (!preset || preset.hours == null) return {};
-  return {since: iso(new Date(Date.now() - preset.hours*3600*1000))};
+  return {hours: String(preset.hours)};
 }
 
 function drawRanges(){

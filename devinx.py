@@ -3871,6 +3871,16 @@ class Handler(BaseHTTPRequestHandler):
         process will execute on someone's behalf.
         """
         out = []
+        # "The last N hours": a stable key, with the bound computed here. A
+        # page that sent since=now-N itself asked for a new window every
+        # minute, and each new window waited a full pass over the log —
+        # 3.6s at 137MB, more under load, past the phone's patience.
+        hours = (parse_qs(query).get("hours") or [""])[0].strip()
+        if hours:
+            if not re.fullmatch(r"[0-9]{1,5}", hours):
+                return None
+            since = datetime.fromtimestamp(time.time() - int(hours) * 3600)
+            return ["--since", since.strftime("%Y-%m-%dT%H:%M")], f"hours={hours}"
         for name in ("since", "until"):
             raw = (parse_qs(query).get(name) or [""])[0].strip()
             if not raw:
@@ -3885,7 +3895,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return None
             out += [f"--{name}", raw]
-        return out
+        return out, " ".join(out)
 
     def serve_stats(self):
         """Live figures for the dashboard.
@@ -3894,12 +3904,12 @@ class Handler(BaseHTTPRequestHandler):
         own shape and this stays decoupled from it. A short cache means ten open
         tabs cost one pass over the log, not ten.
         """
-        window = self.stats_window(urlsplit(self.path).query)
+        parsed = self.stats_window(urlsplit(self.path).query)
+        window, key = parsed if parsed else (None, None)
         if window is None:
             self.send_error_json(400, "invalid_request_error",
                                  "since/until must look like 2026-09-18T18:00")
             return
-        key = " ".join(window)
         slot = _stats_slot(key, window)
         # Never answered empty: a page opened while the first pass for its
         # window is still running used to get zeros and dashes back and had
@@ -4478,6 +4488,14 @@ class _Stamped:
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # A client that hung up before its answer (a phone losing signal, a
+        # dashboard tab closed mid-poll) is routine, not a crash: no traceback.
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError,
+                                          ConnectionAbortedError, TimeoutError)):
+            return
+        ThreadingHTTPServer.handle_error(self, request, client_address)
 
     # One listener per port, enforced by PortLock rather than shared through
     # SO_REUSEPORT. SO_REUSEPORT let a second devinx bind beside the first and
