@@ -392,6 +392,25 @@ in `launcher.py`'s `CODEX_ROLES`), and the orchestrator doctrine reaches the
 root through the Codex skill in `codex/marketplace/`, kept in step with the
 Claude Code one in `plugin/skills/`.
 
+### GPT models in Claude Code
+
+`gpt-*` sent by **Claude Code** (on `/v1/messages`) goes to a local
+[claude-code-proxy](https://github.com/raine/claude-code-proxy) sidecar on
+`127.0.0.1:18765` (`DEVINX_GPT_UPSTREAM` to change it), which holds its own
+ChatGPT login and translates Messages to Codex Responses. Claude Code's
+Anthropic credential is stripped before the hop. Codex's own `gpt-*` traffic
+still goes straight to chatgpt.com on `/v1/responses`.
+
+```sh
+claude-code-proxy codex auth login          # once; separate from ~/.codex/auth.json
+systemctl --user enable --now claude-code-proxy
+```
+
+`/model gpt-6.1-sol` (or any `GPT_MODELS` entry) switches the session; the
+`gpt-sol` and `gpt-luna` subagents are injected with the `swe2-*` ones.
+Switching the *same* conversation between claude-* and gpt-* mid-thread can be
+refused: each side's thinking signatures are opaque to the other.
+
 ### Why the SWE-2 route refuses browsers
 
 It rejects any request carrying an `Origin` header, or a `Host` that is not

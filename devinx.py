@@ -75,6 +75,24 @@ CLAUDE_UPSTREAM = "https://api.anthropic.com"
 # model name, exactly as it already does for claude-* / swe-2-*.
 CODEX_UPSTREAM = "https://chatgpt.com/backend-api/codex"
 COGNITION_UPSTREAM = "https://server.codeium.com"
+# Claude Code on a gpt-* model. Claude Code speaks Messages and carries a
+# claude.ai credential, neither of which chatgpt.com takes, so this route goes
+# to a local claude-code-proxy (raine/claude-code-proxy) that holds its own
+# ChatGPT login and does the Messages <-> Codex Responses translation. Codex's
+# own gpt-* traffic arrives on /v1/responses and never comes here.
+GPT_UPSTREAM = os.environ.get("DEVINX_GPT_UPSTREAM", "http://127.0.0.1:18765")
+GPT_MODELS = (
+    ("gpt-6.1-sol", "GPT-6.1 Sol (ChatGPT)"),
+    ("gpt-6-sol", "GPT-6 Sol (ChatGPT)"),
+    ("gpt-6-luna", "GPT-6 Luna (ChatGPT)"),
+    ("gpt-6-astra", "GPT-6 Astra (ChatGPT)"),
+    ("gpt-5.6-sol", "GPT-5.6 Sol (ChatGPT)"),
+    ("gpt-5.6-terra", "GPT-5.6 Terra (ChatGPT)"),
+    ("gpt-5.6-luna", "GPT-5.6 Luna (ChatGPT)"),
+)
+# The credential Claude Code sends is Anthropic's; it has no business leaving
+# for any other process, local or not.
+GPT_STRIPPED = {"authorization", "x-api-key", "cookie"}
 AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt"
 CHAT_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage"
 
@@ -4084,6 +4102,14 @@ class Handler(BaseHTTPRequestHandler):
                    "runtime": {"max_input_tokens": SWE_CONTEXT_TOKENS,
                                "max_output_tokens": 128000}}
                   for mid, name in SWE_MODELS]
+        models += [{"type": "model", "id": mid, "display_name": name,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "object": "model", "created": 1767225600,
+                    "owned_by": "devinx",
+                    "context_window": 272000,
+                    "runtime": {"max_input_tokens": 272000,
+                                "max_output_tokens": 128000}}
+                   for mid, name in GPT_MODELS]
         # `data` is what Claude Code reads, `models` what Codex reads; serving
         # both means one endpoint rather than one per client dialect.
         self.send_json(200, {"data": models, "models": self.codex_catalog(),
@@ -4191,6 +4217,18 @@ class Handler(BaseHTTPRequestHandler):
             self.relay(raw, model, CODEX_UPSTREAM + "/responses", "codex")
             return
 
+        if model.startswith("gpt-"):
+            # The sidecar spends a ChatGPT login it holds, so the same rule as
+            # the SWE-2 route: a page the user merely visits must not reach it.
+            if self.browser_origin():
+                self.send_error_json(
+                    403, "permission_error",
+                    "Refusing a browser-originated request on the GPT route")
+                return
+            self.relay(raw, model, GPT_UPSTREAM + self.path, "gpt",
+                       strip=GPT_STRIPPED)
+            return
+
         if not model.startswith("claude-"):
             self.send_error_json(400, "invalid_request_error", "Unsupported model")
             return
@@ -4288,15 +4326,17 @@ class Handler(BaseHTTPRequestHandler):
                   flush=True)
             self.close_connection = True
 
-    def relay(self, raw, model, url, label):
+    def relay(self, raw, model, url, label, strip=()):
         """Transparent relay. Headers pass through untouched, including the
-        caller's credential; this process adds nothing of its own."""
+        caller's credential unless `strip` names it; this process adds nothing
+        of its own."""
         response = None
         response_started = False
         relay_started = time.time()
         try:
             headers = {name: value for name, value in self.headers.items()
-                       if name.lower() not in REQUEST_EXCLUDED}
+                       if name.lower() not in REQUEST_EXCLUDED
+                       and name.lower() not in strip}
             _request_phase("connecting")
             response = SESSION.request(self.command, url, data=raw,
                                        headers=headers, stream=True,
