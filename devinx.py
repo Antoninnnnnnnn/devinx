@@ -82,13 +82,10 @@ COGNITION_UPSTREAM = "https://server.codeium.com"
 # own gpt-* traffic arrives on /v1/responses and never comes here.
 GPT_UPSTREAM = os.environ.get("DEVINX_GPT_UPSTREAM", "http://127.0.0.1:18765")
 GPT_MODELS = (
+    # Current ChatGPT lineup only; Sol is 6.1 (~/.codex/models_cache.json).
     ("gpt-6.1-sol", "GPT-6.1 Sol (ChatGPT)"),
-    ("gpt-6-sol", "GPT-6 Sol (ChatGPT)"),
-    ("gpt-6-luna", "GPT-6 Luna (ChatGPT)"),
     ("gpt-6-astra", "GPT-6 Astra (ChatGPT)"),
-    ("gpt-5.6-sol", "GPT-5.6 Sol (ChatGPT)"),
-    ("gpt-5.6-terra", "GPT-5.6 Terra (ChatGPT)"),
-    ("gpt-5.6-luna", "GPT-5.6 Luna (ChatGPT)"),
+    ("gpt-6-luna", "GPT-6 Luna (ChatGPT)"),
 )
 # The credential Claude Code sends is Anthropic's; it has no business leaving
 # for any other process, local or not.
