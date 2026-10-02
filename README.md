@@ -406,24 +406,40 @@ claude-code-proxy codex auth login          # once; separate from ~/.codex/auth.
 systemctl --user enable --now claude-code-proxy
 ```
 
-`/model gpt-6.1-sol` (or any `GPT_MODELS` entry) switches the session; the
-`gpt-sol` and `gpt-luna` subagents are injected with the `swe2-*` ones.
+`/model` lists **Sol** (`gpt-6.1-sol`), **Astra** (`gpt-6-astra`) and **Luna**
+(`gpt-6-luna`), with the effort slider (low to max): the launcher passes a
+session-scoped `--settings` whose `modelPicker` rows use `behavesAs:
+claude-opus-5-5` for the client-side handling, and the sidecar turns
+`output_config.effort` into Codex's reasoning effort. The `gpt-sol` and
+`gpt-luna` subagents are injected with the `swe2-*` ones. A user `--settings`
+wins, and then the rows are not added.
+
+**Compaction copies Codex** (`ModelInfo::auto_compact_token_limit` in
+codex-rs): compact at 90% of the 272k window, 244800 tokens, measured on the
+counts the server reports.
+
+- Main session: Claude Code compacts it, with `modelSettings.<model>.
+  autoCompactWindow` at 277800 so that its fixed 33k buffer lands on 244800;
+  behind it the sidecar's Codex-native compaction (`CCP_CODEX_SERVER_COMPACTION`)
+  keeps the earlier history in model-native form.
+- Subagents (`x-claude-code-agent-id`), which Claude Code never compacts:
+  devinx does, with the same machinery as SWE-2 but a summariser that runs on
+  the agent's own GPT model through the sidecar, so nothing goes to Cognition.
+  The trigger is the server's last reported usage plus an estimate of what was
+  added since, as in Codex. A summary that takes long keeps the stream alive
+  with SSE comments; a context refusal is retried once, compacted harder,
+  instead of ending the agent. `DEVINX_GPT_COMPACT_AT` overrides 244800.
+
 Switching a conversation from gpt-* back to claude-* works: GPT-signed thinking
 (`ccp:` signatures) is dropped from a claude-* history, and kept unsigned on
 swe-2-*.
 
-Limits:
-
-- Nothing compacts a GPT **subagent** (devinx's proxy-side compaction summarises
-  on SWE-2, and a GPT conversation is not sent to Cognition for that). A long
-  `gpt-sol` run stops at ~272k tokens; brief it for bounded work. The main
-  session compacts as usual.
-- The sidecar is a patched build: upstream claude-code-proxy (0.1.43) accepts
-  browser-originated requests and any `Host`, so a page could spend the ChatGPT
-  quota. The local patch refuses any `Origin` and any non-loopback `Host`.
-  Reinstalling with `install.sh` or brew **overwrites it** with the unpatched
-  binary.
-  The patch is kept in `~/devinx-local/claude-code-proxy-v0.1.43-origin-guard.patch`.
+The sidecar is a patched build: upstream claude-code-proxy (0.1.43) accepts
+browser-originated requests and any `Host`, so a page could spend the ChatGPT
+quota. The local patch refuses any `Origin` and any non-loopback `Host`.
+Reinstalling with `install.sh` or brew **overwrites it** with the unpatched
+binary. The patch is kept in
+`~/devinx-local/claude-code-proxy-v0.1.43-origin-guard.patch`.
 
 ### Why the SWE-2 route refuses browsers
 

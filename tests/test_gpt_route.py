@@ -32,16 +32,19 @@ class FakeSidecar:
                 outer.seen.append({'path': self.path,
                                    'headers': {k.lower(): v for k, v in self.headers.items()},
                                    'body': json.loads(self.rfile.read(length) or b'{}')})
-                self.send_response(outer.status)
+                status, body = outer.status, outer.body
+                if outer.answer is not None:
+                    status, body = outer.answer(outer.seen[-1]['body'])
+                self.send_response(status)
                 self.send_header('content-type', 'application/json')
-                self.send_header('content-length', str(len(outer.body)))
+                self.send_header('content-length', str(len(body)))
                 self.end_headers()
-                self.wfile.write(outer.body)
+                self.wfile.write(body)
 
             def log_message(self, *args):
                 pass
 
-        self.status, self.body = status, body
+        self.status, self.body, self.answer = status, body, None
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Echo)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f'http://127.0.0.1:{self.server.server_address[1]}'
@@ -148,6 +151,193 @@ class GptRouteTests(unittest.TestCase):
         self.assertEqual(body['error']['type'], 'rate_limit_error')
 
 
+def long_history(turns=12, size=4000):
+    msgs = [{'role': 'user', 'content': 'the task: fix the parser'}]
+    for i in range(turns):
+        msgs.append({'role': 'assistant', 'content': [
+            {'type': 'tool_use', 'id': f'call_{i}', 'name': 'Read',
+             'input': {'file_path': f'/src/f{i}.py'}}]})
+        msgs.append({'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': f'call_{i}',
+             'content': f'contents {i} ' + 'x' * size}]})
+    msgs.append({'role': 'assistant', 'content': [{'type': 'text', 'text': 'reading'}]})
+    msgs.append({'role': 'user', 'content': 'continue'})
+    return {'model': 'gpt-6.1-sol', 'max_tokens': 8, 'stream': True,
+            'messages': msgs}
+
+
+def summariser(delay=0.0):
+    """The fake sidecar: a summary for the summary request, a turn otherwise."""
+    def answer(body):
+        text = json.dumps(body)
+        if '<conversation>' in text:
+            import time
+            time.sleep(delay)
+            return 200, json.dumps({'type': 'message', 'content': [
+                {'type': 'text', 'text': 'SUMMARY: read f0..f9, parser bug in f3'}]}).encode()
+        return 200, b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    return answer
+
+
+class GptCompactionBase(unittest.TestCase):
+
+    def setUp(self):
+        self.sidecar = FakeSidecar()
+        self.sidecar.answer = summariser()
+        self.addCleanup(self.sidecar.close)
+        for name, value in (('GPT_UPSTREAM', self.sidecar.url),
+                            ('GPT_COMPACT_AT', 6000)):
+            patcher = mock.patch.object(devinx, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        devinx._summaries.clear()
+        self.live = LiveServer()
+        self.addCleanup(self.live.close)
+
+    def send(self, body, agent=True):
+        headers = {'content-type': 'application/json',
+                   'x-claude-code-session-id': 'sid'}
+        if agent:
+            headers['x-claude-code-agent-id'] = 'agent-1'
+        conn = http.client.HTTPConnection('127.0.0.1', self.live.port, timeout=30)
+        try:
+            conn.request('POST', '/v1/messages', body=json.dumps(body).encode(),
+                         headers=headers)
+            r = conn.getresponse()
+            return r.status, r.read()
+        finally:
+            conn.close()
+
+
+class GptCompactionTests(GptCompactionBase):
+
+    def test_subagent_is_compacted_by_gpt(self):
+        status, _ = self.send(long_history())
+        self.assertEqual(status, 200)
+        summary_call, turn = self.sidecar.seen
+        # The summary was written by GPT, on the agent's own model.
+        self.assertIn('<conversation>', json.dumps(summary_call['body']))
+        self.assertEqual(summary_call['body']['model'], 'gpt-6.1-sol')
+        sent = turn['body']
+        self.assertLess(devinx.estimate_tokens(sent), 6000)
+        self.assertEqual(sent['messages'][0]['content'], 'the task: fix the parser')
+        self.assertIn('SUMMARY: read f0..f9', json.dumps(sent['messages'][1]))
+        self.assertEqual(sent['messages'][-1]['content'], 'continue')
+
+    def test_next_turn_reuses_the_summary(self):
+        body = long_history()
+        self.send(body)
+        body['messages'] += [
+            {'role': 'assistant', 'content': [{'type': 'text', 'text': 'ok'}]},
+            {'role': 'user', 'content': 'go on'}]
+        self.send(body)
+        summaries = [c for c in self.sidecar.seen
+                     if '<conversation>' in json.dumps(c['body'])]
+        self.assertEqual(len(summaries), 1)
+
+    def test_main_session_is_left_to_compact_itself(self):
+        self.send(long_history(), agent=False)
+        (turn,) = self.sidecar.seen
+        self.assertEqual(len(turn['body']['messages']), len(long_history()['messages']))
+
+    def test_small_subagent_turn_is_relayed_byte_for_byte(self):
+        self.send(GPT_BODY)
+        (turn,) = self.sidecar.seen
+        self.assertEqual(turn['body'], GPT_BODY)
+
+    def test_slow_summary_keeps_the_stream_alive(self):
+        self.sidecar.answer = summariser(delay=2.5)
+        with mock.patch.object(devinx, 'KEEPALIVE_EVERY', 1):
+            status, raw = self.send(long_history())
+        self.assertEqual(status, 200)
+        self.assertTrue(raw.startswith(b': devinx compacting'))
+        self.assertIn(b'message_stop', raw)
+
+    def test_error_after_keepalive_is_an_sse_error(self):
+        slow = summariser(delay=2.5)
+
+        def answer(body):
+            if '<conversation>' in json.dumps(body):
+                return slow(body)
+            return 429, b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+        self.sidecar.answer = answer
+        with mock.patch.object(devinx, 'KEEPALIVE_EVERY', 1):
+            status, raw = self.send(long_history())
+        self.assertEqual(status, 200)
+        self.assertIn(b'event: error', raw)
+        self.assertIn(b'rate_limit_error', raw)
+
+
+class CodexRuleTests(GptCompactionBase):
+    """Compaction decided the way Codex decides it: on the server's counts."""
+
+    def setUp(self):
+        super().setUp()
+        devinx._gpt_usage.clear()
+
+    def test_reported_usage_triggers_compaction_the_estimate_would_miss(self):
+        def answer(body):
+            if '<conversation>' in json.dumps(body):
+                return summariser()(body)
+            # The server counts far more than the estimate does.
+            return 200, (b'event: message_delta\ndata: {"type":"message_delta",'
+                         b'"usage":{"input_tokens":5900,"output_tokens":50}}\n\n')
+        self.sidecar.answer = answer
+        body = long_history(turns=4, size=1000)
+        self.assertLess(devinx.estimate_tokens(body), 6000)
+        self.send(body)
+        self.assertEqual(len(self.sidecar.seen), 1)
+        body['messages'] += [
+            {'role': 'assistant', 'content': [{'type': 'text', 'text': 'more'}]},
+            {'role': 'user', 'content': 'x' * 400}]
+        self.send(body)
+        summaries = [c for c in self.sidecar.seen
+                     if '<conversation>' in json.dumps(c['body'])]
+        self.assertEqual(len(summaries), 1)
+
+    def test_context_refusal_is_retried_compacted_not_passed_on(self):
+        refused = []
+
+        def answer(body):
+            text = json.dumps(body)
+            if '<conversation>' in text:
+                return summariser()(body)
+            if not refused:
+                refused.append(len(text))
+                return 413, (b'{"type":"error","error":{"type":"request_too_large",'
+                             b'"message":"exceeds the context window"}}')
+            return 200, b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        self.sidecar.answer = answer
+        body = long_history(turns=4, size=1000)
+        status, raw = self.send(body)
+        self.assertEqual(status, 200)
+        self.assertIn(b'message_stop', raw)
+        turns = [c for c in self.sidecar.seen
+                 if '<conversation>' not in json.dumps(c['body'])]
+        self.assertEqual(len(turns), 2)
+        self.assertLess(len(json.dumps(turns[1]['body'])), refused[0])
+
+    def test_main_session_refusal_is_passed_on(self):
+        self.sidecar.answer = lambda body: (413, b'{"type":"error","error":'
+            b'{"type":"request_too_large","message":"exceeds the context window"}}')
+        status, raw = self.send(long_history(turns=4, size=1000), agent=False)
+        self.assertEqual(status, 400)
+        self.assertIn(b'prompt is too long', raw)
+
+
+class UsageSnifferTests(unittest.TestCase):
+
+    def test_split_lines_and_final_counts(self):
+        sniff = devinx.UsageSniffer()
+        stream = (b'event: message_start\ndata: {"type":"message_start","message":'
+                  b'{"usage":{"input_tokens":100,"cache_read_input_tokens":900}}}\n\n'
+                  b'event: message_delta\ndata: {"type":"message_delta","usage":'
+                  b'{"input_tokens":120,"output_tokens":30}}\n\n')
+        for i in range(0, len(stream), 7):
+            sniff.feed(stream[i:i + 7])
+        self.assertEqual(sniff.total, 120 + 900 + 30)
+
+
 def gpt_turn(tool=True):
     content = [{'type': 'thinking', 'thinking': 'plan',
                 'signature': 'ccp:codex:v1:opaque'}]
@@ -197,6 +387,32 @@ class ForeignThinkingTests(unittest.TestCase):
         self.assertTrue(devinx.strip_foreign_thinking(body, keep_text=True))
         block = body['messages'][1]['content'][0]
         self.assertEqual(block, {'type': 'thinking', 'thinking': 'plan'})
+
+
+class PickerSettingsTests(unittest.TestCase):
+
+    def test_rows_effort_and_window(self):
+        import launcher
+        flag, raw = launcher.picker_settings([])
+        self.assertEqual(flag, '--settings')
+        settings = json.loads(raw)
+        rows = settings['modelPicker']['options']
+        self.assertEqual([r['label'] for r in rows], ['Sol', 'Astra', 'Luna'])
+        for row in rows:
+            self.assertEqual(row['behavesAs'], 'claude-opus-5-5')
+            # Claude Code compacts its 33k buffer short of the window: there,
+            # Codex's 90% of 272k.
+            self.assertEqual(
+                settings['modelSettings'][row['model']]['autoCompactWindow'] - 33000,
+                devinx.GPT_COMPACT_AT)
+
+    def test_the_users_own_settings_win(self):
+        import launcher
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(launcher.picker_settings(['--settings', '{}']), [])
+            self.assertEqual(launcher.picker_settings(['--settings={}']), [])
 
 
 if __name__ == '__main__':

@@ -300,11 +300,15 @@ def split_at_separator(args):
 # rows instead, and it is read from flag settings, so `--settings` scopes it to
 # this session exactly like --agents.
 GPT_PICKER = (
-    ("gpt-6.1-sol", "GPT-6.1 Sol", "ChatGPT subscription, via claude-code-proxy"),
-    ("gpt-6-sol", "GPT-6 Sol", "ChatGPT subscription, via claude-code-proxy"),
-    ("gpt-6-luna", "GPT-6 Luna", "ChatGPT subscription, fast and light"),
-    ("gpt-6-astra", "GPT-6 Astra", "ChatGPT subscription, via claude-code-proxy"),
+    ("gpt-6.1-sol", "Sol", "GPT-6.1 Sol · ChatGPT, strongest"),
+    ("gpt-6-astra", "Astra", "GPT-6 Astra · ChatGPT"),
+    ("gpt-6-luna", "Luna", "GPT-6 Luna · ChatGPT, fast and light"),
 )
+GPT_BEHAVES_AS = "claude-opus-5-5"
+# Claude Code compacts a fixed 33k buffer short of this window (as /context
+# shows), so the window is set to land that point on Codex's own: 90% of
+# 272k = 244800 (codex-rs ModelInfo::auto_compact_token_limit).
+GPT_AUTO_COMPACT_WINDOW = 244800 + 33000
 
 
 def picker_settings(passthrough):
@@ -314,9 +318,20 @@ def picker_settings(passthrough):
         sys.stderr.write("devinx: --settings was already given; the GPT rows "
                          "were not added to /model (type /model gpt-6.1-sol)\n")
         return []
-    options = [{"model": mid, "label": label, "description": desc}
+    # behavesAs lends each row the client-side handling of a model Claude
+    # Code knows, the effort slider included; Opus 5.5 has exactly GPT-6's
+    # levels (low to max), and the sidecar turns output_config.effort into
+    # Codex's reasoning effort. The model id sent is unchanged.
+    options = [{"model": mid, "label": label, "description": desc,
+                "behavesAs": GPT_BEHAVES_AS}
                for mid, label, desc in GPT_PICKER]
-    return ["--settings", json.dumps({"modelPicker": {"options": options}})]
+    # The window has to be stated per model. behavesAs also lends Opus's 1M
+    # window, so auto-compact would wait for 1M on a model the ChatGPT backend
+    # cuts at 272k.
+    window = {mid: {"autoCompactWindow": GPT_AUTO_COMPACT_WINDOW}
+              for mid, _, _ in GPT_PICKER}
+    return ["--settings", json.dumps({"modelPicker": {"options": options},
+                                      "modelSettings": window})]
 
 
 def merge_agents(passthrough, agents):

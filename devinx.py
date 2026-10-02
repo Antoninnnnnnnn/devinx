@@ -92,7 +92,27 @@ GPT_MODELS = (
 )
 # The credential Claude Code sends is Anthropic's; it has no business leaving
 # for any other process, local or not.
+# What the ChatGPT backend gives a coding client for GPT-6.x: 272k, of which
+# Codex treats 95% as usable (effective_context_window_percent in its catalog,
+# ~/.codex/models_cache.json) and keeps the rest for output and overhead. The
+# model takes ~1M on the API, but past 272k a request is billed at the
+# long-context rate in full, and coding originators are clamped to 272k.
 GPT_CONTEXT_TOKENS = 272000
+# Codex's own rule, copied (codex-rs/protocol/src/openai_models.rs,
+# ModelInfo::auto_compact_token_limit): compact once the conversation reaches
+# 90% of the raw window, measured with the token counts the server reported,
+# not an estimate. 244800 for GPT-6.x.
+GPT_COMPACT_AT = int(os.environ.get(
+    "DEVINX_GPT_COMPACT_AT", str(GPT_CONTEXT_TOKENS * 9 // 10)))
+# What the server last reported for each GPT subagent conversation, as
+# key -> (client message count, reported tokens, estimate of what was sent,
+# whether what was sent was compacted). Codex decides on the last reported
+# usage plus an estimate of what was added since; so does this, while the
+# client's history is still what goes upstream. Once it is compacted the
+# report covers the compacted body, not the client's, and only the ratio of
+# reported to estimated still says anything.
+_gpt_usage = {}
+_gpt_usage_lock = threading.Lock()
 GPT_STRIPPED = {"authorization", "x-api-key", "cookie"}
 AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt"
 CHAT_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage"
@@ -2195,6 +2215,78 @@ def _summarise_once(messages, model, system, previous, turn):
         return None
 
 
+def _summarise_once_gpt(messages, model, system, previous, turn):
+    """_summarise_once for a GPT conversation: the same summary request, sent
+    to the claude-code-proxy sidecar on the agent's own model, so what a GPT
+    subagent did is summarised by GPT and never sent to Cognition.
+
+    Same contract: waits out what passes (rate limits, the sidecar restarting,
+    an empty answer) within the turn's budget; None when the budget is spent
+    or the error will not pass; _TOO_LONG when the piece has to be split.
+    """
+    payload = _summary_body(messages, model, system, previous)
+    # Extraction over a long transcript: medium is enough, and it is what keeps
+    # a summary at seconds rather than the minutes high effort spends.
+    payload["output_config"] = {"effort": "medium"}
+    t0, drops, empties = time.time(), 0, 0
+    while True:
+        turn.check()
+        left = turn.left()
+        if left <= 0:
+            print(f"summary(gpt): {time.time() - t0:.0f}s spent without an "
+                  f"answer", flush=True)
+            return None
+        try:
+            r = SESSION.post(GPT_UPSTREAM + "/v1/messages", json=payload,
+                             headers={"anthropic-version": "2023-06-01"},
+                             timeout=(10, max(30.0, min(left, 600.0))))
+        except requests.RequestException as e:
+            drops += 1
+            wait = min(2 ** drops, 30, left)
+            print(f"summary(gpt): sidecar unreachable ({type(e).__name__}), "
+                  f"retrying in {wait:.0f}s", flush=True)
+            turn.sleep(wait)
+            continue
+        text = r.text[:4000]
+        if r.status_code == 200:
+            try:
+                blocks = r.json().get("content") or []
+            except ValueError:
+                blocks = []
+            got = "".join(b.get("text", "") for b in blocks
+                          if b.get("type") == "text").strip()
+            if not got:
+                # The reasoning is not the summary asked for, but it is an
+                # account of the same turns.
+                got = "".join(b.get("thinking", "") for b in blocks
+                              if b.get("type") == "thinking").strip()
+            if got:
+                print(f"summary(gpt) done: latency={time.time() - t0:.1f}s "
+                      f"chars={len(got)} model={model}", flush=True)
+                return got
+            empties += 1
+            if empties <= 2:
+                print("summary(gpt): empty answer, asking again", flush=True)
+                continue
+            return None
+        if r.status_code == 413 or "too long" in text.lower():
+            return _TOO_LONG
+        if r.status_code in (429, 500, 502, 503, 504, 529):
+            drops += 1
+            try:
+                wait = float(r.headers.get("retry-after") or 0)
+            except ValueError:
+                wait = 0
+            wait = min(wait or min(5 * 2 ** (drops - 1), 120), left)
+            print(f"summary(gpt): {r.status_code}, waiting {wait:.0f}s",
+                  flush=True)
+            turn.sleep(wait)
+            continue
+        print(f"summary(gpt): giving up on {r.status_code} {text[:120]}",
+              flush=True)
+        return None
+
+
 def _digest_turns(messages, cap=48000):
     """What the dropped turns did, written by the proxy itself.
 
@@ -2248,7 +2340,8 @@ def _chunks(messages, cap):
     return out
 
 
-def summarise_turns(messages, model, system, previous=None, never_empty=True):
+def summarise_turns(messages, model, system, previous=None, never_empty=True,
+                    once=None):
     """Summarise dropped turns. With never_empty, this always returns a text.
 
     A span too big for one call is summarised in pieces, each one extending the
@@ -2270,7 +2363,7 @@ def summarise_turns(messages, model, system, previous=None, never_empty=True):
               flush=True)
     while pending:
         piece = pending.pop(0)
-        got = _summarise_once(piece, model, system, summary, turn)
+        got = (once or _summarise_once)(piece, model, system, summary, turn)
         if got is _TOO_LONG and len(piece) > 1:
             half = len(piece) // 2
             pending[:0] = [piece[:half], piece[half:]]
@@ -2464,32 +2557,94 @@ def _tail_start(messages, budget):
     return start
 
 
-def compact_body(body):
+# What an on_error hook returns to have the relay hand the turn back, nothing
+# sent, for its caller to try once more.
+RETRY = object()
+
+
+class UsageSniffer:
+    """Reads the token usage out of an Anthropic SSE stream being relayed.
+
+    message_start carries the input side and message_delta the final counts;
+    the last value seen for each field wins. Lines can be split across chunks,
+    so a partial line waits for the next one.
+    """
+
+    FIELDS = ("input_tokens", "cache_read_input_tokens",
+              "cache_creation_input_tokens", "output_tokens")
+
+    def __init__(self):
+        self._tail = b""
+        self.usage = {}
+
+    def feed(self, chunk):
+        lines = (self._tail + chunk).split(b"\n")
+        self._tail = lines.pop()
+        for line in lines:
+            if not line.startswith(b"data:") or b'"usage"' not in line:
+                continue
+            try:
+                event = json.loads(line[5:])
+            except ValueError:
+                continue
+            usage = ((event.get("message") or {}).get("usage")
+                     or event.get("usage") or {})
+            for field in self.FIELDS:
+                if isinstance(usage.get(field), int) and usage[field] > 0:
+                    self.usage[field] = usage[field]
+
+    @property
+    def total(self):
+        return sum(self.usage.values())
+
+
+class CompactProfile:
+    """Who a compaction answers to: the budget it reduces to, the summariser
+    that writes the summary, the model that summariser runs on, and the
+    namespace its summaries are kept under. SWE-2 is the default; the gpt-*
+    route has its own, so a GPT conversation is summarised by GPT and never
+    leaves for Cognition."""
+
+    def __init__(self, limit, once=None, model=None, namespace=""):
+        self.limit, self.once = limit, once
+        self.model, self.namespace = model, namespace
+
+    def summarise_kwargs(self):
+        # Nothing for the default, so the SWE-2 call stays exactly what it was.
+        return {"once": self.once} if self.once else {}
+
+
+SWE_PROFILE = CompactProfile(None)
+
+
+def compact_body(body, profile=SWE_PROFILE):
+    limit = profile.limit or COMPACT_AT
     messages = body.get("messages") or []
     # One memo for the whole compaction: every estimate below reweighs the
     # same message objects.
     memo = {}
-    if estimate_tokens(body, memo) <= COMPACT_AT:
+    if estimate_tokens(body, memo) <= limit:
         return body
     if len(messages) < 4:
         if COMPACT_STRICT:
             raise CompactionUnavailable("context exceeds the budget with no safely droppable turns")
         return body
-    with _summary_guard(_conv_key(body)):
-        return _compact_body(body, memo)
+    with _summary_guard(profile.namespace + _conv_key(body)):
+        return _compact_body(body, memo, profile)
 
 
-def _compact_body(body, memo=None):
+def _compact_body(body, memo=None, profile=SWE_PROFILE):
     """Replace the middle of an over-long conversation with a summary.
 
     The first turn stays: it is the task. The recent turns stay verbatim: they
     are what the agent is doing right now. Everything between becomes one
     summary, written with Claude Code's own compaction prompt.
     """
+    limit = profile.limit or COMPACT_AT
     messages = body.get("messages") or []
-    if len(messages) < 4 or estimate_tokens(body, memo) <= COMPACT_AT:
+    if len(messages) < 4 or estimate_tokens(body, memo) <= limit:
         return body
-    start = _tail_start(messages, int(COMPACT_AT * COMPACT_TAIL))
+    start = _tail_start(messages, int(limit * COMPACT_TAIL))
     if start <= 1 or start >= len(messages):
         # Nothing to drop that would help; the size is the first turn or the
         # tail alone, and summarising cannot fix either.
@@ -2498,7 +2653,7 @@ def _compact_body(body, memo=None):
         print("compaction: nothing droppable, forwarding as is", flush=True)
         return body
 
-    key = _conv_key(body)
+    key = profile.namespace + _conv_key(body)
     span = _span_blocks(messages, start)
     total_blocks = _count_blocks(messages)
     # Several summaries per key, each good for exactly the history it covers.
@@ -2551,17 +2706,18 @@ def _compact_body(body, memo=None):
             {"type": "text", "text": (text or "") + retained}]}]
         trial = dict(body)
         trial["messages"] = head + _regroup(uncovered) + messages[start:]
-        return estimate_tokens(trial, memo) <= COMPACT_AT, trial
+        return estimate_tokens(trial, memo) <= limit, trial
 
     room, _ = fits(summary, fresh)
     if summary is None or not room:
-        model = resolve_model(body)
+        model = profile.model or resolve_model(body)
         before = estimate_tokens(body, memo)
         # Only what arrived since the last summary, extending it rather than
         # rebuilding it: the difference between a few seconds a turn and half a
         # minute a turn.
         fresh_count = len(fresh)
-        new = summarise_turns(_regroup(fresh), model, _system_text(body), summary)
+        new = summarise_turns(_regroup(fresh), model, _system_text(body), summary,
+                              **profile.summarise_kwargs())
         if not new and summary is None and COMPACT_STRICT:
             raise CompactionUnavailable("no summary available; no turns were discarded")
         if not new and summary is None:
@@ -2572,7 +2728,7 @@ def _compact_body(body, memo=None):
             # agent loses the middle of its run, which is a real loss, and it
             # keeps its task, its recent work and its life.
             print(f"compaction: no summary available ({before} tokens, over "
-                  f"{COMPACT_AT}); dropping {len(span)} blocks unsummarised",
+                  f"{limit}); dropping {len(span)} blocks unsummarised",
                   flush=True)
             summary = None
         elif not new:
@@ -2591,7 +2747,8 @@ def _compact_body(body, memo=None):
             # short call against a record that would otherwise never stop.
             folded = summarise_turns(
                 [{"role": "user", "content": [{"type": "text", "text": summary}]}],
-                model, _system_text(body), None, never_empty=False)
+                model, _system_text(body), None, never_empty=False,
+                **profile.summarise_kwargs())
             if folded:
                 print(f"compaction: summary folded, {len(summary) // 4} -> "
                       f"{len(folded) // 4} tokens", flush=True)
@@ -2610,7 +2767,7 @@ def _compact_body(body, memo=None):
         if new:
             print(f"compaction: {fresh_count} more blocks summarised "
                   f"({covered} of {len(span)} covered, {before} tokens "
-                  f"estimated, over {COMPACT_AT})", flush=True)
+                  f"estimated, over {limit})", flush=True)
 
     # Uncovered turns ride verbatim only when there is a summary in front of
     # them. With none — the summariser could not be reached — they are what had
@@ -2636,9 +2793,9 @@ def _compact_body(body, memo=None):
         return out
 
     compacted = assemble(carried)
-    if COMPACT_STRICT and estimate_tokens(compacted, memo) > COMPACT_AT:
+    if COMPACT_STRICT and estimate_tokens(compacted, memo) > limit:
         raise CompactionUnavailable("preserved context still exceeds the compaction budget")
-    if carried and estimate_tokens(compacted, memo) > COMPACT_AT:
+    if carried and estimate_tokens(compacted, memo) > limit:
         # The summary could not be extended far enough to make room. Whatever
         # it does not cover goes, because a body over the limit comes back
         # refused and that ends the agent.
@@ -3827,6 +3984,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
         self.close_connection = True
 
+    def send_sse_error(self, kind, message):
+        """An error after a 200 was committed: the event the real API sends."""
+        data = json.dumps({"type": "error", "error": {"type": kind, "message": message}})
+        try:
+            self.wfile.write(f"event: error\ndata: {data}\n\n".encode())
+            self.wfile.flush()
+        except OSError:
+            pass
+
     def send_error_json(self, status, kind, message, retry_after=None):
         self.send_json(status, {"type": "error",
                                 "error": {"type": kind, "message": message}},
@@ -4295,9 +4461,7 @@ class Handler(BaseHTTPRequestHandler):
                     403, "permission_error",
                     "Refusing a browser-originated request on the GPT route")
                 return
-            self.relay(raw, model, GPT_UPSTREAM + self.path, "gpt",
-                       strip=GPT_STRIPPED,
-                       on_error=lambda status, text: gpt_error(status, text, body))
+            self.serve_gpt(raw, body, model, path)
             return
 
         if not model.startswith("claude-"):
@@ -4403,11 +4567,139 @@ class Handler(BaseHTTPRequestHandler):
                   flush=True)
             self.close_connection = True
 
-    def relay(self, raw, model, url, label, strip=(), on_error=None):
+    def serve_gpt(self, raw, body, model, path):
+        """Relay a Claude Code gpt-* turn to the sidecar.
+
+        Only a subagent is compacted here: the main session compacts on its
+        own, visibly and with the sidecar's native compaction behind it, while
+        a subagent never does and is ended by the first refusal. So for a
+        subagent a context refusal is not passed on either: the history is cut
+        harder and the turn tried once more.
+        """
+        agent = (path == "/v1/messages"
+                 and bool(self.headers.get("x-claude-code-agent-id")))
+        original, committed = body, False
+        for attempt in (0, 1):
+            on_usage = None
+            if agent:
+                key = "gpt\0" + _conv_key(original)
+                count = len(original.get("messages") or [])
+                body, committed = self.compact_gpt(original, force=attempt > 0,
+                                                   committed=committed)
+                if body is None:
+                    return
+                shrunk = body is not original
+                raw = json.dumps(body).encode() if shrunk else raw
+                sent = estimate_tokens(body)
+
+                def on_usage(total, key=key, count=count, sent=sent, shrunk=shrunk):
+                    with _gpt_usage_lock:
+                        if key not in _gpt_usage and len(_gpt_usage) >= 256:
+                            _gpt_usage.pop(next(iter(_gpt_usage)))
+                        _gpt_usage[key] = (count, total, sent, shrunk)
+
+            def on_error(status, text, body=body, retry=agent and not attempt):
+                if retry and status == 413 and "context" in text.lower():
+                    return RETRY
+                return gpt_error(status, text, body)
+
+            if self.relay(raw, model, GPT_UPSTREAM + self.path, "gpt",
+                          strip=GPT_STRIPPED, committed=committed,
+                          on_usage=on_usage, on_error=on_error) is not RETRY:
+                return
+
+    def compact_gpt(self, body, force=False, committed=False):
+        """Reduce a GPT subagent's history before it outgrows the window.
+
+        Returns (body, committed): the body to send — the same object when
+        nothing had to change — and whether a 200 and an SSE stream were
+        already started to keep the client waiting through a long summary.
+        None for the body means the client left.
+
+        The summary runs on a worker so this thread can keep the connection
+        alive: Claude Code gives up on five silent minutes, and a summary of a
+        long run can take a few. The keepalive is an SSE comment, which every
+        SSE parser skips, so nothing in the event order changes.
+        """
+        messages = body.get("messages") or []
+        estimated = estimate_tokens(body)
+        key = "gpt\0" + _conv_key(body)
+        with _gpt_usage_lock:
+            reported = _gpt_usage.get(key)
+        measured = estimated
+        if reported and not reported[3] and reported[0] <= len(messages):
+            # The server's count for the history it saw, plus an estimate of
+            # only what was added after it, as Codex does.
+            measured = reported[1] + estimate_tokens(
+                {"messages": messages[reported[0]:]})
+        elif reported and reported[2]:
+            measured = int(estimated * reported[1] / reported[2])
+        if force:
+            # The server refused this size: whatever the counts said, they
+            # were short. Cut to well under the limit by the estimate itself.
+            measured = max(measured, int(GPT_COMPACT_AT * 1.25))
+        if measured < GPT_COMPACT_AT or len(messages) < 4:
+            return body, committed
+        # compact_body sizes by estimate. Scaling the limit by how far the
+        # estimate is from the server's count makes it cut where the server's
+        # count would, in both directions.
+        limit = max(1000, int(GPT_COMPACT_AT * estimated / max(measured, 1)))
+        print(f"compaction(gpt): {measured} tokens measured ({estimated} "
+              f"estimated), over {GPT_COMPACT_AT}", flush=True)
+        turn = Turn(conn=getattr(self, "connection", None))
+        profile = CompactProfile(limit, once=_summarise_once_gpt,
+                                 model=body.get("model"), namespace="gpt\0")
+        result = {}
+
+        def work():
+            _request_local.turn = turn
+            try:
+                result["body"] = compact_body(body, profile)
+            except ClientGone:
+                result["gone"] = True
+            except Exception as e:
+                # Compaction is a rescue, never a new way to fail.
+                print(f"compaction(gpt): {type(e).__name__}: {e}; forwarding "
+                      f"as is", flush=True)
+                result["body"] = body
+            finally:
+                _request_local.turn = None
+
+        _request_phase("compacting")
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        last = time.time()
+        while worker.is_alive():
+            worker.join(1.0)
+            if (worker.is_alive() and body.get("stream") and KEEPALIVE_EVERY > 0
+                    and time.time() - last >= KEEPALIVE_EVERY):
+                try:
+                    if not committed:
+                        self.send_response(200)
+                        self.send_header("content-type", "text/event-stream")
+                        self.send_header("cache-control", "no-cache")
+                        self.send_header("connection", "close")
+                        self.end_headers()
+                        committed = True
+                    self.wfile.write(b": devinx compacting\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    turn.gone.set()
+                last = time.time()
+        if result.get("gone"):
+            print("compaction(gpt): client left during the summary", flush=True)
+            self.close_connection = True
+            return None, committed
+        return result.get("body", body), committed
+
+    def relay(self, raw, model, url, label, strip=(), on_error=None,
+              committed=False, on_usage=None):
         """Transparent relay. Headers pass through untouched, including the
         caller's credential unless `strip` names it; this process adds nothing
         of its own. `on_error(status, text)` may replace an upstream error
-        with (status, type, message) of its own."""
+        with (status, type, message) of its own. `committed` means a 200 and an
+        SSE stream were already started: only the body follows, and an error
+        becomes an SSE error event."""
         response = None
         response_started = False
         relay_started = time.time()
@@ -4431,19 +4723,40 @@ class Handler(BaseHTTPRequestHandler):
                 text = ("" if response.headers.get("content-encoding")
                         else consumed[:65536].decode("utf-8", "replace"))
                 replaced = on_error(response.status_code, text)
+                if replaced is RETRY:
+                    print(f"route={label} model={model} "
+                          f"status={response.status_code} -> retrying",
+                          flush=True)
+                    return RETRY
                 if replaced is not None:
                     print(f"route={label} model={model} "
                           f"status={response.status_code}->{replaced[0]} "
                           f"in {time.time() - relay_started:.1f}s", flush=True)
-                    self.send_error_json(*replaced)
+                    if committed:
+                        self.send_sse_error(replaced[1], replaced[2])
+                    else:
+                        self.send_error_json(*replaced)
                     return
+            if committed and response.status_code >= 400:
+                if consumed is None:
+                    consumed = response.raw.read(decode_content=True)
+                try:
+                    error = json.loads(consumed).get("error") or {}
+                except (ValueError, AttributeError):
+                    error = {}
+                self.send_sse_error(error.get("type") or "api_error",
+                                    error.get("message") or f"upstream {response.status_code}")
+                print(f"route={label} model={model} status={response.status_code} "
+                      f"(sse) in {time.time() - relay_started:.1f}s", flush=True)
+                return
             response_started = True
-            self.send_response(response.status_code)
-            for name, value in response.headers.items():
-                if name.lower() not in RESPONSE_EXCLUDED:
-                    self.send_header(name, value)
-            self.send_header("connection", "close")
-            self.end_headers()
+            if not committed:
+                self.send_response(response.status_code)
+                for name, value in response.headers.items():
+                    if name.lower() not in RESPONSE_EXCLUDED:
+                        self.send_header(name, value)
+                self.send_header("connection", "close")
+                self.end_headers()
             # Diagnostic only, behind the same gate as the request dump: the
             # upstream stream is the only authoritative description of the event
             # vocabulary a given client version actually consumes.
@@ -4458,7 +4771,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(consumed)
                 self.wfile.flush()
             elif self.command != "HEAD":
-                for chunk in response.raw.stream(65536, decode_content=False):
+                # Behind headers of our own, the body has to be plain: the
+                # upstream's Content-Encoding was never relayed.
+                sniff = (UsageSniffer() if on_usage is not None
+                         and response.status_code == 200
+                         and not response.headers.get("content-encoding")
+                         else None)
+                for chunk in response.raw.stream(65536, decode_content=committed):
+                    if sniff is not None and chunk:
+                        sniff.feed(chunk)
                     if chunk:
                         if tap is not None:
                             tap.write(chunk)
@@ -4466,6 +4787,9 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
             if tap is not None:
                 tap.close()
+            if (on_usage is not None and self.command != "HEAD"
+                    and consumed is None and sniff is not None and sniff.total):
+                on_usage(sniff.total)
             print(f"route={label} model={model} status={response.status_code} "
                   f"in {time.time() - relay_started:.1f}s",
                   flush=True)
@@ -4477,7 +4801,9 @@ class Handler(BaseHTTPRequestHandler):
             print(f"route={label} model={model} status={type(error).__name__} "
                   f"in {time.time() - relay_started:.1f}s",
                   flush=True)
-            if not response_started:
+            if committed:
+                self.send_sse_error("api_error", "Upstream unavailable")
+            elif not response_started:
                 self.send_error_json(502, "api_error", "Upstream unavailable")
         finally:
             if response is not None:
