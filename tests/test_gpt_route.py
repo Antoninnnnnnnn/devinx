@@ -415,5 +415,18 @@ class PickerSettingsTests(unittest.TestCase):
             self.assertEqual(launcher.picker_settings(['--settings={}']), [])
 
 
+class AgentEffortTests(unittest.TestCase):
+
+    def test_gpt_subagents_carry_codex_effort(self):
+        import launcher
+        agents = launcher.packaged_agents()
+        # Codex's catalog: multi_agent_reasoning_effort xhigh for Sol and
+        # Astra, none for Luna, which follows the session.
+        self.assertEqual(agents['gpt-sol']['effort'], 'xhigh')
+        self.assertEqual(agents['gpt-astra']['effort'], 'xhigh')
+        self.assertNotIn('effort', agents['gpt-luna'])
+        self.assertEqual(agents['gpt-sol']['model'], 'gpt-6.1-sol')
+
+
 if __name__ == '__main__':
     unittest.main()

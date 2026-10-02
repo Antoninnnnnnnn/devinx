@@ -209,6 +209,9 @@ def split_args(argv):
     return use_devin, use_orch, use_codex, out
 
 
+AGENT_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
 def packaged_agents():
     """Parse agents/*.md into the JSON shape `claude --agents` expects.
 
@@ -257,6 +260,15 @@ def packaged_agents():
             except ValueError:
                 sys.stderr.write(f"devinx: agent {name!r} has a non-numeric "
                                  f"maxTurns ({meta['maxTurns']!r}); ignoring it\n")
+        if meta.get("effort"):
+            # Without it a subagent runs at the session's effort (measured: a
+            # low session sends its subagents low). Pinning it is how a role
+            # keeps the effort it was designed for.
+            if meta["effort"] in AGENT_EFFORTS:
+                agent["effort"] = meta["effort"]
+            else:
+                sys.stderr.write(f"devinx: agent {name!r} has an unknown effort "
+                                 f"({meta['effort']!r}); ignoring it\n")
         tools = [t.strip() for t in meta.get("tools", "").split(",") if t.strip()]
         if tools:
             agent["tools"] = tools

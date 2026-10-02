@@ -410,8 +410,11 @@ systemctl --user enable --now claude-code-proxy
 (`gpt-6-luna`), with the effort slider (low to max): the launcher passes a
 session-scoped `--settings` whose `modelPicker` rows use `behavesAs:
 claude-opus-5-5` for the client-side handling, and the sidecar turns
-`output_config.effort` into Codex's reasoning effort. The `gpt-sol` and
-`gpt-luna` subagents are injected with the `swe2-*` ones. A user `--settings`
+`output_config.effort` into Codex's reasoning effort. The `gpt-sol`,
+`gpt-astra` and `gpt-luna` subagents are injected with the `swe2-*` ones; an
+agent's `effort:` frontmatter pins its effort, otherwise it runs at the
+session's. Sol and Astra are pinned at `xhigh`, Codex's own
+`multi_agent_reasoning_effort` for them; Luna follows the session. A user `--settings`
 wins, and then the rows are not added.
 
 **Compaction copies Codex** (`ModelInfo::auto_compact_token_limit` in
