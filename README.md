@@ -408,8 +408,22 @@ systemctl --user enable --now claude-code-proxy
 
 `/model gpt-6.1-sol` (or any `GPT_MODELS` entry) switches the session; the
 `gpt-sol` and `gpt-luna` subagents are injected with the `swe2-*` ones.
-Switching the *same* conversation between claude-* and gpt-* mid-thread can be
-refused: each side's thinking signatures are opaque to the other.
+Switching a conversation from gpt-* back to claude-* works: GPT-signed thinking
+(`ccp:` signatures) is dropped from a claude-* history, and kept unsigned on
+swe-2-*.
+
+Limits:
+
+- Nothing compacts a GPT **subagent** (devinx's proxy-side compaction summarises
+  on SWE-2, and a GPT conversation is not sent to Cognition for that). A long
+  `gpt-sol` run stops at ~272k tokens; brief it for bounded work. The main
+  session compacts as usual.
+- The sidecar is a patched build: upstream claude-code-proxy (0.1.43) accepts
+  browser-originated requests and any `Host`, so a page could spend the ChatGPT
+  quota. The local patch refuses any `Origin` and any non-loopback `Host`.
+  Reinstalling with `install.sh` or brew **overwrites it** with the unpatched
+  binary.
+  The patch is kept in `~/devinx-local/claude-code-proxy-v0.1.43-origin-guard.patch`.
 
 ### Why the SWE-2 route refuses browsers
 

@@ -92,6 +92,7 @@ GPT_MODELS = (
 )
 # The credential Claude Code sends is Anthropic's; it has no business leaving
 # for any other process, local or not.
+GPT_CONTEXT_TOKENS = 272000
 GPT_STRIPPED = {"authorization", "x-api-key", "cookie"}
 AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt"
 CHAT_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage"
@@ -191,6 +192,75 @@ def repair_tool_ids(body):
                     if fixed != value:
                         block[key] = fixed
                         changed = True
+    return changed
+
+
+# claude-code-proxy signs the thinking it emits for GPT with this prefix: an
+# encrypted Codex reasoning item only OpenAI can open. Anthropic verifies every
+# signature it is replayed, so one of these in a claude-* history refuses the
+# whole request — and Claude Code resends the history every turn, so a session
+# that ran a turn on gpt-* would stay refused on claude-* until /clear.
+FOREIGN_SIGNATURE_PREFIX = "ccp:"
+
+
+def gpt_error(status, text, body):
+    """Say what a claude-code-proxy error means to Claude Code.
+
+    A 401 there is the sidecar's own ChatGPT login, not the user's claude.ai
+    one, and relayed as is it sends them to /login for nothing. A 413 about the
+    context window carries no figures, and the client only recovers from an
+    overflow it can read two numbers out of (see anthropic_error).
+    """
+    if status == 401:
+        return (503, "api_error", "devinx GPT sidecar is not logged in to "
+                "ChatGPT: run `claude-code-proxy codex auth login`")
+    if status == 413 and "context" in text.lower():
+        return (400, "invalid_request_error",
+                f"prompt is too long: {estimate_tokens(body)} tokens > "
+                f"{GPT_CONTEXT_TOKENS} maximum")
+    return None
+
+
+def _foreign(block):
+    return (isinstance(block, dict)
+            and block.get("type") in ("thinking", "redacted_thinking")
+            and str(block.get("signature") or "").startswith(
+                FOREIGN_SIGNATURE_PREFIX))
+
+
+def strip_foreign_thinking(body, keep_text=False):
+    """Take GPT-signed thinking out of a history bound for another upstream.
+
+    With keep_text the block stays and only its signature goes: Cognition
+    accepts replayed thinking unsigned. Without it the block goes entirely,
+    which is what Anthropic needs. Anthropic also refuses a final assistant
+    turn that calls a tool without opening on a thinking block while thinking
+    is on, so when that turn loses one, thinking is turned off for this one
+    request rather than the request being refused.
+
+    Returns whether anything changed, so the relay can stay byte for byte for
+    every request that carries nothing foreign.
+    """
+    messages = body.get("messages") or []
+    last_assistant = max((i for i, m in enumerate(messages)
+                          if isinstance(m, dict)
+                          and m.get("role") == "assistant"), default=None)
+    changed = touched_last = False
+    for i, message in enumerate(messages):
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or not any(map(_foreign, content)):
+            continue
+        changed = True
+        if keep_text:
+            for block in content:
+                if _foreign(block):
+                    block.pop("signature", None)
+            continue
+        kept = [b for b in content if not _foreign(b)]
+        message["content"] = kept or [{"type": "text", "text": "(reasoning omitted)"}]
+        touched_last = touched_last or i == last_assistant
+    if touched_last and isinstance(body.get("thinking"), dict):
+        body.pop("thinking", None)
     return changed
 
 
@@ -4106,8 +4176,8 @@ class Handler(BaseHTTPRequestHandler):
                     "created_at": "2026-01-01T00:00:00Z",
                     "object": "model", "created": 1767225600,
                     "owned_by": "devinx",
-                    "context_window": 272000,
-                    "runtime": {"max_input_tokens": 272000,
+                    "context_window": GPT_CONTEXT_TOKENS,
+                    "runtime": {"max_input_tokens": GPT_CONTEXT_TOKENS,
                                 "max_output_tokens": 128000}}
                    for mid, name in GPT_MODELS]
         # `data` is what Claude Code reads, `models` what Codex reads; serving
@@ -4226,7 +4296,8 @@ class Handler(BaseHTTPRequestHandler):
                     "Refusing a browser-originated request on the GPT route")
                 return
             self.relay(raw, model, GPT_UPSTREAM + self.path, "gpt",
-                       strip=GPT_STRIPPED)
+                       strip=GPT_STRIPPED,
+                       on_error=lambda status, text: gpt_error(status, text, body))
             return
 
         if not model.startswith("claude-"):
@@ -4240,12 +4311,18 @@ class Handler(BaseHTTPRequestHandler):
         # Anthropic refuses, and would be unusable on a claude-* model forever.
         # The body is rebuilt only when something actually changed, so every
         # other request is relayed byte for byte as before.
-        if repair_tool_ids(body):
-            raw = json.dumps(body).encode()
+        repaired = repair_tool_ids(body)
+        if repaired:
             print("repaired tool ids carried by an older transcript", flush=True)
+        if strip_foreign_thinking(body):
+            repaired = True
+            print("dropped GPT-signed thinking from a claude-* history", flush=True)
+        if repaired:
+            raw = json.dumps(body).encode()
         self.relay(raw, model, CLAUDE_UPSTREAM + self.path, "claude")
 
     def serve_swe(self, body):
+        strip_foreign_thinking(body, keep_text=True)
         stream = bool(body.get("stream"))
         started = time.time()
         # What the client actually got. Until now only the relayed route logged
@@ -4326,10 +4403,11 @@ class Handler(BaseHTTPRequestHandler):
                   flush=True)
             self.close_connection = True
 
-    def relay(self, raw, model, url, label, strip=()):
+    def relay(self, raw, model, url, label, strip=(), on_error=None):
         """Transparent relay. Headers pass through untouched, including the
         caller's credential unless `strip` names it; this process adds nothing
-        of its own."""
+        of its own. `on_error(status, text)` may replace an upstream error
+        with (status, type, message) of its own."""
         response = None
         response_started = False
         relay_started = time.time()
@@ -4343,6 +4421,22 @@ class Handler(BaseHTTPRequestHandler):
                                        allow_redirects=False,
                                        timeout=(15, RELAY_READ_TIMEOUT))
             _request_phase("relaying")
+            # An error body read to judge it is gone from the stream, so one
+            # that is kept is written from here rather than relayed again.
+            consumed = None
+            if on_error is not None and response.status_code >= 400:
+                # Raw, so the bytes still match the Content-Encoding and
+                # Content-Length relayed with them.
+                consumed = response.raw.read(decode_content=False)
+                text = ("" if response.headers.get("content-encoding")
+                        else consumed[:65536].decode("utf-8", "replace"))
+                replaced = on_error(response.status_code, text)
+                if replaced is not None:
+                    print(f"route={label} model={model} "
+                          f"status={response.status_code}->{replaced[0]} "
+                          f"in {time.time() - relay_started:.1f}s", flush=True)
+                    self.send_error_json(*replaced)
+                    return
             response_started = True
             self.send_response(response.status_code)
             for name, value in response.headers.items():
@@ -4360,7 +4454,10 @@ class Handler(BaseHTTPRequestHandler):
                                f"{time.time_ns()}.sse", "wb")
                 except OSError:
                     tap = None
-            if self.command != "HEAD":
+            if consumed is not None:
+                self.wfile.write(consumed)
+                self.wfile.flush()
+            elif self.command != "HEAD":
                 for chunk in response.raw.stream(65536, decode_content=False):
                     if chunk:
                         if tap is not None:

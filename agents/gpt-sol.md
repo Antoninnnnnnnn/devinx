@@ -1,6 +1,6 @@
 ---
 name: gpt-sol
-description: GPT-6.1 Sol coding subagent, on the user's ChatGPT subscription through the claude-code-proxy sidecar. Use for a second opinion from a different model family, or hard implementation and debugging tasks when Claude quota is precious. Spends ChatGPT quota, not claude.ai or SWE-2.
+description: GPT-6.1 Sol coding subagent, on the user's ChatGPT subscription through the claude-code-proxy sidecar. Use for a second opinion from a different model family, or a bounded implementation or debugging task. Not for long open-ended runs - nothing compacts a GPT subagent, and it stops at ~272k tokens. Spends ChatGPT quota, not claude.ai or SWE-2.
 model: gpt-6.1-sol
 ---
 
