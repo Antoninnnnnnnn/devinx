@@ -417,16 +417,25 @@ class PickerSettingsTests(unittest.TestCase):
 
 class AgentEffortTests(unittest.TestCase):
 
-    def test_gpt_subagents_carry_codex_effort(self):
+    def test_every_gpt_model_at_every_effort_but_low(self):
         import launcher
         agents = launcher.packaged_agents()
-        # Codex's catalog: multi_agent_reasoning_effort xhigh for Sol and
-        # Astra, none for Luna, which follows the session.
-        self.assertEqual(agents['gpt-sol']['effort'], 'xhigh')
-        self.assertEqual(agents['gpt-astra']['effort'], 'xhigh')
-        self.assertNotIn('effort', agents['gpt-luna'])
-        self.assertEqual(agents['gpt-sol']['model'], 'gpt-6.1-sol')
+        for short, model in (('sol', 'gpt-6.1-sol'), ('astra', 'gpt-6-astra'),
+                             ('luna', 'gpt-6-luna')):
+            self.assertNotIn(f'gpt-{short}-low', agents)
+            for effort in ('medium', 'high', 'xhigh', 'max'):
+                agent = agents[f'gpt-{short}-{effort}']
+                self.assertEqual((agent['model'], agent['effort']), (model, effort))
+                self.assertEqual(agent['disallowedTools'], ['mcp__*'])
 
+    def test_low_effort_runs_as_medium(self):
+        body = {'output_config': {'effort': 'low'}}
+        self.assertTrue(devinx.gpt_raise_low_effort(body))
+        self.assertEqual(body['output_config']['effort'], 'medium')
+        for effort in ('medium', 'high', 'xhigh', 'max'):
+            body = {'output_config': {'effort': effort}}
+            self.assertFalse(devinx.gpt_raise_low_effort(body))
+        self.assertFalse(devinx.gpt_raise_low_effort({}))
 
 if __name__ == '__main__':
     unittest.main()

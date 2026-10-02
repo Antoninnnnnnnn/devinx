@@ -220,6 +220,17 @@ def repair_tool_ids(body):
 FOREIGN_SIGNATURE_PREFIX = "ccp:"
 
 
+def gpt_raise_low_effort(body):
+    """Medium is the floor on GPT: the picker borrows Opus's effort scale,
+    which starts at low, and low is not a level these models are run at here.
+    Returns whether the body changed."""
+    config = body.get("output_config")
+    if isinstance(config, dict) and config.get("effort") == "low":
+        config["effort"] = "medium"
+        return True
+    return False
+
+
 def gpt_error(status, text, body):
     """Say what a claude-code-proxy error means to Claude Code.
 
@@ -4565,6 +4576,8 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def serve_gpt(self, raw, body, model, path):
+        if gpt_raise_low_effort(body):
+            raw = json.dumps(body).encode()
         """Relay a Claude Code gpt-* turn to the sidecar.
 
         Only a subagent is compacted here: the main session compacts on its

@@ -211,6 +211,41 @@ def split_args(argv):
 
 AGENT_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
+# GPT subagents, one per model and effort: the Agent tool takes no effort, so
+# choosing a subagent is the only place to choose it. Low is left out on
+# purpose (devinx also raises a low turn to medium on the gpt-* route).
+GPT_AGENT_MODELS = (
+    ("sol", "gpt-6.1-sol", "GPT-6.1 Sol",
+     "the strongest GPT: hard implementation, debugging, a second opinion"),
+    ("astra", "gpt-6-astra", "GPT-6 Astra",
+     "a second GPT voice beside Sol, for implementation, debugging or review"),
+    ("luna", "gpt-6-luna", "GPT-6 Luna",
+     "fast and light: quick searches, small mechanical edits, routine checks"),
+)
+GPT_AGENT_EFFORTS = ("medium", "high", "xhigh", "max")
+
+
+def gpt_agents():
+    out = {}
+    for short, model, label, use in GPT_AGENT_MODELS:
+        for effort in GPT_AGENT_EFFORTS:
+            out[f"gpt-{short}-{effort}"] = {
+                "description": (
+                    f"{label} subagent at {effort} effort, on the user's ChatGPT "
+                    f"subscription through the claude-code-proxy sidecar: {use}. "
+                    f"Long runs are compacted by devinx (GPT summarises GPT). "
+                    f"Spends ChatGPT quota, not claude.ai or SWE-2."),
+                "prompt": (
+                    f"You are a {label} coding subagent inside Claude Code. "
+                    f"Execute the delegated task directly with your available "
+                    f"tools, verify your result, and return a concise summary to "
+                    f"the parent agent. When asked about your model identity, "
+                    f"answer `{model}`."),
+                "model": model,
+                "effort": effort,
+            }
+    return out
+
 
 def packaged_agents():
     """Parse agents/*.md into the JSON shape `claude --agents` expects.
@@ -289,6 +324,11 @@ def packaged_agents():
         if blocked:
             agent["disallowedTools"] = blocked
         out[name] = agent
+    for name, agent in gpt_agents().items():
+        if os.environ.get("DEVINX_SUBAGENT_MCP") != "1":
+            agent["disallowedTools"] = ["mcp__*"]
+        # A file of the same name in agents/ wins: that is where an override goes.
+        out.setdefault(name, agent)
     return out
 
 
