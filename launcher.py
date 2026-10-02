@@ -294,6 +294,31 @@ def split_at_separator(args):
     return list(args), []
 
 
+# The GPT rows of /model. ANTHROPIC_CUSTOM_MODEL_OPTION holds one entry and swe-2
+# has it; gateway discovery would list the rest but Claude Code skips it on a
+# claude.ai login (it wants an API credential). A `modelPicker` setting appends
+# rows instead, and it is read from flag settings, so `--settings` scopes it to
+# this session exactly like --agents.
+GPT_PICKER = (
+    ("gpt-6.1-sol", "GPT-6.1 Sol", "ChatGPT subscription, via claude-code-proxy"),
+    ("gpt-6-sol", "GPT-6 Sol", "ChatGPT subscription, via claude-code-proxy"),
+    ("gpt-6-luna", "GPT-6 Luna", "ChatGPT subscription, fast and light"),
+    ("gpt-6-astra", "GPT-6 Astra", "ChatGPT subscription, via claude-code-proxy"),
+)
+
+
+def picker_settings(passthrough):
+    """`--settings` carrying the GPT picker rows, unless the user passed their
+    own --settings: the client takes one, and theirs must win."""
+    if any(a == "--settings" or a.startswith("--settings=") for a in passthrough):
+        sys.stderr.write("devinx: --settings was already given; the GPT rows "
+                         "were not added to /model (type /model gpt-6.1-sol)\n")
+        return []
+    options = [{"model": mid, "label": label, "description": desc}
+               for mid, label, desc in GPT_PICKER]
+    return ["--settings", json.dumps({"modelPicker": {"options": options}})]
+
+
 def merge_agents(passthrough, agents):
     """Add --agents, merging with one the user already passed rather than
     fighting over the flag. Their definitions win on a name clash.
@@ -1048,7 +1073,7 @@ def main():
     # of the user's: a client subcommand anywhere in `head` (`mcp`, `plugin`,
     # `doctor`) is parsed as positional and stops recognising options typed
     # after it, which is exactly what broke `devinx --d mcp ...` before.
-    args = ([claude] + plugin_args(use_orch)
+    args = ([claude] + plugin_args(use_orch) + picker_settings(head)
             + merge_agents(head, packaged_agents()) + tail)
     _warn_windows_cmd_shim(claude, args)
     if sys.platform == "win32":
