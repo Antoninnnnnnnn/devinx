@@ -795,7 +795,7 @@ function render(d){
     ["Plus grosse requête envoyée", `${n(sw.request_kb?.max)} Ko`,
      `médiane ${n(sw.request_kb?.p50)} Ko · p90 ${n(sw.request_kb?.p90)} Ko`],
     ["Volume total transféré", `${n(sw.request_kb?.total_mb)} Mo`,
-     "en corps de requêtes, compression comprise"],
+     "taille des requêtes avant compression gzip ; sur le réseau, environ 4 à 5 fois moins"],
     ["Conversation la plus longue", `${n(sw.messages_per_request?.max)} messages`,
      `médiane ${n(sw.messages_per_request?.p50)} · p90 ${n(sw.messages_per_request?.p90)}`],
     ["Tokens par heure d'appel", big(fun.tokens_per_hour_of_calls),
