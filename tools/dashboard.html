@@ -519,7 +519,14 @@ function render(d){
     .map(([k,v]) => `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td class="n">${n(v.turns)}</td>
       <td class="n">${big(v.input)}</td><td class="n">${big(v.output)}</td></tr>`).join("");
 
-  $("byacct").innerHTML = Object.entries(sw.by_account || {})
+  // Le tableau vient du journal de la période choisie : un compte bloqué
+  // depuis des heures n'y figurait plus du tout, comme s'il avait été retiré.
+  // Les comptes chargés par le service y sont toujours, à zéro s'il le faut.
+  const rows = Object.assign({}, sw.by_account || {});
+  for (const a of (sv.accounts || []))
+    if (typeof a === "object" && a.name && !rows[a.name])
+      rows[a.name] = {turns: 0, refusals: 0};
+  $("byacct").innerHTML = Object.entries(rows)
     .sort((a,b) => b[1].turns - a[1].turns)
     .map(([k,v]) => { const t = v.turns + v.refusals, r = t ? v.refusals/t : 0;
       const cls = r > .15 ? "crit" : r > .02 ? "warn" : "ok";
@@ -534,7 +541,8 @@ function render(d){
       // La part que le répartiteur donne à ce compte maintenant, d'après son
       // taux de réussite mesuré. Vide pour un compte bloqué ou exclu.
       const share = live && typeof live.share === "number" && live.share > 0
-        ? pct(live.share) : "—";
+        ? pct(live.share)
+        : live && live.blocked_for ? `bloqué ${dur(live.blocked_for)}` : "—";
       return `<tr><td>${k === "unknown" ? "avant le marquage" : esc(k)}</td><td>${plan}</td><td class="n">${share}</td><td class="n">${n(v.turns)}</td><td class="n">${n(v.refusals)}</td>
         <td class="n"><span class="pill ${cls}">${pct(r)}</span></td></tr>`; }).join("");
 
