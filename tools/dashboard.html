@@ -522,11 +522,11 @@ function render(d){
   // Le tableau vient du journal de la période choisie : un compte bloqué
   // depuis des heures n'y figurait plus du tout, comme s'il avait été retiré.
   // Les comptes chargés par le service y sont toujours, à zéro s'il le faut.
-  const rows = Object.assign({}, sw.by_account || {});
+  const acctRows = Object.assign({}, sw.by_account || {});
   for (const a of (sv.accounts || []))
-    if (typeof a === "object" && a.name && !rows[a.name])
-      rows[a.name] = {turns: 0, refusals: 0};
-  $("byacct").innerHTML = Object.entries(rows)
+    if (typeof a === "object" && a.name && !acctRows[a.name])
+      acctRows[a.name] = {turns: 0, refusals: 0};
+  $("byacct").innerHTML = Object.entries(acctRows)
     .sort((a,b) => b[1].turns - a[1].turns)
     .map(([k,v]) => { const t = v.turns + v.refusals, r = t ? v.refusals/t : 0;
       const cls = r > .15 ? "crit" : r > .02 ? "warn" : "ok";
