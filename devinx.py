@@ -611,15 +611,34 @@ class Turn:
         if self.client_gone():
             raise ClientGone()
 
-    def sleep(self, seconds):
+    def sleep(self, seconds, wake=None):
+        """Wait, in short steps; `wake` ends the wait early when it says so."""
         remaining = max(0.0, seconds)
         while remaining > 0:
             self.check()
+            if wake is not None and wake():
+                return
             step = min(remaining, self.STEP)
             time.sleep(step)
             self.slept += step
             remaining -= step
         self.check()
+
+
+def _credential_back():
+    """Has a credential become usable since every one of them was blocked?
+
+    A turn held for "every credential is blocked" slept until the earliest
+    announced reset, and nothing else woke it: a Devin account logged in
+    meanwhile was not even read, since credentials are rescanned on a claim
+    and every turn was asleep instead of claiming. 2026-10-03: compte6 logged
+    in at 11:36 while seventeen turns slept until 11:59 beside it.
+    """
+    _maybe_rescan()
+    now = time.time()
+    with _acct_lock:
+        return any(not a.get("excluded") and a["blocked_until"] <= now
+                   for a in _accounts)
 
 
 def current_turn():
@@ -2162,7 +2181,7 @@ def _summarise_once(messages, model, system, previous, turn):
                 print(f"summary: every credential rate limited, waiting "
                       f"{wait:.0f}s ({time.time() - t0:.0f}s so far)", flush=True)
                 _request_phase("waiting_rate_limit")
-                pause(wait)
+                pause(wait, wake=_credential_back)
                 continue
         texts, thinks, err = [], [], None
         for msg, e in chat_stream(req, acct, purpose="summary"):
@@ -3403,7 +3422,7 @@ def _run_swe(body, out):
                       f"({turn.spent():.0f}s waited so far)",
                       flush=True)
                 _request_phase("waiting_rate_limit")
-                turn.sleep(wait)
+                turn.sleep(wait, wake=_credential_back)
                 acct, _ = claim_account()
                 continue
             print(f"upstream rate limited and the turn's {turn.budget}s budget "
