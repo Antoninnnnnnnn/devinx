@@ -61,6 +61,9 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-
 .g3{grid-template-columns:repeat(3,1fr)}
 .g2{grid-template-columns:repeat(2,1fr)}
 .g1{grid-template-columns:1fr}
+/* Two thirds and one third: the per-credential table has six columns and
+   was cramped in a third of the row. */
+.g21{grid-template-columns:minmax(0,2fr) minmax(0,1fr)}
 /* Une colonne empilée par minute : refusé au-dessus de servi, même échelle.
    align-self:stretch est ce qui fait tenir le graphique : .bars aligne ses
    enfants en flex-end, ce qui laisse la colonne sans hauteur définie, et une
@@ -71,8 +74,8 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-
   justify-content:flex-end;background:none}
 .bars .col > div{width:100%;border-radius:2px 2px 0 0;min-height:0}
 .bars .col:hover{opacity:.75;background:none}
-@media (max-width:900px){.g4,.g3,.g2{grid-template-columns:repeat(2,1fr)}}
-@media (max-width:560px){.g4,.g3,.g2{grid-template-columns:1fr}}
+@media (max-width:900px){.g4,.g3,.g2{grid-template-columns:repeat(2,1fr)}.g21{grid-template-columns:1fr}}
+@media (max-width:560px){.g4,.g3,.g2,.g21{grid-template-columns:1fr}}
 
 .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
 .card h3{margin:0 0 14px;font-size:13px;font-weight:600;color:var(--ink-2)}
@@ -259,17 +262,12 @@ button.t:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 </div>
 
 <h2>Quotas et comptes</h2>
-<div class="grid g3">
+<div class="grid g21">
   <div class="card">
     <h3>Par credential</h3>
     <div class="tw"><table><thead><tr><th>compte</th><th>plan</th><th class="n">part</th><th class="n">tours</th>
       <th class="n">refus de quota</th><th class="n">taux</th></tr></thead>
       <tbody id="byacct"></tbody></table></div>
-  </div>
-  <div class="card">
-    <h3>Nature des refus de quota</h3>
-    <div class="rows" id="quotas"></div>
-    <div class="note" id="quotanote"></div>
   </div>
   <div class="card">
     <h3>Rafales et attentes</h3>
@@ -691,12 +689,6 @@ function render(d){
   } else {
     $("retnote").textContent = "Pas encore de journée horodatée complète.";
   }
-
-  const q = Object.entries(rl.by_quota || {}).sort((a,b) => b[1]-a[1]);
-  rows($("quotas"), q.map(([k,v],i) => ({k, v, t: n(v), c: SERIES[i%4]})));
-  $("quotanote").textContent = q.length
-    ? "Deux compteurs distincts sur le même usage : l'un se recharge en secondes, l'autre peut bloquer douze minutes."
-    : "Aucun refus de quota enregistré.";
 
   const w = rl.wait_seconds || {}, b = rl.bursts || {};
   $("rlkv").innerHTML = [
