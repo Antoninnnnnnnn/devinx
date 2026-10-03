@@ -52,7 +52,7 @@ STAMP_LEN = len("2026-09-17T22:00:00 ")
 RE_CONN = re.compile(
     STAMP + r"upstream conn: ([\d.]+)s to headers "
     r"\((?:acct=(\S+) )?(?:model=(\S+) )?(\d+) msgs, (\d+)KB req"
-    r"(?:, purpose=(\w+) conv=(\S+))?\)")
+    r"(?:, (\d+)KB wire)?(?:, purpose=(\w+) conv=(\S+))?\)")
 RE_DONE = re.compile(
     STAMP + r"upstream done: (?:stop=([a-z_]+)/\d+ calls=(\d+) )?"
     r"(?:purpose=(\w+) conv=(\S+) )?"
@@ -136,6 +136,7 @@ def collect(path, since=None, until=None, undated=False):
         "turns_ok": 0, "turns_failed": 0,
         "in": 0, "out": 0, "cr": 0, "cw": 0,
         "lat": [], "kb": [], "msgs": [], "calls": [],
+        "wire_kb": 0, "wire_raw_kb": 0, "unwired_kb": 0,
         "calls_hist": Counter(), "stops": Counter(),
         "by_model": defaultdict(lambda: {"turns": 0, "input": 0, "output": 0}),
         "by_account": defaultdict(lambda: {"turns": 0, "refusals": 0}),
@@ -232,10 +233,18 @@ def collect(path, since=None, until=None, undated=False):
                                 del st["ttfb_recent"][:20]
                         st["msgs"].append(int(m.group(4)))
                         st["kb"].append(int(m.group(5)))
+                        # What went over the network: the gzip frame. Lines
+                        # written before the service logged it carry only
+                        # the serialized size, before compression.
+                        if m.group(6) is not None:
+                            st["wire_kb"] += int(m.group(6))
+                            st["wire_raw_kb"] += int(m.group(5))
+                        else:
+                            st["unwired_kb"] += int(m.group(5))
                         last_acct, last_model = m.group(2), m.group(3)
-                        last_purpose = m.group(6) or "turn"
-                        if m.group(7):
-                            st["conversations"].add(m.group(7))
+                        last_purpose = m.group(7) or "turn"
+                        if m.group(8):
+                            st["conversations"].add(m.group(8))
                         if last_purpose == "summary":
                             st["summary_calls"] += 1
                 elif line.startswith("upstream done:"):
@@ -612,6 +621,15 @@ def main():
                 "p90": pct(st["kb"], 0.9),
                 "max": max(st["kb"]) if st["kb"] else 0,
                 "total_mb": round(sum(st["kb"]) / 1024.0, 1),
+                # Measured on the lines that log the gzip frame; the older
+                # ones are estimated at the ratio those lines show.
+                "wire_measured_mb": round(st["wire_kb"] / 1024.0, 1),
+                "wire_ratio": round(st["wire_raw_kb"] / st["wire_kb"], 2)
+                              if st["wire_kb"] else None,
+                "wire_estimated_mb": round(
+                    st["unwired_kb"] * st["wire_kb"] / st["wire_raw_kb"] / 1024.0, 1)
+                    if st["wire_raw_kb"] else None,
+                "unmeasured_mb": round(st["unwired_kb"] / 1024.0, 1),
             },
             "messages_per_request": {
                 "p50": pct(st["msgs"], 0.5),

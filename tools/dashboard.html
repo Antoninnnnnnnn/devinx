@@ -467,6 +467,24 @@ function renderActiveRequests(items){
     target.appendChild(tr);
   }
 }
+// Ce qui a réellement transité : la trame gzip envoyée à Cognition. Le
+// service ne l'enregistre que depuis le 3 octobre ; avant, seule la taille
+// non compressée est connue, et elle est convertie au taux mesuré depuis.
+function wireCard(rk){
+  const mb = v => `${n(Math.round(v))} Mo`;
+  if (rk.wire_measured_mb == null && rk.total_mb == null)
+    return ["Volume réseau envoyé", "—", "aucune requête dans la période"];
+  if (!rk.wire_measured_mb)
+    return ["Volume réseau envoyé", "—",
+      `pas encore mesuré sur cette période ; ${mb(rk.total_mb || 0)} avant compression`];
+  const est = rk.wire_estimated_mb || 0;
+  const total = rk.wire_measured_mb + est;
+  const ratio = String(rk.wire_ratio).replace(".", ",");
+  return ["Volume réseau envoyé", mb(total), est
+    ? `${mb(rk.wire_measured_mb)} mesurés, ${mb(est)} estimés (avant le 3/10, au taux mesuré de ×${ratio}) · ${mb(rk.total_mb)} avant compression`
+    : `mesuré, compression gzip comprise (×${ratio}) · ${mb(rk.total_mb)} avant compression`];
+}
+
 function render(d){
   renderActiveRequests(d.active_requests);
   const sv = d.service || {}, sw = d.swe || {}, tk = sw.tokens || {},
@@ -794,8 +812,7 @@ function render(d){
        dur(fun.busiest_single_turn?.latency)} — un autre tour que le plus long`],
     ["Plus grosse requête envoyée", `${n(sw.request_kb?.max)} Ko`,
      `médiane ${n(sw.request_kb?.p50)} Ko · p90 ${n(sw.request_kb?.p90)} Ko`],
-    ["Volume total transféré", `${n(sw.request_kb?.total_mb)} Mo`,
-     "taille des requêtes avant compression gzip ; sur le réseau, environ 4 à 5 fois moins"],
+    wireCard(sw.request_kb || {}),
     ["Conversation la plus longue", `${n(sw.messages_per_request?.max)} messages`,
      `médiane ${n(sw.messages_per_request?.p50)} · p90 ${n(sw.messages_per_request?.p90)}`],
     ["Tokens par heure d'appel", big(fun.tokens_per_hour_of_calls),

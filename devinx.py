@@ -1917,7 +1917,8 @@ def chat_stream(req, acct=None, purpose="turn"):
         # nothing interleaved can be attributed to a run after the fact.
         print(f"upstream conn: {time.time() - t_start:.1f}s to headers "
               f"(acct={acct['name']} model={req.chat_model_uid} {n_msgs} msgs, "
-              f"{len(body) // 1024}KB req, purpose={purpose} "
+              f"{len(body) // 1024}KB req, {len(frame) // 1024}KB wire, "
+              f"purpose={purpose} "
               f"conv={(req.cascade_id or '?')[:12]})", flush=True)
         _request_phase("summarizing" if purpose == "summary" else "waiting_first_frame")
         buf = b""
