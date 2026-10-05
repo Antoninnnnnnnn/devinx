@@ -1,0 +1,45 @@
+diff --git a/src/server.rs b/src/server.rs
+index da3c842..e603b87 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -292,7 +292,39 @@ pub fn app_with_features(
+     } else {
+         router
+     };
+-    router.fallback(fallback_handler).with_state(state)
++    router
++        .fallback(fallback_handler)
++        .layer(axum::middleware::from_fn(reject_browser_requests))
++        .with_state(state)
++}
++
++/// Local patch (devinx): the listener spends a ChatGPT login it holds and takes
++/// no client credential, so a page the user merely visits could POST to it (a
++/// text/plain body needs no preflight) or read it back through DNS rebinding.
++/// Real clients never send Origin and always name a loopback host.
++async fn reject_browser_requests(
++    req: Request<Body>,
++    next: axum::middleware::Next,
++) -> Response {
++    let headers = req.headers();
++    let host = headers
++        .get(axum::http::header::HOST)
++        .and_then(|v| v.to_str().ok())
++        .unwrap_or("");
++    let hostname = if let Some(rest) = host.strip_prefix('[') {
++        rest.split(']').next().unwrap_or("")
++    } else {
++        host.rsplit_once(':').map_or(host, |(h, _)| h)
++    };
++    let loopback = matches!(hostname, "127.0.0.1" | "localhost" | "::1");
++    if headers.contains_key(axum::http::header::ORIGIN) || !loopback {
++        return json_error(
++            StatusCode::FORBIDDEN,
++            "permission_error",
++            "Refusing a browser-originated or non-loopback request".to_string(),
++        );
++    }
++    next.run(req).await
+ }
+ 
+ #[derive(Clone)]

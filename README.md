@@ -482,10 +482,20 @@ swe-2-*.
 
 The sidecar is a patched build: upstream claude-code-proxy (0.1.43) accepts
 browser-originated requests and any `Host`, so a page could spend the ChatGPT
-quota. The local patch refuses any `Origin` and any non-loopback `Host`.
-Reinstalling with `install.sh` or brew **overwrites it** with the unpatched
-binary. The patch is kept in
-`~/devinx-local/claude-code-proxy-v0.1.43-origin-guard.patch`.
+quota. The patch in `sidecar/origin-guard.patch` refuses any `Origin` and any
+non-loopback `Host`. Upstream's `install.sh` and brew install the unpatched
+binary, so build it with devinx instead (needs Rust, via rustup):
+
+    python3 install.py --gpt        # or, on its own: python3 sidecar/build.py
+    ~/.local/bin/claude-code-proxy codex auth login   # once, the sidecar's own login
+
+`sidecar/build.py` checks out the pinned upstream commit, applies the patch,
+runs `cargo build --release --locked`, installs the binary in
+`~/.local/bin` (an unpatched one found there is kept as `.unpatched`) and, on
+Linux, installs and starts the systemd user unit `sidecar/claude-code-proxy.service`
+(port 18765, Codex-native compaction). A sidecar already running is not
+restarted, since that cuts its GPT turns: pass `--restart`, or restart it when
+idle. A unit edited by hand is left alone unless `--force`.
 
 ### Why the SWE-2 route refuses browsers
 

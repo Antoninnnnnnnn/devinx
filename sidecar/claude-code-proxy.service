@@ -1,0 +1,15 @@
+[Unit]
+Description=claude-code-proxy sidecar: Claude Code -> ChatGPT Codex for devinx's gpt-* route
+
+[Service]
+ExecStart=@BIN@ serve --no-monitor --port @PORT@
+Environment=CCP_BIND_ADDRESS=127.0.0.1
+# Codex-native compaction behind Claude Code's own /compact and auto-compact,
+# as Codex itself does (compact_remote_v2): the encrypted item carries the
+# earlier history into later turns; the portable summary stays as fallback.
+Environment=CCP_CODEX_SERVER_COMPACTION=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

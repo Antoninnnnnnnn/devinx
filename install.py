@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """devinx installer - Windows, macOS and Linux.
 
-    python3 install.py [--force] [--port 8316] [--no-smoke] [--bin DIR]
+    python3 install.py [--force] [--port 8316] [--no-smoke] [--bin DIR] [--gpt]
 
 Creates a virtualenv next to this file, installs the two pinned dependencies,
 drops a `devinx` launcher on PATH and runs a smoke test end to end. The subagents
 and the orchestrator skill are injected per session by the launcher, so nothing is
 written into ~/.claude unless you ask for it with --global-agents. Uses the
-standard library only, so it runs before any dependency exists.
+standard library only, so it runs before any dependency exists. --gpt also builds
+and starts the claude-code-proxy sidecar the gpt-* route needs (sidecar/build.py,
+which needs Rust).
 """
 import argparse
 import contextlib
@@ -718,6 +720,22 @@ def smoke(py, have_credential):
         log.close()
 
 
+def install_gpt_sidecar(force):
+    """The sidecar behind the gpt-* route, built from the pinned upstream with
+    the origin guard. A failure here is reported, not fatal: everything else
+    devinx does works without it."""
+    import importlib.util
+    # Loaded by path: a module named `build` on sys.path (PyPI has one) must
+    # not be the one that runs.
+    spec = importlib.util.spec_from_file_location(
+        "devinx_sidecar_build", os.path.join(HERE, "sidecar", "build.py"))
+    build = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build)
+    if build.main(["--force"] if force else []) != 0:
+        say(WARN, "the GPT sidecar is not installed; gpt-* models will not "
+                  "answer until `python3 sidecar/build.py` succeeds")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Install devinx.")
     ap.add_argument("--force", action="store_true",
@@ -726,6 +744,10 @@ def main():
     ap.add_argument("--port", type=int, default=8316, help="service port")
     ap.add_argument("--bin", default=default_bin(), help="where to put the launcher")
     ap.add_argument("--no-smoke", action="store_true", help="skip the smoke test")
+    ap.add_argument("--gpt", action="store_true",
+                    help="also build, install and start the patched "
+                         "claude-code-proxy sidecar for gpt-* models (needs "
+                         "Rust; see sidecar/build.py)")
     ap.add_argument("--global-agents", action="store_true",
                     help="also install the agents into ~/.claude/agents, making "
                          "them visible outside devin mode (not recommended)")
@@ -745,6 +767,8 @@ def main():
     report_skill()
     install_codex(args.force)
     path = install_launcher(args.bin, args.port, args.force)
+    if args.gpt:
+        install_gpt_sidecar(args.force)
     have_credential = check_credential()
     if not args.no_smoke:
         smoke(py, have_credential)
