@@ -239,8 +239,12 @@ def gpt_agents():
                     f"You are a {label} coding subagent inside Claude Code. "
                     f"Execute the delegated task directly with your available "
                     f"tools, verify your result, and return a concise summary to "
-                    f"the parent agent. When asked about your model identity, "
-                    f"answer `{model}`."),
+                    f"the parent agent. When the task names a report or any "
+                    f"other file to write, write it at that path: an explicit "
+                    f"request outranks any general rule against report files, "
+                    f"and the file is the deliverable, so never send its "
+                    f"contents as a message instead. When asked about your "
+                    f"model identity, answer `{model}`."),
                 "model": model,
                 "effort": effort,
             }

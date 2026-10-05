@@ -436,6 +436,46 @@ counts the server reports.
   with SSE comments; a context refusal is retried once, compacted harder,
   instead of ending the agent. `DEVINX_GPT_COMPACT_AT` overrides 244800.
 
+**The advisor on GPT (off by default).** Claude Code declares `advisor` as a server
+tool, which on the Anthropic API the server runs and on a GPT model nobody
+would (the sidecar turns it into a plain function, GPT calls it, and the client
+answers `No such tool available: advisor`). Claude Code offers the tool to a
+GPT model when it treats it as an Opus (the launcher's picker rows say
+`behavesAs: claude-opus-5-5`) or when `CLAUDE_CODE_ENABLE_EXPERIMENTAL_ADVISOR_TOOL=1`
+is set, in a GPT main session and in a `gpt-*` subagent of a Claude one alike.
+Then devinx answers the call itself: the tool call is held back, a GPT model (`gpt-6.1-sol`) is given the
+task and the transcript and asked for advice, and the turn continues upstream
+with that advice as the tool's result, as one continuous message. The client
+sees the `server_tool_use` / `advisor_tool_result` pair Claude's own advisor
+leaves, so the exchange is stored and replayed with the conversation; on the
+way back to the sidecar the pair is turned into an ordinary tool call and
+result (so a conversation that began on Claude, whose advice is encrypted, also
+continues on GPT, told that the advice cannot be read). Tool calls made beside
+the advisor are not run and the model is told so. A failed advisor is an error
+result, never a failed turn, and a slow one keeps the stream alive with SSE
+comments. Only streamed requests are handled; for any other the tool is taken
+out. Requests that do not declare the advisor are relayed byte for byte.
+The advisor's own calls travel under a cache key derived from the session
+(`<session>:advisor[:<agent>]`, never the conversation's own, which the sidecar
+keeps state for): successive advice read ~97% of their transcript from the
+cache instead of paying for all of it each time. The advisor tool stays in the
+request until a call is refused, because the tools head the prompt and changing
+them re-reads the whole history. `DEVINX_ADVISOR_MODEL` (default `gpt-6.1-sol`), `DEVINX_ADVISOR_EFFORT`
+(`high`), `DEVINX_ADVISOR_MAX_CALLS` (0 by default, which turns the feature off and
+takes the tool out of every gpt-* request; set 3, say, to turn it on, after
+which that many advice per client request are given and the tool is withdrawn), `DEVINX_ADVISOR_TIMEOUT` (300s).
+
+**Report files.** Claude Code tells every subagent "Do NOT Write
+report/summary/findings/analysis .md files", and a GPT model obeys it even when
+the task asks for exactly such a file under a path it names (two subagents
+answered that a generic rule forbade it and sent their findings as messages).
+On the gpt-* route (subagents only), devinx narrows that sentence to
+unrequested reports: a file the launching agent asks for, or a path it names,
+is the deliverable and gets written. The `gpt-*` subagents' own prompt says the
+same, for a client that bypasses the rewrite. Claude's own route is relayed
+untouched, and so is swe-2-* (its subagents were measured writing a requested
+report with the sentence in place).
+
 Switching a conversation from gpt-* back to claude-* works: GPT-signed thinking
 (`ccp:` signatures) is dropped from a claude-* history, and kept unsigned on
 swe-2-*.
